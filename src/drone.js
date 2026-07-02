@@ -33,6 +33,8 @@
  * Drone: sticks → velocity command → position setpoint,  cascaded PI position/velocity/tilt hold
  */
 
+import { reportUserError } from './error-report.js';
+
 const DEG2RAD = Math.PI / 180;
 const RAD2DEG = 180 / Math.PI;
 const G = 9.81;              // gravitational acceleration (m/s²)
@@ -293,8 +295,11 @@ export class Drone {
 
         // NaN guard — reset if physics blew up
         if (isNaN(this.x) || isNaN(this.y) || isNaN(this.z)) {
-            console.warn('NaN detected in drone state, resetting.',
-                { mass: this.mass, thrust: this.thrustOutput, dragCd: this.dragCd, dragArea: this.dragArea });
+            reportUserError(
+                'Drone physics produced NaN; resetting',
+                new Error(`mass=${this.mass}, thrust=${this.thrustOutput}, dragCd=${this.dragCd}, dragArea=${this.dragArea}`),
+                { key: 'drone-physics-nan', intervalMs: 10000 }
+            );
             this.reset();
             return;
         }

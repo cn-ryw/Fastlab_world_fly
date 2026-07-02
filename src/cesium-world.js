@@ -28,6 +28,8 @@
  * longitude/latitude.
  */
 
+import { reportUserError } from './error-report.js';
+
 const DEFAULT_ION_TOKEN = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJqdGkiOiJlMTg2MGFhOS02YTdhLTQ1NWMtYjkzMi05YjQ2ODRlZjI5YTgiLCJpZCI6MjUxNzM1LCJpYXQiOjE3MzAyODI0ODN9.prWAxx4RB8teelutQQbVqdxhgRZpZ4zjw8wzM-8k1Ug';
 const DEFAULT_ASSET_ID = 2275207;
 const DEFAULT_VIEW = {
@@ -48,23 +50,15 @@ const PANORAMA_FACE_DEFS = [
 ];
 
 function urlNumber(name, fallback) {
-    try {
-        const v = new URLSearchParams(window.location.search).get(name);
-        if (v == null || v === '') return fallback;
-        const n = Number(v);
-        return Number.isFinite(n) ? n : fallback;
-    } catch (_) {
-        return fallback;
-    }
+    const v = new URLSearchParams(window.location.search).get(name);
+    if (v == null || v === '') return fallback;
+    const n = Number(v);
+    return Number.isFinite(n) ? n : fallback;
 }
 
 function urlString(name, fallback) {
-    try {
-        const v = new URLSearchParams(window.location.search).get(name);
-        return v == null || v === '' ? fallback : v;
-    } catch (_) {
-        return fallback;
-    }
+    const v = new URLSearchParams(window.location.search).get(name);
+    return v == null || v === '' ? fallback : v;
 }
 
 function requireCesium() {
@@ -165,6 +159,8 @@ class PanoramaEquirectProjector {
             varying vec2 v_uv;
             uniform float u_vertical_fov;
             uniform float u_tan_half_face_fov;
+            uniform float u_top_pole_guard;
+            uniform float u_bottom_pole_guard;
             uniform sampler2D u_front;
             uniform sampler2D u_right;
             uniform sampler2D u_back;
@@ -228,7 +224,10 @@ class PanoramaEquirectProjector {
             }
 
             void main() {
-                float pitch = (v_uv.y - 0.5) * u_vertical_fov;
+                float halfFov = u_vertical_fov * 0.5;
+                float topPitch = max(0.0, halfFov - u_top_pole_guard);
+                float bottomPitch = max(0.0, halfFov - u_bottom_pole_guard);
+                float pitch = mix(-bottomPitch, topPitch, v_uv.y);
                 float yaw = PI - v_uv.x * TWO_PI;
                 float cosPitch = cos(pitch);
                 float forward = cosPitch * cos(yaw);
@@ -251,6 +250,8 @@ class PanoramaEquirectProjector {
             position: gl.getAttribLocation(this.program, 'a_position'),
             verticalFov: gl.getUniformLocation(this.program, 'u_vertical_fov'),
             tanHalfFaceFov: gl.getUniformLocation(this.program, 'u_tan_half_face_fov'),
+            topPoleGuard: gl.getUniformLocation(this.program, 'u_top_pole_guard'),
+            bottomPoleGuard: gl.getUniformLocation(this.program, 'u_bottom_pole_guard'),
         };
         this.faceNames.forEach((name, i) => {
             const texture = gl.createTexture();
@@ -275,7 +276,7 @@ class PanoramaEquirectProjector {
         this.readyFaces.add(name);
     }
 
-    render(width, height, verticalFovDeg, faceFovDeg = 130) {
+    render(width, height, verticalFovDeg, faceFovDeg = 130, topPoleGuardDeg = 0, bottomPoleGuardDeg = 0) {
         if (!this.faceNames.every(name => this.readyFaces.has(name))) return null;
         const gl = this.gl;
         if (this.canvas.width !== width) this.canvas.width = width;
@@ -294,8 +295,13 @@ class PanoramaEquirectProjector {
         });
         const verticalFov = Math.max(1, Math.min(180, verticalFovDeg || 180)) * Math.PI / 180;
         const faceFov = Math.max(45, Math.min(170, faceFovDeg || 90)) * Math.PI / 180;
+        const maxGuard = Math.max(0, verticalFov * 0.5 - (1 * Math.PI / 180));
+        const topPoleGuard = Math.min(maxGuard, Math.max(0, Number(topPoleGuardDeg) || 0) * Math.PI / 180);
+        const bottomPoleGuard = Math.min(maxGuard, Math.max(0, Number(bottomPoleGuardDeg) || 0) * Math.PI / 180);
         gl.uniform1f(this.locations.verticalFov, verticalFov);
         gl.uniform1f(this.locations.tanHalfFaceFov, Math.tan(faceFov * 0.5));
+        gl.uniform1f(this.locations.topPoleGuard, topPoleGuard);
+        gl.uniform1f(this.locations.bottomPoleGuard, bottomPoleGuard);
         gl.drawArrays(gl.TRIANGLES, 0, 6);
         gl.flush();
         return this.canvas;
@@ -530,7 +536,10 @@ export class CesiumWorld {
                 if (progressCb) progressCb('Loading Google Photorealistic 3D Tiles...');
                 return await Cesium.createGooglePhotorealistic3DTileset();
             } catch (e) {
-                console.warn('[CesiumWorld] createGooglePhotorealistic3DTileset failed; falling back to ion asset:', e);
+                reportUserError('Google Photorealistic tileset API failed; falling back to ion asset', e, {
+                    key: 'google-photorealistic-tileset',
+                    intervalMs: 10000,
+                });
             }
         }
 
@@ -542,7 +551,10 @@ export class CesiumWorld {
         if (!this.tileset) return;
         const onFailure = (error) => {
             const message = error && error.message ? error.message : String(error || 'unknown tile error');
-            console.warn('[CesiumWorld] Google tiles failed:', error);
+            reportUserError('Google 3D Tiles request failed', error, {
+                key: `google-tile-failed-${message}`,
+                intervalMs: 10000,
+            });
             if (progressCb) progressCb(`Google 3D Tiles request failed: ${message}`, true);
         };
 
@@ -965,7 +977,11 @@ export class CesiumWorld {
                 const p = scene.pickPosition(windowPosition);
                 if (Cesium.defined(p)) cartesian = p;
             }
-        } catch (_) {
+        } catch (error) {
+            reportUserError('Scene pickPosition failed', error, {
+                key: 'scene-pick-position',
+                intervalMs: 10000,
+            });
             cartesian = null;
         }
 
@@ -976,7 +992,11 @@ export class CesiumWorld {
                     const hit = scene.pickFromRay(ray);
                     if (hit && Cesium.defined(hit.position)) cartesian = hit.position;
                 }
-            } catch (_) {
+            } catch (error) {
+                reportUserError('Scene pickFromRay failed while picking spawn', error, {
+                    key: 'scene-pick-from-ray-spawn',
+                    intervalMs: 10000,
+                });
                 cartesian = null;
             }
         }
@@ -985,7 +1005,11 @@ export class CesiumWorld {
             try {
                 const p = this.viewer.camera.pickEllipsoid(windowPosition, Cesium.Ellipsoid.WGS84);
                 if (Cesium.defined(p)) cartesian = p;
-            } catch (_) {
+            } catch (error) {
+                reportUserError('Camera pickEllipsoid failed while picking spawn', error, {
+                    key: 'camera-pick-ellipsoid-spawn',
+                    intervalMs: 10000,
+                });
                 cartesian = null;
             }
         }
@@ -1000,7 +1024,11 @@ export class CesiumWorld {
                     const distance = ellipsoidHit.start >= 0 ? ellipsoidHit.start : ellipsoidHit.stop;
                     cartesian = Cesium.Ray.getPoint(ray, distance, new Cesium.Cartesian3());
                 }
-            } catch (_) {
+            } catch (error) {
+                reportUserError('Ray ellipsoid fallback failed while picking spawn', error, {
+                    key: 'ray-ellipsoid-spawn',
+                    intervalMs: 10000,
+                });
                 cartesian = null;
             }
         }
@@ -1141,10 +1169,18 @@ export class CesiumWorld {
         let sampledHeight;
         try {
             sampledHeight = scene.sampleHeight(carto, this._collisionExclusions(), width);
-        } catch (_) {
+        } catch (error) {
+            reportUserError('Scene height sample with exclusions failed', error, {
+                key: 'height-sample-exclusions',
+                intervalMs: 10000,
+            });
             try {
                 sampledHeight = scene.sampleHeight(carto, undefined, width);
-            } catch (_) {
+            } catch (fallbackError) {
+                reportUserError('Scene height sample failed', fallbackError, {
+                    key: 'height-sample',
+                    intervalMs: 10000,
+                });
                 return null;
             }
         }
@@ -1177,7 +1213,11 @@ export class CesiumWorld {
         if (typeof scene.pickFromRay !== 'function') {
             const now = performance.now();
             if (now - this._lastPickWarning > 5000) {
-                console.warn('[CesiumWorld] scene.pickFromRay is unavailable; collision uses height sampling only.');
+                reportUserError(
+                    'Scene pickFromRay unavailable',
+                    new Error('collision uses height sampling only'),
+                    { key: 'scene-pick-from-ray-unavailable', intervalMs: 10000 }
+                );
                 this._lastPickWarning = now;
             }
             return null;
@@ -1193,7 +1233,11 @@ export class CesiumWorld {
         let hit;
         try {
             hit = scene.pickFromRay(ray, this._collisionExclusions());
-        } catch (_) {
+        } catch (error) {
+            reportUserError('Scene pickFromRay failed during collision query', error, {
+                key: 'scene-pick-from-ray-collision',
+                intervalMs: 10000,
+            });
             return null;
         }
         if (!hit || !Cesium.defined(hit.position)) return null;
@@ -1320,12 +1364,21 @@ export class CesiumWorld {
                 viewer.render();
                 return;
             }
-        } catch (_) {}
+        } catch (error) {
+            reportUserError('Viewer render failed', error, {
+                key: 'viewer-render',
+                intervalMs: 10000,
+            });
+        }
         try {
             if (typeof viewer.scene.render === 'function') {
                 viewer.scene.render(viewer.clock ? viewer.clock.currentTime : undefined);
             }
-        } catch (_) {
+        } catch (error) {
+            reportUserError('Scene render failed', error, {
+                key: 'scene-render',
+                intervalMs: 10000,
+            });
             viewer.scene.requestRender();
         }
     }
@@ -1482,7 +1535,10 @@ export class CesiumWorld {
             this._panoramaProjector = new PanoramaEquirectProjector();
             return this._panoramaProjector;
         } catch (error) {
-            console.warn('[CesiumWorld] GPU panorama projection unavailable:', error);
+            reportUserError('GPU panorama projection unavailable', error, {
+                key: 'gpu-panorama-projection',
+                intervalMs: 10000,
+            });
             this._panoramaProjector = false;
             return null;
         }
@@ -1510,6 +1566,8 @@ export class CesiumWorld {
         const basis = this.getTransformBasisFixed(transform);
         const destination = this.localToCartesian(transform.position);
         const faceFovDeg = Math.max(90, Math.min(170, Number(options.faceFovDeg) || 130));
+        const topPoleGuardDeg = Math.max(0, Math.min(45, Number(options.topPoleGuardDeg) || 0));
+        const bottomPoleGuardDeg = Math.max(0, Math.min(45, Number(options.bottomPoleGuardDeg) || 0));
         const frameDelayMs = Math.max(0, Math.min(1000, Number(options.frameDelayMs) || 0));
         const sleep = (ms) => new Promise(resolve => window.setTimeout(resolve, ms));
 
@@ -1538,7 +1596,7 @@ export class CesiumWorld {
                 projector.updateFace(faceDef.name, viewer.scene.canvas);
             }
 
-            const canvas = projector.render(width, height, verticalFovDeg, faceFovDeg);
+            const canvas = projector.render(width, height, verticalFovDeg, faceFovDeg, topPoleGuardDeg, bottomPoleGuardDeg);
             return {
                 canvas,
                 complete: !!canvas,
@@ -1566,6 +1624,8 @@ export class CesiumWorld {
         const viewer = await this._ensurePanoramaCaptureViewer(faceSize);
         return this._capturePanoramaHybridWithViewerAsync(viewer, transform, width, height, faceSize, verticalFovDeg, {
             faceFovDeg: options.faceFovDeg,
+            topPoleGuardDeg: options.topPoleGuardDeg,
+            bottomPoleGuardDeg: options.bottomPoleGuardDeg,
             frameDelayMs: options.frameDelayMs,
         });
     }
@@ -1582,6 +1642,8 @@ export class CesiumWorld {
         const viewer = await this._ensurePanoramaCaptureViewer(faceSize);
         return this._capturePanoramaHybridWithViewerAsync(viewer, transform, width, height, faceSize, verticalFovDeg, {
             faceFovDeg: options.faceFovDeg,
+            topPoleGuardDeg: options.topPoleGuardDeg,
+            bottomPoleGuardDeg: options.bottomPoleGuardDeg,
             frameDelayMs: options.frameDelayMs,
         });
     }

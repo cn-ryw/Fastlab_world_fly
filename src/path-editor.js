@@ -62,6 +62,7 @@
  */
 
 import { sampleClosed, tangentAtPoint } from './catmull-rom.js';
+import { reportUserError } from './error-report.js';
 
 // ---- Config constants ----
 const MAX_CANVAS_PX   = 900;
@@ -313,7 +314,13 @@ export function editPath({ octree, bounds, spawnPoint, initialPath, gateSize, cl
                     hitCount = typeof octree.querySphereCount === 'function'
                         ? octree.querySphereCount(p.x, p.y, p.z, r)
                         : octree.querySphere(p.x, p.y, p.z, r).length;
-                } catch (_) { hitCount = 0; }
+                } catch (error) {
+                    reportUserError('Path editor clearance query failed', error, {
+                        key: 'path-editor-clearance',
+                        intervalMs: 10000,
+                    });
+                    hitCount = 0;
+                }
                 clearanceCache[i] = hitCount === 0;
             }
         }
@@ -628,7 +635,14 @@ export function editPath({ octree, bounds, spawnPoint, initialPath, gateSize, cl
         // --- Teardown -----------------------------------------------
         function finish(result) {
             window.removeEventListener('keydown', onKey, true);
-            try { document.body.removeChild(overlay); } catch (_) {}
+            try {
+                document.body.removeChild(overlay);
+            } catch (error) {
+                reportUserError('Path editor close failed', error, {
+                    key: 'path-editor-close',
+                    intervalMs: 10000,
+                });
+            }
             resolve(result);
         }
 

@@ -30,6 +30,7 @@ import { Drone } from './drone.js';
 import { HUD } from './hud.js';
 import { OSD } from './osd.js';
 import { PanoramaSensor } from './panorama-sensor.js';
+import { reportUserError } from './error-report.js';
 
 let world = null;
 let collisionProvider = null;
@@ -88,15 +89,11 @@ let cachedHFov = 120;
 let flightStartWarnings = [];
 
 function urlNumber(name, fallback, min = -Infinity, max = Infinity) {
-    try {
-        const value = new URLSearchParams(window.location.search).get(name);
-        if (value == null || value === '') return fallback;
-        const n = Number(value);
-        if (!Number.isFinite(n)) return fallback;
-        return Math.max(min, Math.min(max, n));
-    } catch (_) {
-        return fallback;
-    }
+    const value = new URLSearchParams(window.location.search).get(name);
+    if (value == null || value === '') return fallback;
+    const n = Number(value);
+    if (!Number.isFinite(n)) return fallback;
+    return Math.max(min, Math.min(max, n));
 }
 
 function normalizeViewMode(value, fallback = 'first') {
@@ -174,10 +171,7 @@ function updateViewChoiceHint() {
 }
 
 function showError(error) {
-    console.error(error);
-    const msg = error && error.message ? error.message : String(error);
-    setProgress(msg, true);
-    document.getElementById('loading-overlay')?.classList.add('visible');
+    reportUserError('Startup failed', error, { overlay: true, intervalMs: 0 });
 }
 
 function withTimeout(promise, timeoutMs, label) {
@@ -273,7 +267,10 @@ function warmPanoramaViewerInBackground() {
         : { faceSize: 256 };
     panoramaWarmupPromise = world.warmPanoramaCaptureViewer(options.faceSize)
         .catch((error) => {
-            console.warn('[TilesFlight] panorama viewer warmup failed:', error);
+            reportUserError('Panorama viewer warmup failed', error, {
+                key: 'panorama-warmup',
+                intervalMs: 10000,
+            });
             panoramaWarmupPromise = null;
             return false;
         });
@@ -317,7 +314,10 @@ async function preloadPanoramaBeforeFlight() {
         return ready;
     } catch (error) {
         if (FLIGHT_PRELOAD_STRICT) throw error;
-        console.warn('[TilesFlight] panorama preload failed; live capture will retry in flight:', error);
+        reportUserError('Panorama preload failed; live capture will retry in flight', error, {
+            key: 'panorama-preload',
+            intervalMs: 10000,
+        });
         return false;
     }
 }
@@ -495,7 +495,11 @@ async function confirmSpawnAndFly() {
             const coverage = preload && preload.coverage ? preload.coverage.ratio : 0;
             const pct = Math.round(coverage * 100);
             if (preload && preload.coverage && coverage < FLIGHT_PRELOAD_MIN_COVERAGE) {
-                console.warn(`[TilesFlight] low preload coverage around spawn: ${pct}%`, preload);
+                reportUserError(
+                    'Flight tile preload coverage low',
+                    new Error(`coverage ${pct}% below required ${Math.round(FLIGHT_PRELOAD_MIN_COVERAGE * 100)}%`),
+                    { key: 'flight-preload-coverage-low', intervalMs: 10000 }
+                );
             }
             const coverageReady = preload && preload.coverage
                 ? coverage >= FLIGHT_PRELOAD_MIN_COVERAGE
@@ -514,10 +518,13 @@ async function confirmSpawnAndFly() {
         } catch (e) {
             const msg = e && e.message ? e.message : String(e);
             if (FLIGHT_PRELOAD_STRICT) {
-                console.error('[TilesFlight] required tile preload failed:', e);
+                reportUserError('Required flight tile preload failed', e, { intervalMs: 0 });
                 throw new Error(`Required flight tile preload failed: ${msg}`);
             }
-            console.warn('[TilesFlight] tile preload failed; continuing to view selection:', e);
+            reportUserError('Flight tile preload failed; continuing to view selection', e, {
+                key: 'flight-tile-preload',
+                intervalMs: 10000,
+            });
             rememberFlightStartWarning(`flight tile preload skipped: ${shortStatusMessage(msg)}`);
         }
 
@@ -525,14 +532,20 @@ async function confirmSpawnAndFly() {
             await preloadInitialFlightViewsBeforeControl();
         } catch (e) {
             if (FLIGHT_PRELOAD_STRICT) throw e;
-            console.warn('[TilesFlight] initial flight view preload failed; continuing:', e);
+            reportUserError('Initial flight view preload failed; continuing', e, {
+                key: 'initial-flight-view-preload',
+                intervalMs: 10000,
+            });
         }
 
         try {
             await preloadPanoramaBeforeFlight();
         } catch (e) {
             if (FLIGHT_PRELOAD_STRICT) throw e;
-            console.warn('[TilesFlight] panorama preload failed; continuing:', e);
+            reportUserError('Panorama preload failed; continuing', e, {
+                key: 'panorama-preload-before-flight',
+                intervalMs: 10000,
+            });
         }
 
         mode = 'view-select';
@@ -540,13 +553,14 @@ async function confirmSpawnAndFly() {
         document.getElementById('view-choice-overlay')?.classList.add('visible');
         applyDisplaySettings();
     } catch (e) {
-        console.error('[TilesFlight] failed to confirm spawn:', e);
-        const msg = e && e.message ? e.message : String(e);
-        setProgress(`Spawn failed: ${msg}`, true);
+        reportUserError('Spawn failed', e, { overlay: true, intervalMs: 0 });
         try {
             await enterPlacementMode(false);
         } catch (restoreError) {
-            console.warn('[TilesFlight] failed to restore placement mode:', restoreError);
+            reportUserError('Failed to restore placement mode', restoreError, {
+                key: 'restore-placement',
+                intervalMs: 10000,
+            });
         }
     } finally {
         document.getElementById('loading-overlay')?.classList.remove('visible');
@@ -650,7 +664,10 @@ function gameLoop(now) {
             updateFlight(frameDt);
         }
     } catch (e) {
-        console.error('[gameLoop]', e);
+        reportUserError('Frame update failed', e, {
+            key: 'game-loop',
+            intervalMs: 3000,
+        });
     }
     requestAnimationFrame(gameLoop);
 }
@@ -870,7 +887,14 @@ function setupThirdPersonPointerControls() {
         thirdPersonPointer.button = e.button;
         thirdPersonPointer.x = e.clientX;
         thirdPersonPointer.y = e.clientY;
-        try { canvas.setPointerCapture(e.pointerId); } catch (_) {}
+        try {
+            canvas.setPointerCapture(e.pointerId);
+        } catch (error) {
+            reportUserError('Pointer capture failed', error, {
+                key: 'pointer-capture',
+                intervalMs: 10000,
+            });
+        }
     });
 
     canvas.addEventListener('pointermove', (e) => {

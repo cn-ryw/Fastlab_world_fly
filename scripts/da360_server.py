@@ -44,7 +44,7 @@ DEFAULT_MODEL = Path(os.environ.get(
     DA360_ROOT / "checkpoints" / f"DA360_{DEFAULT_MODEL_NAME}.pth",
 ))
 PATCH_SIZE = 14
-DEFAULT_INPUT_SCALE = 1.0
+DEFAULT_INPUT_SCALE = 0.65
 
 
 def env_bool(name, default=False):
@@ -97,7 +97,15 @@ def decode_request_image(req):
         image = Image.open(io.BytesIO(req.get_data()))
         return ImageOps.exif_transpose(image).convert("RGB")
 
-    data = req.get_json(silent=True) or {}
+    is_json = content_type == "application/json" or content_type.endswith("+json")
+    if not is_json:
+        raise ValueError("No image data received")
+    try:
+        data = req.get_json(silent=False)
+    except Exception as exc:  # pylint: disable=broad-except
+        raise ValueError(f"Invalid JSON body: {exc}") from exc
+    if not isinstance(data, dict):
+        raise ValueError("JSON body must be an object")
     if "image" not in data:
         raise ValueError("No image data received")
     return decode_data_url(data["image"])
@@ -217,8 +225,8 @@ class DA360Runner:
             torch.backends.cudnn.allow_tf32 = True
             try:
                 torch.set_float32_matmul_precision("high")
-            except Exception:
-                pass
+            except Exception as exc:  # pylint: disable=broad-except
+                print(f"[DA360] set_float32_matmul_precision failed: {exc}", file=sys.stderr)
 
         checkpoint = load_torch_checkpoint(model_path, self.device)
         checkpoint.setdefault("net", "DA360")
@@ -261,6 +269,7 @@ class DA360Runner:
         self.mean = torch.tensor([0.485, 0.456, 0.406], device=self.device).view(1, 3, 1, 1)
         self.std = torch.tensor([0.229, 0.224, 0.225], device=self.device).view(1, 3, 1, 1)
         resample_name = os.environ.get("DA360_RESAMPLE", "bilinear").strip().lower()
+        self.resample_name = "bicubic" if resample_name == "bicubic" else "bilinear"
         self.resample = Image.Resampling.BICUBIC if resample_name == "bicubic" else Image.Resampling.BILINEAR
         self.lock = threading.Lock()
 
@@ -315,6 +324,7 @@ def create_app(runner):
             "checkpoint_width": runner.checkpoint_width,
             "checkpoint_height": runner.checkpoint_height,
             "input_scale": runner.input_scale,
+            "resample": runner.resample_name,
             "amp": runner.use_amp,
             "channels_last": runner.channels_last,
         })
@@ -326,18 +336,29 @@ def create_app(runner):
         started = time.time()
 
         try:
+            timings = {}
+            mark = time.time()
             image = decode_request_image(request)
+            timings["decode_ms"] = (time.time() - mark) * 1000.0
             request_width, request_height = image.size
+            mark = time.time()
             pred_depth = runner.infer(image)
+            timings["infer_ms"] = (time.time() - mark) * 1000.0
+            mark = time.time()
             colored, depth_scale = depth_to_color(pred_depth)
+            timings["color_ms"] = (time.time() - mark) * 1000.0
+            mark = time.time()
+            depth_image = encode_image(
+                colored,
+                os.environ.get("DA360_OUTPUT_FORMAT", "jpeg"),
+                env_int("DA360_JPEG_QUALITY", 72),
+            )
+            timings["encode_ms"] = (time.time() - mark) * 1000.0
             return jsonify({
-                "depth_image": encode_image(
-                    colored,
-                    os.environ.get("DA360_OUTPUT_FORMAT", "jpeg"),
-                    env_int("DA360_JPEG_QUALITY", 72),
-                ),
+                "depth_image": depth_image,
                 "depth_scale": depth_scale,
                 "latency_ms": (time.time() - started) * 1000.0,
+                "timings_ms": timings,
                 "model": runner.model_name,
                 "device": str(runner.device),
                 "width": runner.width,
@@ -381,7 +402,7 @@ def main():
     print(f"Model: {args.model_path}")
     print(f"Device: {runner.device}")
     print(f"Input: {runner.width}x{runner.height} (checkpoint {runner.checkpoint_width}x{runner.checkpoint_height})")
-    app.run(host=args.host, port=args.port, debug=args.debug, threaded=True)
+    app.run(host=args.host, port=args.port, debug=args.debug, threaded=False)
 
 
 if __name__ == "__main__":

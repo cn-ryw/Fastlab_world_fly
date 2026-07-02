@@ -63,8 +63,8 @@ class Handler(http.server.SimpleHTTPRequestHandler):
     def handle(self):
         try:
             super().handle()
-        except (BrokenPipeError, ConnectionResetError):
-            pass
+        except (BrokenPipeError, ConnectionResetError) as e:
+            print(f"Client connection closed while handling request: {e}", file=sys.stderr)
 
     def end_headers(self):
         # Enable CORS and proper MIME types for ES modules

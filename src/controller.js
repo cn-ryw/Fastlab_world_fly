@@ -22,6 +22,7 @@
 
 import { editPath } from './path-editor.js';
 import { formatLap } from './gates.js';
+import { reportUserError } from './error-report.js';
 
 const ACTIONS = ['roll', 'pitch', 'throttle', 'yaw', 'cameraTilt'];
 const BUTTON_ACTIONS = ['arm', 'modeSwitch'];
@@ -599,7 +600,12 @@ export class Controller {
         }
         if (this._gatePathApplyCb) {
             try { this._gatePathApplyCb(); }
-            catch (e) { console.warn('[Race] apply failed:', e); }
+            catch (e) {
+                reportUserError('Gate path apply failed', e, {
+                    key: 'gate-path-apply',
+                    intervalMs: 10000,
+                });
+            }
         }
     }
 
@@ -1078,7 +1084,10 @@ export class Controller {
 
             return this._openHIDDevice(devices[0]);
         } catch (error) {
-            console.error('HID connection error:', error);
+            reportUserError('HID connection failed', error, {
+                key: 'hid-connection',
+                intervalMs: 10000,
+            });
             return false;
         }
     }
@@ -1106,7 +1115,10 @@ export class Controller {
             this._buildSettingsUI();
             return true;
         } catch (error) {
-            console.error('Failed to open HID device:', error);
+            reportUserError('Failed to open HID device', error, {
+                key: 'hid-open-device',
+                intervalMs: 10000,
+            });
             return false;
         }
     }
@@ -1964,7 +1976,8 @@ export class Controller {
                         const config = JSON.parse(ev.target.result);
                         this.loadConfig(config);
                     } catch (err) {
-                        alert('Invalid config file');
+                        reportUserError('Invalid controller config file', err, { intervalMs: 0 });
+                        alert(`Invalid config file: ${err && err.message ? err.message : String(err)}`);
                     }
                 };
                 reader.readAsText(file);
@@ -2068,7 +2081,12 @@ export class Controller {
     _saveConfig() {
         try {
             localStorage.setItem('drone_sim_controller_config', JSON.stringify(this.getConfig()));
-        } catch (e) { /* ignore */ }
+        } catch (e) {
+            reportUserError('Controller config save failed', e, {
+                key: 'controller-config-save',
+                intervalMs: 10000,
+            });
+        }
     }
 
     _migrateConfig(config) {
@@ -2139,6 +2157,11 @@ export class Controller {
                     this._mergeGatePathSettings(config.raceCourseSettings);
                 }
             }
-        } catch (e) { /* ignore */ }
+        } catch (e) {
+            reportUserError('Controller config load failed', e, {
+                key: 'controller-config-load',
+                intervalMs: 10000,
+            });
+        }
     }
 }

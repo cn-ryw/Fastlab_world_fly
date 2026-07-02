@@ -48,6 +48,8 @@
  * intermediate state and the loader tolerates it.
  */
 
+import { reportUserError } from './error-report.js';
+
 const API_BASE = '/api/path/';
 const SCHEMA_VERSION = 1;
 
@@ -80,8 +82,8 @@ export function keyFor(file) {
  *   - the parsed record object on 200,
  *   - `null` on 404 (first time this scene is loaded),
  *   - `null` on any other failure (network / malformed JSON), with a
- *     console warning — we never reject, because a missing path file is
- *     not an error condition worth blocking scene load.
+ *     user-visible error banner — we never reject, because a missing path
+ *     file is not an error condition worth blocking scene load.
  *
  * @param {File} file
  * @returns {Promise<object | null>}
@@ -93,13 +95,19 @@ export async function loadForScene(file) {
         const res = await fetch(API_BASE + key, { method: 'GET' });
         if (res.status === 404) return null;
         if (!res.ok) {
-            console.warn(`[path-store] load ${key}: HTTP ${res.status}`);
+            reportUserError('Gate path load failed', new Error(`${key}: HTTP ${res.status}`), {
+                key: `path-load-${key}`,
+                intervalMs: 10000,
+            });
             return null;
         }
         const data = await res.json();
         return _validate(data, file) ? data : null;
     } catch (e) {
-        console.warn(`[path-store] load ${key} failed:`, e);
+        reportUserError(`Gate path load failed (${key})`, e, {
+            key: `path-load-${key}`,
+            intervalMs: 10000,
+        });
         return null;
     }
 }
@@ -118,7 +126,7 @@ export async function loadForScene(file) {
  *   path?: object | null,
  *   bestLapMs?: number | null,
  * }} record
- * @returns {Promise<boolean>}  true on success, false on failure (console-logged)
+ * @returns {Promise<boolean>}  true on success, false on failure (reported to the user)
  */
 export async function saveForScene(file, record) {
     const key = keyFor(file);
@@ -139,12 +147,18 @@ export async function saveForScene(file, record) {
             body,
         });
         if (!res.ok) {
-            console.warn(`[path-store] save ${key}: HTTP ${res.status}`);
+            reportUserError('Gate path save failed', new Error(`${key}: HTTP ${res.status}`), {
+                key: `path-save-${key}`,
+                intervalMs: 10000,
+            });
             return false;
         }
         return true;
     } catch (e) {
-        console.warn(`[path-store] save ${key} failed:`, e);
+        reportUserError(`Gate path save failed (${key})`, e, {
+            key: `path-save-${key}`,
+            intervalMs: 10000,
+        });
         return false;
     }
 }
@@ -161,9 +175,17 @@ export async function deleteForScene(file) {
     if (!key) return false;
     try {
         const res = await fetch(API_BASE + key, { method: 'DELETE' });
-        return res.ok || res.status === 404;
+        if (res.ok || res.status === 404) return true;
+        reportUserError('Gate path delete failed', new Error(`${key}: HTTP ${res.status}`), {
+            key: `path-delete-${key}`,
+            intervalMs: 10000,
+        });
+        return false;
     } catch (e) {
-        console.warn(`[path-store] delete ${key} failed:`, e);
+        reportUserError(`Gate path delete failed (${key})`, e, {
+            key: `path-delete-${key}`,
+            intervalMs: 10000,
+        });
         return false;
     }
 }
@@ -180,12 +202,19 @@ export async function deleteForScene(file) {
 function _validate(data, file) {
     if (!data || typeof data !== 'object') return false;
     if (Number(data.schemaVersion) !== SCHEMA_VERSION) {
-        console.warn(`[path-store] schema v${data.schemaVersion} differs from client v${SCHEMA_VERSION}; discarding`);
+        reportUserError('Gate path schema mismatch', new Error(`stored v${data.schemaVersion}, client v${SCHEMA_VERSION}`), {
+            key: 'path-schema-mismatch',
+            intervalMs: 10000,
+        });
         return false;
     }
     if (typeof data.filename !== 'string' || !data.filename) return false;
     if (file && Number(data.fileSize) !== Number(file.size)) {
-        console.warn(`[path-store] size mismatch for ${data.filename}: stored=${data.fileSize} current=${file.size}`);
+        reportUserError(
+            'Gate path file size mismatch',
+            new Error(`${data.filename}: stored=${data.fileSize}, current=${file.size}`),
+            { key: 'path-size-mismatch', intervalMs: 10000 }
+        );
     }
     return true;
 }

@@ -61,6 +61,7 @@
  */
 
 import { evaluateClosed, tangentAtPoint, sampleClosed } from './catmull-rom.js';
+import { reportUserError } from './error-report.js';
 
 const DEFAULT_OPTS = {
     gateSize:  1.2,    // metres — square gate, edge length
@@ -352,7 +353,14 @@ export class GateCourse {
 
     _applyVisibility() {
         if (!this._rootEntity) return;
-        try { this._rootEntity.enabled = this._visible; } catch (_) { /* no-op */ }
+        try {
+            this._rootEntity.enabled = this._visible;
+        } catch (error) {
+            reportUserError('Gate course visibility update failed', error, {
+                key: 'gate-course-visibility',
+                intervalMs: 10000,
+            });
+        }
     }
 
     /**
@@ -691,7 +699,14 @@ export class GateCourse {
         const dist = (index - this.nextGateIdx + N) % N;
         const visible = dist < HORIZON;
         if (gate.entity) {
-            try { gate.entity.enabled = visible; } catch (_) { /* no-op */ }
+            try {
+                gate.entity.enabled = visible;
+            } catch (error) {
+                reportUserError('Gate visibility update failed', error, {
+                    key: 'gate-visibility',
+                    intervalMs: 10000,
+                });
+            }
         }
         if (!visible) return;
 
@@ -863,7 +878,12 @@ export class GateCourse {
         console.log(`[Race] passed gate ${i + 1} / ${N}`);
         if (typeof this.onGatePassed === 'function') {
             try { this.onGatePassed(i, N); }
-            catch (e) { console.warn('[Race] onGatePassed callback error:', e); }
+            catch (e) {
+                reportUserError('Gate passed callback failed', e, {
+                    key: 'gate-passed-callback',
+                    intervalMs: 10000,
+                });
+            }
         }
     }
 
@@ -893,11 +913,21 @@ export class GateCourse {
         console.log(`[Race] lap ${this.lapCount}: ${(lapMs / 1000).toFixed(3)} s${isBest ? ' — NEW BEST' : ''}`);
         if (typeof this.onLapComplete === 'function') {
             try { this.onLapComplete(lapMs, isBest); }
-            catch (e) { console.warn('[Race] onLapComplete callback error:', e); }
+            catch (e) {
+                reportUserError('Lap complete callback failed', e, {
+                    key: 'lap-complete-callback',
+                    intervalMs: 10000,
+                });
+            }
         }
         if (isBest && typeof this.onBestLap === 'function') {
             try { this.onBestLap(lapMs); }
-            catch (e) { console.warn('[Race] onBestLap callback error:', e); }
+            catch (e) {
+                reportUserError('Best lap callback failed', e, {
+                    key: 'best-lap-callback',
+                    intervalMs: 10000,
+                });
+            }
         }
     }
 
@@ -957,7 +987,14 @@ export class GateCourse {
     /** Tear down all PlayCanvas entities and clear state. */
     destroy() {
         if (this._rootEntity) {
-            try { this._rootEntity.destroy(); } catch (_) { /* already dead */ }
+            try {
+                this._rootEntity.destroy();
+            } catch (error) {
+                reportUserError('Gate course destroy failed', error, {
+                    key: 'gate-course-destroy',
+                    intervalMs: 10000,
+                });
+            }
             this._rootEntity = null;
         }
         this.gates = [];

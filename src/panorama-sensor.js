@@ -1,13 +1,11 @@
+import { reportUserError } from './error-report.js';
+
 function urlNumber(name, fallback, min, max) {
-    try {
-        const value = new URLSearchParams(window.location.search).get(name);
-        if (value == null || value === '') return fallback;
-        const n = Number(value);
-        if (!Number.isFinite(n)) return fallback;
-        return Math.max(min, Math.min(max, n));
-    } catch (_) {
-        return fallback;
-    }
+    const value = new URLSearchParams(window.location.search).get(name);
+    if (value == null || value === '') return fallback;
+    const n = Number(value);
+    if (!Number.isFinite(n)) return fallback;
+    return Math.max(min, Math.min(max, n));
 }
 
 function evenNumber(value) {
@@ -16,7 +14,7 @@ function evenNumber(value) {
 }
 
 const CAPTURE_INTERVAL_MS = urlNumber('panoMs', 16, 8, 10000);
-const DEPTH_INTERVAL_MS = urlNumber('depthMs', 600, 150, 10000);
+const DEPTH_INTERVAL_MS = urlNumber('depthMs', 100, 50, 10000);
 const DA360_TIMEOUT_MS = urlNumber('da360TimeoutMs', 12000, 1000, 60000);
 const DA360_UPLOAD_SCALE = urlNumber('da360UploadScale', 0.2, 0.05, 1);
 const DA360_UPLOAD_WIDTH = Math.round(urlNumber('da360UploadWidth', 0, 0, 5760));
@@ -27,6 +25,8 @@ const PANORAMA_FACE_SIZE = Math.round(urlNumber('panoFace', 192, 128, 2048));
 const PANORAMA_VERTICAL_FOV = urlNumber('panoVfov', 180, 30, 180);
 const PANORAMA_JPEG_QUALITY = urlNumber('panoJpeg', 0.74, 0.35, 0.95);
 const PANORAMA_FACE_FOV = urlNumber('panoFaceFov', 130, 90, 170);
+const PANORAMA_TOP_POLE_GUARD = urlNumber('panoTopPoleGuard', 10, 0, 45);
+const PANORAMA_BOTTOM_POLE_GUARD = urlNumber('panoBottomPoleGuard', 2, 0, 45);
 const PANORAMA_FRAME_DELAY_MS = urlNumber('panoFrameDelayMs', 8, 0, 1000);
 const PANORAMA_PRELOAD_FRAME_DELAY_MS = urlNumber(
     'panoPreloadFrameDelayMs',
@@ -130,6 +130,8 @@ export class PanoramaSensor {
             faceSize: PANORAMA_FACE_SIZE,
             verticalFovDeg: PANORAMA_VERTICAL_FOV,
             faceFovDeg: PANORAMA_FACE_FOV,
+            topPoleGuardDeg: PANORAMA_TOP_POLE_GUARD,
+            bottomPoleGuardDeg: PANORAMA_BOTTOM_POLE_GUARD,
             frameDelayMs: preload ? PANORAMA_PRELOAD_FRAME_DELAY_MS : PANORAMA_FRAME_DELAY_MS,
             timeoutMs: preload ? PANORAMA_PRELOAD_TIMEOUT_MS : 0,
         };
@@ -213,7 +215,12 @@ export class PanoramaSensor {
         this._drawPlaceholder(canvas, label);
         try {
             this.depthImg.src = canvas.toDataURL('image/png');
-        } catch (_) {}
+        } catch (error) {
+            reportUserError('Depth placeholder render failed', error, {
+                key: 'depth-placeholder',
+                intervalMs: 10000,
+            });
+        }
     }
 
     _setStatus(rgbStatus, depthStatus) {
@@ -286,7 +293,10 @@ export class PanoramaSensor {
                 this._requestDepth(this.rgbCanvas);
             }
         } catch (error) {
-            console.warn('[PanoramaSensor] capture failed:', error);
+            reportUserError('Panorama capture failed', error, {
+                key: 'panorama-capture',
+                intervalMs: 3000,
+            });
             this._setStatus(shortError(error), this.depthPending ? 'inferring' : 'offline');
         } finally {
             this.capturing = false;
@@ -375,9 +385,12 @@ export class PanoramaSensor {
                 : `${Math.round(this.lastDepthTime - started)}ms`;
             this._setStatus('ready', latency);
         } catch (error) {
-            console.warn('[PanoramaSensor] DA360 request failed:', error);
+            reportUserError('DA360 depth request failed', error, {
+                key: 'da360-depth-request',
+                intervalMs: 3000,
+            });
             this.lastDepthTime = performance.now();
-            this._setStatus('ready', 'offline');
+            this._setStatus('ready', shortError(error));
         } finally {
             window.clearTimeout(timeout);
             this.depthPending = false;

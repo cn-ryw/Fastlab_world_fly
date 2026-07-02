@@ -59,23 +59,19 @@ python3 -m pip install --user gdown
 docker rm -f mindcloud-da360-api
 ```
 
-注意，默认使用 `DA360_large`，DA360 服务端按 checkpoint 的官方输入尺寸 `1036x518` 推理。右下角 RGB 全景仍保持原始显示尺寸；只有发送给 DA360 的深度请求会单独缩小，前端默认按 `da360UploadScale=0.2` 上传约 `134x67` 的 JPEG，再由服务端 resize 到模型输入尺寸。
+注意，默认使用 `DA360_large`，DA360 服务端以实时优先的 `DA360_INPUT_SCALE=0.65` 推理，模型输入约为 `672x336`；在 RTX 4070 Ti SUPER 上真实 HTTP 端到端约 70 ms。右下角 RGB 全景仍保持原始显示尺寸；只有发送给 DA360 的深度请求会单独缩小，前端默认按 `da360UploadScale=0.2` 上传约 `134x67` 的 JPEG，再由服务端 resize 到模型输入尺寸。前端默认 `depthMs=100`，推理未完成时不会堆积请求。
 
-需要换成其他 DA360 模型时，可选 `small`、`base` 或 `large`：
+默认不建议换模型；实验中 `DA360_large` 的 fast 档比 `DA360_small` 保留了更好的深度排序和边缘一致性。只有显存、功耗或部署体积受限时，再自行覆盖模型名：
 
 ```bash
-# 方式一：脚本参数
-./scripts/download_da360_model.sh small
-./scripts/start_da360_api.sh small
-
-# 方式二：环境变量
-DA360_MODEL=base ./scripts/download_da360_model.sh
-DA360_MODEL=base ./scripts/start_da360_api.sh
+DA360_MODEL=<large|base|small> ./scripts/download_da360_model.sh
+DA360_MODEL=<large|base|small> ./scripts/start_da360_api.sh
 ```
 
-如需主动调整 DA360 服务端模型输入尺寸，可设置推理 scale 或指定模型输入宽高；过低的 `DA360_INPUT_SCALE` 可能让 large 模型输出条带化深度，不建议默认低于 `0.46`。服务端 resize 默认使用 `DA360_RESAMPLE=bicubic`，与 DA360 原项目的输入缩放方式保持一致：
+如需主动调整 DA360 服务端模型输入尺寸，可设置推理 scale 或指定模型输入宽高；过低的 `DA360_INPUT_SCALE` 可能让 large 模型输出条带化深度，不建议低于 `0.46`。服务端 resize 默认使用 `DA360_RESAMPLE=bicubic`，与 DA360 原项目的输入缩放方式保持一致：
 
 ```bash
+DA360_INPUT_SCALE=1.0 ./scripts/start_da360_api.sh
 DA360_INPUT_SCALE=0.46 ./scripts/start_da360_api.sh
 DA360_INPUT_WIDTH=476 ./scripts/start_da360_api.sh
 DA360_INPUT_WIDTH=672 DA360_INPUT_HEIGHT=336 ./scripts/start_da360_api.sh
@@ -129,7 +125,7 @@ yaw   = pi - (u + 0.5) / W * 2pi
 pitch = vfov / 2 - (v + 0.5) / H * vfov
 ```
 
-这保证投影模型与 YOPO_360 的 ERP 相机一致；区别是数据来源为 Cesium 渲染视图，而不是仿真栅格的直接 raycast。放置阶段会后台创建全景采样 viewer；确认出生点后会在用户可控前预采样一张全景首帧。飞行中默认 `panoMs=16`、`panoFace=192`、每个采样方向等待 `panoFrameDelayMs=8`，优先提高移动时实时性；首帧预加载使用 `panoPreloadFrameDelayMs=96`，让隐藏 viewer 有时间拉取初始 tiles。
+这保证投影模型与 YOPO_360 的 ERP 相机一致；区别是数据来源为 Cesium 渲染视图，而不是仿真栅格的直接 raycast。放置阶段会后台创建全景采样 viewer；确认出生点后会在用户可控前预采样一张全景首帧。飞行中默认 `panoMs=16`、`panoFace=192`、每个采样方向等待 `panoFrameDelayMs=8`，优先提高移动时实时性；首帧预加载使用 `panoPreloadFrameDelayMs=96`，让隐藏 viewer 有时间拉取初始 tiles。为了避免 Google Tiles 天空/极区采样在 ERP 顶部形成海市蜃楼状伪影，默认对顶部 10 度和底部 2 度做极区 guard，可用 `panoTopPoleGuard` / `panoBottomPoleGuard` 调整或设为 0 关闭。
 
 进入可控飞行前，主 Cesium 视图会预加载出生点周围区域，并分别等待第一人称和第三人称初始视角 tiles idle。默认 `flightPreloadStrict=0`，只要目标区域覆盖率达标就进入视角选择；只有覆盖不足或预加载异常时才会在视角选择面板提示 warning。需要阻塞到全局 tiles 队列完全 idle 时可加 `?flightPreloadStrict=1`。
 
@@ -150,6 +146,9 @@ http://127.0.0.1:8080/?flightPreloadRadius=600&flightPreloadMinCoverage=0.98
 
 # 调整 RGB / 深度更新间隔
 http://127.0.0.1:8080/?panoMs=1000&depthMs=1200
+
+# 调整 ERP 极区 guard
+http://127.0.0.1:8080/?panoTopPoleGuard=0&panoBottomPoleGuard=0
 
 # 调整仅用于 DA360 的上传尺寸或缩放，不影响 RGB 全景显示
 http://127.0.0.1:8080/?da360UploadScale=0.35

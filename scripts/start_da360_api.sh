@@ -13,6 +13,7 @@ BASE_IMAGE="${DA360_BASE_IMAGE:-pytorch/pytorch:2.1.1-cuda12.1-cudnn8-runtime}"
 BUILD_NETWORK="${DA360_BUILD_NETWORK:-host}"
 BUILD_RETRIES="${DA360_BUILD_RETRIES:-3}"
 RESAMPLE="${DA360_RESAMPLE:-bicubic}"
+MOUNT_SERVER="${DA360_MOUNT_SERVER:-1}"
 if ! [[ "$BUILD_RETRIES" =~ ^[0-9]+$ ]] || (( BUILD_RETRIES < 1 )); then
     BUILD_RETRIES=1
 fi
@@ -121,41 +122,47 @@ docker info >/dev/null 2>&1 || {
 }
 
 build_ok=0
-existing_server_sha="$(image_label "mindcloud.da360.server_sha")"
-if [[ "${DA360_FORCE_BUILD:-0}" != "1" && "$existing_server_sha" != "$SERVER_SHA" ]] &&
+if [[ "${DA360_FORCE_BUILD:-0}" != "1" && "$MOUNT_SERVER" == "1" ]] &&
     docker image inspect "$IMAGE" >/dev/null 2>&1; then
-    existing_server_sha="$(image_server_sha_from_file)"
-fi
-if [[ "${DA360_FORCE_BUILD:-0}" != "1" && "$existing_server_sha" == "$SERVER_SHA" ]]; then
-    echo "DA360 image $IMAGE already contains the current server script; skipping rebuild."
+    echo "Using existing DA360 image $IMAGE and mounting the current server script; skipping rebuild."
     build_ok=1
 else
-    if [[ -n "$BUILD_NETWORK" ]]; then
-        echo "Using Docker build network: $BUILD_NETWORK"
-    fi
-    if [[ "$FORWARDED_PROXY_BUILD_ARGS" == "1" ]]; then
-        echo "Forwarding host proxy environment to Docker build."
-    fi
-    for ((attempt = 1; attempt <= BUILD_RETRIES; attempt++)); do
-        if docker build "${build_args[@]}" \
-            --build-arg "DA360_BASE_IMAGE=$BASE_IMAGE" \
-            --build-arg "DA360_SERVER_SHA=$SERVER_SHA" \
-            -f "$PROJECT_ROOT/Dockerfile.da360" \
-            -t "$IMAGE" \
-            "$PROJECT_ROOT"; then
-            build_ok=1
-            break
-        fi
-        if (( attempt < BUILD_RETRIES )); then
-            echo "WARNING: DA360 image build failed; retrying ($attempt/$BUILD_RETRIES)..." >&2
-            sleep 2
-        fi
-    done
-    if [[ "$build_ok" != "1" ]] && docker image inspect "$IMAGE" >/dev/null 2>&1; then
+    existing_server_sha="$(image_label "mindcloud.da360.server_sha")"
+    if [[ "${DA360_FORCE_BUILD:-0}" != "1" && "$existing_server_sha" != "$SERVER_SHA" ]] &&
+        docker image inspect "$IMAGE" >/dev/null 2>&1; then
         existing_server_sha="$(image_server_sha_from_file)"
-        if [[ "$existing_server_sha" == "$SERVER_SHA" ]]; then
-            echo "WARNING: failed to rebuild $IMAGE, but the existing local image contains the current server script; using it." >&2
-            build_ok=1
+    fi
+    if [[ "${DA360_FORCE_BUILD:-0}" != "1" && "$existing_server_sha" == "$SERVER_SHA" ]]; then
+        echo "DA360 image $IMAGE already contains the current server script; skipping rebuild."
+        build_ok=1
+    else
+        if [[ -n "$BUILD_NETWORK" ]]; then
+            echo "Using Docker build network: $BUILD_NETWORK"
+        fi
+        if [[ "$FORWARDED_PROXY_BUILD_ARGS" == "1" ]]; then
+            echo "Forwarding host proxy environment to Docker build."
+        fi
+        for ((attempt = 1; attempt <= BUILD_RETRIES; attempt++)); do
+            if docker build "${build_args[@]}" \
+                --build-arg "DA360_BASE_IMAGE=$BASE_IMAGE" \
+                --build-arg "DA360_SERVER_SHA=$SERVER_SHA" \
+                -f "$PROJECT_ROOT/Dockerfile.da360" \
+                -t "$IMAGE" \
+                "$PROJECT_ROOT"; then
+                build_ok=1
+                break
+            fi
+            if (( attempt < BUILD_RETRIES )); then
+                echo "WARNING: DA360 image build failed; retrying ($attempt/$BUILD_RETRIES)..." >&2
+                sleep 2
+            fi
+        done
+        if [[ "$build_ok" != "1" ]] && docker image inspect "$IMAGE" >/dev/null 2>&1; then
+            existing_server_sha="$(image_server_sha_from_file)"
+            if [[ "$existing_server_sha" == "$SERVER_SHA" ]]; then
+                echo "WARNING: failed to rebuild $IMAGE, but the existing local image contains the current server script; using it." >&2
+                build_ok=1
+            fi
         fi
     fi
 fi
@@ -183,7 +190,7 @@ run_args=(
     --name "$NAME"
     -p "$PORT:5688"
     -e "DA360_NO_WARMUP=${DA360_NO_WARMUP:-0}"
-    -e "DA360_INPUT_SCALE=${DA360_INPUT_SCALE:-1.0}"
+    -e "DA360_INPUT_SCALE=${DA360_INPUT_SCALE:-0.65}"
     -e "DA360_INPUT_WIDTH=${DA360_INPUT_WIDTH:-0}"
     -e "DA360_INPUT_HEIGHT=${DA360_INPUT_HEIGHT:-0}"
     -e "DA360_RESAMPLE=$RESAMPLE"
@@ -194,6 +201,10 @@ run_args=(
     -e "DA360_TORCH_COMPILE=${DA360_TORCH_COMPILE:-0}"
     -v "$MODEL_PATH:/models/$MODEL_BASENAME:ro"
 )
+
+if [[ "$MOUNT_SERVER" == "1" ]]; then
+    run_args+=(-v "$SCRIPT_DIR/da360_server.py:/opt/mindcloud-da360/scripts/da360_server.py:ro")
+fi
 
 if [[ "${DA360_DETACH:-1}" == "1" ]]; then
     run_args=(-d "${run_args[@]}")
