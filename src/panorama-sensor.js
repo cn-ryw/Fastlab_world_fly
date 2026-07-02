@@ -28,13 +28,17 @@ const PANORAMA_FACE_FOV = urlNumber('panoFaceFov', 130, 90, 170);
 const PANORAMA_TOP_POLE_GUARD = urlNumber('panoTopPoleGuard', 10, 0, 45);
 const PANORAMA_BOTTOM_POLE_GUARD = urlNumber('panoBottomPoleGuard', 2, 0, 45);
 const PANORAMA_FRAME_DELAY_MS = urlNumber('panoFrameDelayMs', 8, 0, 1000);
+const PANORAMA_FACE_TILE_TIMEOUT_MS = urlNumber('panoFaceTileTimeoutMs', 900, 0, 10000);
+const PANORAMA_FACE_TILE_QUIET_MS = urlNumber('panoFaceTileQuietMs', 180, 0, 5000);
 const PANORAMA_PRELOAD_FRAME_DELAY_MS = urlNumber(
     'panoPreloadFrameDelayMs',
     Math.max(96, PANORAMA_FRAME_DELAY_MS),
     0,
     1000
 );
-const PANORAMA_PRELOAD_TIMEOUT_MS = urlNumber('panoPreloadTimeoutMs', 7000, 500, 30000);
+const PANORAMA_PRELOAD_FACE_TILE_TIMEOUT_MS = urlNumber('panoPreloadFaceTileTimeoutMs', 6000, 500, 30000);
+const PANORAMA_PRELOAD_FACE_TILE_QUIET_MS = urlNumber('panoPreloadFaceTileQuietMs', 650, 0, 5000);
+const PANORAMA_PRELOAD_TIMEOUT_MS = urlNumber('panoPreloadTimeoutMs', 60000, 500, 120000);
 
 function getDA360Endpoint() {
     const params = new URLSearchParams(window.location.search);
@@ -133,6 +137,8 @@ export class PanoramaSensor {
             topPoleGuardDeg: PANORAMA_TOP_POLE_GUARD,
             bottomPoleGuardDeg: PANORAMA_BOTTOM_POLE_GUARD,
             frameDelayMs: preload ? PANORAMA_PRELOAD_FRAME_DELAY_MS : PANORAMA_FRAME_DELAY_MS,
+            tileTimeoutMs: preload ? PANORAMA_PRELOAD_FACE_TILE_TIMEOUT_MS : PANORAMA_FACE_TILE_TIMEOUT_MS,
+            tileQuietMs: preload ? PANORAMA_PRELOAD_FACE_TILE_QUIET_MS : PANORAMA_FACE_TILE_QUIET_MS,
             timeoutMs: preload ? PANORAMA_PRELOAD_TIMEOUT_MS : 0,
         };
     }

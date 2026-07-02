@@ -407,6 +407,8 @@ export class CesiumWorld {
         this._panoramaInitPromise = null;
         this._panoramaFaceSize = 0;
         this._panoramaProjector = null;
+        this._panoramaTileset = null;
+        this._panoramaTileLoadState = { pending: null, processing: null };
 
         this.originCartographic = null;
         this.enuToFixed = null;
@@ -547,27 +549,35 @@ export class CesiumWorld {
         return Cesium.Cesium3DTileset.fromIonAssetId(this.assetId);
     }
 
-    _wireTilesetDiagnostics(progressCb = null) {
-        if (!this.tileset) return;
+    _wireTilesetDiagnostics(progressCb = null, tileset = this.tileset, loadState = null, label = 'Google 3D Tiles') {
+        if (!tileset) return;
+        const keyPrefix = String(label || 'Google 3D Tiles').toLowerCase().replace(/[^a-z0-9]+/g, '-');
         const onFailure = (error) => {
             const message = error && error.message ? error.message : String(error || 'unknown tile error');
-            reportUserError('Google 3D Tiles request failed', error, {
-                key: `google-tile-failed-${message}`,
+            reportUserError(`${label} request failed`, error, {
+                key: `${keyPrefix}-failed-${message}`,
                 intervalMs: 10000,
             });
-            if (progressCb) progressCb(`Google 3D Tiles request failed: ${message}`, true);
+            if (progressCb) progressCb(`${label} request failed: ${message}`, true);
         };
 
-        if (this.tileset.tileFailed && typeof this.tileset.tileFailed.addEventListener === 'function') {
-            this.tileset.tileFailed.addEventListener(onFailure);
+        if (tileset.tileFailed && typeof tileset.tileFailed.addEventListener === 'function') {
+            tileset.tileFailed.addEventListener(onFailure);
         }
-        if (this.tileset.errorEvent && typeof this.tileset.errorEvent.addEventListener === 'function') {
-            this.tileset.errorEvent.addEventListener(onFailure);
+        if (tileset.errorEvent && typeof tileset.errorEvent.addEventListener === 'function') {
+            tileset.errorEvent.addEventListener(onFailure);
         }
-        if (this.tileset.loadProgress && typeof this.tileset.loadProgress.addEventListener === 'function') {
-            this.tileset.loadProgress.addEventListener((pending, processing) => {
-                this._tileLoadPending = Math.max(0, Number(pending) || 0);
-                this._tileLoadProcessing = Math.max(0, Number(processing) || 0);
+        if (tileset.loadProgress && typeof tileset.loadProgress.addEventListener === 'function') {
+            tileset.loadProgress.addEventListener((pending, processing) => {
+                const nextPending = Math.max(0, Number(pending) || 0);
+                const nextProcessing = Math.max(0, Number(processing) || 0);
+                if (loadState) {
+                    loadState.pending = nextPending;
+                    loadState.processing = nextProcessing;
+                } else {
+                    this._tileLoadPending = nextPending;
+                    this._tileLoadProcessing = nextProcessing;
+                }
             });
         }
     }
@@ -649,8 +659,9 @@ export class CesiumWorld {
         };
     }
 
-    waitForTilesIdle(timeoutMs = 1600, quietMs = 180) {
-        if (!this.tileset) return Promise.resolve(true);
+    waitForTilesIdle(timeoutMs = 1600, quietMs = 180, tileset = null, loadState = null, renderViewer = null) {
+        const targetTileset = tileset || this.tileset;
+        if (!targetTileset) return Promise.resolve(true);
 
         return new Promise((resolve) => {
             const started = performance.now();
@@ -665,11 +676,21 @@ export class CesiumWorld {
 
             const tick = () => {
                 if (done) return;
+                if (
+                    renderViewer &&
+                    (!renderViewer.isDestroyed || !renderViewer.isDestroyed()) &&
+                    renderViewer.scene
+                ) {
+                    renderViewer.scene.requestRender();
+                    this._renderViewerNow(renderViewer);
+                }
                 const now = performance.now();
-                const queueKnown = this._tileLoadPending !== null || this._tileLoadProcessing !== null;
+                const pending = loadState ? loadState.pending : this._tileLoadPending;
+                const processing = loadState ? loadState.processing : this._tileLoadProcessing;
+                const queueKnown = pending !== null || processing !== null;
                 const queueIdle = !queueKnown ||
-                    ((this._tileLoadPending || 0) <= 0 && (this._tileLoadProcessing || 0) <= 0);
-                const loaded = this.tileset.tilesLoaded === true && queueIdle;
+                    ((pending || 0) <= 0 && (processing || 0) <= 0);
+                const loaded = targetTileset.tilesLoaded === true && queueIdle;
 
                 if (loaded) {
                     if (idleSince == null) idleSince = now;
@@ -1439,6 +1460,8 @@ export class CesiumWorld {
         this._panoramaContainer = null;
         this._panoramaInitPromise = null;
         this._panoramaFaceSize = 0;
+        this._panoramaTileset = null;
+        this._panoramaTileLoadState = { pending: null, processing: null };
     }
 
     async _createPanoramaCaptureViewer(faceSize) {
@@ -1500,6 +1523,9 @@ export class CesiumWorld {
 
         const tileset = await this._createGoogleTileset(null);
         this._configurePanoramaTileset(tileset);
+        this._panoramaTileset = tileset;
+        this._panoramaTileLoadState = { pending: null, processing: null };
+        this._wireTilesetDiagnostics(null, tileset, this._panoramaTileLoadState, 'Panorama Google 3D Tiles');
         viewer.scene.primitives.add(tileset);
         viewer.resize();
 
@@ -1569,6 +1595,9 @@ export class CesiumWorld {
         const topPoleGuardDeg = Math.max(0, Math.min(45, Number(options.topPoleGuardDeg) || 0));
         const bottomPoleGuardDeg = Math.max(0, Math.min(45, Number(options.bottomPoleGuardDeg) || 0));
         const frameDelayMs = Math.max(0, Math.min(1000, Number(options.frameDelayMs) || 0));
+        const tileTimeoutMs = Math.max(0, Math.min(120000, Number(options.tileTimeoutMs) || 0));
+        const tileQuietMs = Math.max(0, Math.min(5000, Number(options.tileQuietMs) || 0));
+        const progressCb = typeof options.progressCb === 'function' ? options.progressCb : null;
         const sleep = (ms) => new Promise(resolve => window.setTimeout(resolve, ms));
 
         try {
@@ -1578,7 +1607,9 @@ export class CesiumWorld {
                 if ('far' in frustum) frustum.far = 15000000;
             }
 
-            for (const faceDef of PANORAMA_FACE_DEFS) {
+            for (let faceIndex = 0; faceIndex < PANORAMA_FACE_DEFS.length; faceIndex++) {
+                const faceDef = PANORAMA_FACE_DEFS[faceIndex];
+                if (progressCb) progressCb(`face ${faceIndex + 1}/${PANORAMA_FACE_DEFS.length} ${faceDef.name}`);
                 camera.setView({
                     destination,
                     orientation: {
@@ -1592,6 +1623,25 @@ export class CesiumWorld {
                     await sleep(frameDelayMs);
                     viewer.scene.requestRender();
                     this._renderViewerNow(viewer);
+                }
+                if (tileTimeoutMs > 0) {
+                    const tilesReady = await this.waitForTilesIdle(
+                        tileTimeoutMs,
+                        tileQuietMs,
+                        this._panoramaTileset,
+                        this._panoramaTileLoadState,
+                        viewer
+                    );
+                    if (!tilesReady) {
+                        return {
+                            canvas: null,
+                            complete: false,
+                            ready: false,
+                            loadingTiles: true,
+                            faceIndex,
+                            faces: PANORAMA_FACE_DEFS.length,
+                        };
+                    }
                 }
                 projector.updateFace(faceDef.name, viewer.scene.canvas);
             }
@@ -1627,6 +1677,9 @@ export class CesiumWorld {
             topPoleGuardDeg: options.topPoleGuardDeg,
             bottomPoleGuardDeg: options.bottomPoleGuardDeg,
             frameDelayMs: options.frameDelayMs,
+            tileTimeoutMs: options.tileTimeoutMs,
+            tileQuietMs: options.tileQuietMs,
+            progressCb: options.progressCb,
         });
     }
 
@@ -1645,6 +1698,9 @@ export class CesiumWorld {
             topPoleGuardDeg: options.topPoleGuardDeg,
             bottomPoleGuardDeg: options.bottomPoleGuardDeg,
             frameDelayMs: options.frameDelayMs,
+            tileTimeoutMs: options.tileTimeoutMs,
+            tileQuietMs: options.tileQuietMs,
+            progressCb: options.progressCb,
         });
     }
 

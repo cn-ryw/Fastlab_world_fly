@@ -969,7 +969,7 @@
                         window.googleTilesFlightStart();
                         return;
                     }
-                    import('./src/main.js?v=20260702-spawn-rebase')
+                    import('./src/main.js?v=20260703-panorama-tile-idle')
                         .then(function (mod) {
                             var start = window.googleTilesFlightStart || mod.startTilesMode;
                             if (typeof start === 'function') start();
@@ -980,6 +980,6 @@
             });
         }());
     </script>
-    <script type="module" src="src/main.js?v=20260702-spawn-rebase"></script>
+    <script type="module" src="src/main.js?v=20260703-panorama-tile-idle"></script>
 </body>
 </html>

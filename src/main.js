@@ -23,7 +23,7 @@
  * from the original simulator.
  */
 
-import { CesiumWorld } from './cesium-world.js?v=20260702-spawn-rebase';
+import { CesiumWorld } from './cesium-world.js?v=20260703-panorama-tile-idle';
 import { TilesCollisionProvider } from './tiles-collision.js';
 import { Controller } from './controller.js';
 import { Drone } from './drone.js';
@@ -75,6 +75,7 @@ const FLIGHT_PRELOAD_MIN_COVERAGE = urlNumber('flightPreloadMinCoverage', 0.95, 
 const FLIGHT_PRELOAD_VIEW_TIMEOUT_MS = Math.round(urlNumber('flightPreloadViewTimeoutMs', 20000, 3000, 60000));
 const FLIGHT_PRELOAD_VIEW_ATTEMPTS = Math.round(urlNumber('flightPreloadViewAttempts', 2, 1, 5));
 const FLIGHT_PRELOAD_STRICT = urlNumber('flightPreloadStrict', 0, 0, 1) >= 0.5;
+const PANORAMA_PRELOAD_REQUIRED = urlNumber('panoPreloadRequired', 1, 0, 1) >= 0.5;
 const VIEW_CHOICE_HINT_HTML = '1 / O: First Person &nbsp;|&nbsp; 2: Third Person<br>Easy speed: ↑/↓ forward/back, Shift boost, Tab &gt; Easy Max Speed';
 const MAX_PHYSICS_FRAME_DT = 0.25;
 const PHYSICS_SUBSTEP_DT = 0.05;
@@ -293,7 +294,10 @@ async function preloadPanoramaBeforeFlight() {
         : (drone.getBodyTransform ? drone.getBodyTransform() : drone.getCameraTransform());
     if (!transform) return false;
 
-    const options = panoramaSensor.getCaptureOptions({ preload: true });
+    const options = {
+        ...panoramaSensor.getCaptureOptions({ preload: true }),
+        progressCb: (message) => setProgress(`Preloading 360 panorama sensor (${message})...`),
+    };
     const started = performance.now();
     setProgress('Preloading 360 panorama sensor before flight...');
 
@@ -308,12 +312,12 @@ async function preloadPanoramaBeforeFlight() {
             '360 panorama preload'
         );
         const ready = panoramaSensor.primeFromCaptureResult(result, performance.now() - started);
-        if (!ready && FLIGHT_PRELOAD_STRICT) {
+        if (!ready && (PANORAMA_PRELOAD_REQUIRED || FLIGHT_PRELOAD_STRICT)) {
             throw new Error('360 panorama preload did not produce a complete frame.');
         }
         return ready;
     } catch (error) {
-        if (FLIGHT_PRELOAD_STRICT) throw error;
+        if (PANORAMA_PRELOAD_REQUIRED || FLIGHT_PRELOAD_STRICT) throw error;
         reportUserError('Panorama preload failed; live capture will retry in flight', error, {
             key: 'panorama-preload',
             intervalMs: 10000,
@@ -541,7 +545,7 @@ async function confirmSpawnAndFly() {
         try {
             await preloadPanoramaBeforeFlight();
         } catch (e) {
-            if (FLIGHT_PRELOAD_STRICT) throw e;
+            if (PANORAMA_PRELOAD_REQUIRED || FLIGHT_PRELOAD_STRICT) throw e;
             reportUserError('Panorama preload failed; continuing', e, {
                 key: 'panorama-preload-before-flight',
                 intervalMs: 10000,
