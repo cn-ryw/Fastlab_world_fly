@@ -116,6 +116,9 @@ Tab         设置面板
 ./launch.sh --setup-input
 ```
 
+![](asset/display/20260703-005006.jpg)
+![](asset/display/20260703-005023.jpg)
+
 ## 全景相机实现原理
 
 全景 RGB 默认从机头 360 相机位置采集，输出 `672x336` ERP 图。实现方式是对 Cesium/Google Tiles 渲染结果进行 6 个方向采样，然后在 GPU 中按 ERP 射线模型重投影：

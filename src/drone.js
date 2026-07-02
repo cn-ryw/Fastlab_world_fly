@@ -42,6 +42,7 @@ const AIR_DENSITY = 1.225;   // kg/m³ at sea level
 const DRONE_BOOST_MULTIPLIER = 2.0;
 const FPV_BOOST_MULTIPLIER = 1.7;
 const DRONE_MAX_SUPPORTED_SPEED = 300 / 3.6; // 300 km/h in m/s
+const DRONE_MAX_SUPPORTED_VSPEED = 25;
 
 // Reusable PlayCanvas math objects (avoid per-frame allocation)
 const _quat  = new pc.Quat();
@@ -85,10 +86,10 @@ export class Drone {
         this.maxPitchRate = 220;
         this.maxRollRate  = 220;
         this.maxYawRate   = 120;
-        this.droneMaxYawRate = 60;  // Drone mode yaw rate limit (deg/s)
+        this.droneMaxYawRate = 80;  // Drone mode yaw rate limit (deg/s)
 
-        this.droneMaxAngle   = 42;
-        this.droneAngleRate  = 220;
+        this.droneMaxAngle   = 58;
+        this.droneAngleRate  = 280;
         this.droneMaxVSpeed  = 8.0;
         this.droneMaxSpeed   = DRONE_MAX_SUPPORTED_SPEED;
 
@@ -140,6 +141,8 @@ export class Drone {
         this.thrustOutput     = 0;
         this.throttlePercent  = 0;
         this.commandedGroundSpeed = 0;
+        this.targetGroundSpeed = 0;
+        this.pilotGroundSpeedCommand = 0;
         this.effectiveMaxSpeed = this.droneMaxSpeed;
         this.boostActive      = false;
         this.boostMultiplier  = 1.0;
@@ -176,6 +179,8 @@ export class Drone {
         this.airSpeed = 0;
         this.verticalSpeed = 0;
         this.commandedGroundSpeed = 0;
+        this.targetGroundSpeed = 0;
+        this.pilotGroundSpeedCommand = 0;
         this.effectiveMaxSpeed = this.droneMaxSpeed;
         this.boostActive = false;
         this.boostMultiplier = 1.0;
@@ -217,7 +222,9 @@ export class Drone {
         if (droneMaxSpeedVal !== null) {
             this.droneMaxSpeed = Math.max(1, Math.min(DRONE_MAX_SUPPORTED_SPEED, droneMaxSpeedVal));
         }
-        if (droneMaxVSpeedVal !== null) this.droneMaxVSpeed = droneMaxVSpeedVal;
+        if (droneMaxVSpeedVal !== null) {
+            this.droneMaxVSpeed = Math.max(1, Math.min(DRONE_MAX_SUPPORTED_VSPEED, droneMaxVSpeedVal));
+        }
         if (modeEl) this.flightMode = modeEl.value;
         const mountAngle = v('cam-mount-angle');
         if (mountAngle !== null) this.cameraMountAngle = mountAngle;
@@ -294,10 +301,11 @@ export class Drone {
         this.z += this.vz * dt;
 
         // NaN guard — reset if physics blew up
-        if (isNaN(this.x) || isNaN(this.y) || isNaN(this.z)) {
+        if (!Number.isFinite(this.x) || !Number.isFinite(this.y) || !Number.isFinite(this.z) ||
+            !Number.isFinite(this.vx) || !Number.isFinite(this.vy) || !Number.isFinite(this.vz)) {
             reportUserError(
-                'Drone physics produced NaN; resetting',
-                new Error(`mass=${this.mass}, thrust=${this.thrustOutput}, dragCd=${this.dragCd}, dragArea=${this.dragArea}`),
+                'Drone physics produced invalid state; resetting',
+                new Error(`pos=${this.x},${this.y},${this.z}, vel=${this.vx},${this.vy},${this.vz}, mass=${this.mass}, thrust=${this.thrustOutput}, dragCd=${this.dragCd}, dragArea=${this.dragArea}`),
                 { key: 'drone-physics-nan', intervalMs: 10000 }
             );
             this.reset();
@@ -487,6 +495,8 @@ export class Drone {
         this.thrustOutput = 0;
         this.throttlePercent = 0;
         this.commandedGroundSpeed = 0;
+        this.targetGroundSpeed = 0;
+        this.pilotGroundSpeedCommand = 0;
         this.effectiveMaxSpeed = this.flightMode === 'drone' ? this.droneMaxSpeed : null;
         this.boostActive = false;
         this.boostMultiplier = 1.0;
@@ -516,6 +526,8 @@ export class Drone {
         this.boostActive = !!input.boost;
         this.boostMultiplier = boost;
         this.commandedGroundSpeed = 0;
+        this.targetGroundSpeed = 0;
+        this.pilotGroundSpeedCommand = 0;
         this.effectiveMaxSpeed = null;
 
         // Sticks → target angular rates (body frame), scaled by rate
@@ -557,9 +569,18 @@ export class Drone {
         // Get body-frame forward (-Z) and right (+X) in world XZ plane
         _mat4.setTRS(pc.Vec3.ZERO, this.orientation, pc.Vec3.ONE);
         _mat4.getZ(_v3);
-        const fwdX = -_v3.x, fwdZ = -_v3.z;
+        let fwdX = -_v3.x, fwdZ = -_v3.z;
         _mat4.getX(_v3);
-        const rightX = _v3.x, rightZ = _v3.z;
+        let rightX = _v3.x, rightZ = _v3.z;
+
+        const fwdLen = Math.sqrt(fwdX * fwdX + fwdZ * fwdZ);
+        if (fwdLen > 1e-4) {
+            fwdX /= fwdLen; fwdZ /= fwdLen;
+        }
+        const rightLen = Math.sqrt(rightX * rightX + rightZ * rightZ);
+        if (rightLen > 1e-4) {
+            rightX /= rightLen; rightZ /= rightLen;
+        }
 
         const rates = input.rates || { roll: 1, pitch: 1, yaw: 1 };
         const maxSpd = Math.min(DRONE_MAX_SUPPORTED_SPEED, this.droneMaxSpeed * boost);
@@ -571,14 +592,23 @@ export class Drone {
         const yawActive = Math.abs(input.yaw) > 0.05;
 
         let vDesX, vDesY, vDesZ;
+        let pilotCmdX = 0;
+        let pilotCmdZ = 0;
 
         // ---- Horizontal: stick = target velocity, centered = position hold ----
         if (horizActive) {
             // Stick directly commands target velocity (body-frame → world-frame)
             const cmdFwd   = -input.pitch * maxSpd * rates.pitch;
             const cmdRight =  input.roll  * maxSpd * rates.roll;
-            vDesX = cmdFwd * fwdX + cmdRight * rightX;
-            vDesZ = cmdFwd * fwdZ + cmdRight * rightZ;
+            pilotCmdX = cmdFwd * fwdX + cmdRight * rightX;
+            pilotCmdZ = cmdFwd * fwdZ + cmdRight * rightZ;
+            const pilotCmdH = Math.sqrt(pilotCmdX * pilotCmdX + pilotCmdZ * pilotCmdZ);
+            if (pilotCmdH > maxSpd) {
+                const s = maxSpd / pilotCmdH;
+                pilotCmdX *= s; pilotCmdZ *= s;
+            }
+            vDesX = pilotCmdX;
+            vDesZ = pilotCmdZ;
 
             // Latch current position as hold target for when stick is released
             this._targetX = this.x;
@@ -638,7 +668,9 @@ export class Drone {
             vDesX *= s; vDesZ *= s;
         }
         vDesY = clamp(vDesY, -this.droneMaxVSpeed * boost, this.droneMaxVSpeed * boost);
-        this.commandedGroundSpeed = Math.sqrt(vDesX * vDesX + vDesZ * vDesZ);
+        this.targetGroundSpeed = Math.sqrt(vDesX * vDesX + vDesZ * vDesZ);
+        this.pilotGroundSpeedCommand = Math.sqrt(pilotCmdX * pilotCmdX + pilotCmdZ * pilotCmdZ);
+        this.commandedGroundSpeed = this.targetGroundSpeed;
 
         // ---- 2. Inner loop: Velocity PID → desired tilt angles ----
         const maxAngle = this.droneMaxAngle;

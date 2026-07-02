@@ -134,7 +134,12 @@ export class HUD {
         }
         const groundSpeed = Number.isFinite(drone.groundSpeed) ? drone.groundSpeed : drone.speed;
         const airSpeed = Number.isFinite(drone.airSpeed) ? drone.airSpeed : groundSpeed;
-        const commandedSpeed = Number.isFinite(drone.commandedGroundSpeed) ? drone.commandedGroundSpeed : 0;
+        const targetSpeed = Number.isFinite(drone.targetGroundSpeed)
+            ? drone.targetGroundSpeed
+            : (Number.isFinite(drone.commandedGroundSpeed) ? drone.commandedGroundSpeed : 0);
+        const pilotCommandSpeed = Number.isFinite(drone.pilotGroundSpeedCommand)
+            ? drone.pilotGroundSpeedCommand
+            : targetSpeed;
         const effectiveMaxSpeed = Number.isFinite(drone.effectiveMaxSpeed) ? drone.effectiveMaxSpeed : 0;
 
         if (this.gspeedEl) {
@@ -143,20 +148,22 @@ export class HUD {
         if (this.speedCommandEl) {
             if (drone.flightMode === 'drone') {
                 this.speedCommandEl.innerHTML =
-                    `${commandedSpeed.toFixed(1)} / ${effectiveMaxSpeed.toFixed(1)}<br>` +
-                    `<span class="hud-kmh">${Math.round(commandedSpeed * 3.6)} / ${Math.round(effectiveMaxSpeed * 3.6)} km/h</span>`;
+                    `${targetSpeed.toFixed(1)} / ${effectiveMaxSpeed.toFixed(1)}<br>` +
+                    `<span class="hud-kmh">${Math.round(targetSpeed * 3.6)} / ${Math.round(effectiveMaxSpeed * 3.6)} km/h</span>`;
             } else {
                 const throttlePct = Number.isFinite(drone.throttlePercent) ? Math.round(drone.throttlePercent * 100) : 0;
-                this.speedCommandEl.textContent = `${airSpeed.toFixed(1)} AIR / ${throttlePct}% THR`;
+                this.speedCommandEl.innerHTML =
+                    `${airSpeed.toFixed(1)} AIR / ${throttlePct}% THR<br>` +
+                    `<span class="hud-kmh">${Math.round(airSpeed * 3.6)} km/h air</span>`;
             }
         }
         if (this.speedCommandLabelEl) {
-            this.speedCommandLabelEl.textContent = drone.flightMode === 'drone' ? 'CMD / MAX (m/s)' : 'AIR SPD / THR';
+            this.speedCommandLabelEl.textContent = drone.flightMode === 'drone' ? 'TGT / LIM (m/s)' : 'AIR SPD / THR';
         }
         if (this.speedHintEl) {
             let hint = '';
             if (drone.flightMode === 'drone') {
-                if (commandedSpeed < 0.5 && groundSpeed < 1.0) {
+                if (pilotCommandSpeed < 0.5 && groundSpeed < 1.0) {
                     hint = 'Easy forward uses ↑/↓ or pitch stick. Hold Shift for Boost.';
                 } else if (effectiveMaxSpeed < 83 && groundSpeed > effectiveMaxSpeed * 0.7) {
                     hint = 'Raise Tab > Easy Max Speed for faster Easy flight.';

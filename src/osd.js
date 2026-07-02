@@ -415,16 +415,21 @@ export class OSD {
 
         const groundSpeed = Number.isFinite(drone.groundSpeed) ? drone.groundSpeed : drone.speed;
         const airSpeed = Number.isFinite(drone.airSpeed) ? drone.airSpeed : groundSpeed;
-        const commandedSpeed = Number.isFinite(drone.commandedGroundSpeed) ? drone.commandedGroundSpeed : 0;
+        const targetSpeed = Number.isFinite(drone.targetGroundSpeed)
+            ? drone.targetGroundSpeed
+            : (Number.isFinite(drone.commandedGroundSpeed) ? drone.commandedGroundSpeed : 0);
+        const pilotCommandSpeed = Number.isFinite(drone.pilotGroundSpeedCommand)
+            ? drone.pilotGroundSpeedCommand
+            : targetSpeed;
         const maxSpeed = Number.isFinite(drone.effectiveMaxSpeed) ? drone.effectiveMaxSpeed : 0;
         const throttlePct = Number.isFinite(drone.throttlePercent) ? Math.round(drone.throttlePercent * 100) : 0;
 
         let cue;
         if (mode === 'drone') {
-            if (commandedSpeed < 0.5 && groundSpeed < 1.0) {
+            if (pilotCommandSpeed < 0.5 && groundSpeed < 1.0) {
                 cue = 'EASY: UP/DOWN or pitch stick = forward speed | Shift = Boost | W/S = altitude';
             } else {
-                cue = `GSPD ${groundSpeed.toFixed(1)}  CMD ${commandedSpeed.toFixed(1)}  MAX ${maxSpeed.toFixed(0)}${drone.boostActive ? ' BOOST' : ''}`;
+                cue = `GSPD ${groundSpeed.toFixed(1)}  TGT ${targetSpeed.toFixed(1)}  LIM ${maxSpeed.toFixed(0)}${drone.boostActive ? ' BOOST' : ''}`;
             }
         } else if (groundSpeed < 2.0 && throttlePct > 65) {
             cue = 'FPV: pitch nose down to convert motor thrust into forward speed';
