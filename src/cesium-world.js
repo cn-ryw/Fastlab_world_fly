@@ -223,17 +223,32 @@ class PanoramaEquirectProjector {
                 return mix(side, cap, capBlend);
             }
 
-            void main() {
-                float halfFov = u_vertical_fov * 0.5;
-                float topPitch = max(0.0, halfFov - u_top_pole_guard);
-                float bottomPitch = max(0.0, halfFov - u_bottom_pole_guard);
-                float pitch = mix(-bottomPitch, topPitch, v_uv.y);
-                float yaw = PI - v_uv.x * TWO_PI;
+            vec3 directionFromPitchYaw(float pitch, float yaw) {
                 float cosPitch = cos(pitch);
                 float forward = cosPitch * cos(yaw);
                 float left = cosPitch * sin(yaw);
-                vec3 dir = normalize(vec3(left, sin(pitch), -forward));
-                gl_FragColor = sampleHybridRing(dir);
+                return normalize(vec3(left, sin(pitch), -forward));
+            }
+
+            void main() {
+                float halfFov = u_vertical_fov * 0.5;
+                float pitch = (v_uv.y - 0.5) * u_vertical_fov;
+                float yaw = PI - v_uv.x * TWO_PI;
+                float topGuardStart = halfFov - u_top_pole_guard;
+                float bottomGuardStart = -halfFov + u_bottom_pole_guard;
+                float guardedPitch = clamp(pitch, bottomGuardStart, topGuardStart);
+                vec4 color = sampleHybridRing(directionFromPitchYaw(guardedPitch, yaw));
+
+                if (u_top_pole_guard > 0.0001 && pitch > topGuardStart) {
+                    float t = smoothstep(topGuardStart, halfFov, pitch);
+                    color = mix(color, sampleYFace(vec3(0.0, 1.0, 0.0)), t);
+                }
+                if (u_bottom_pole_guard > 0.0001 && pitch < bottomGuardStart) {
+                    float t = smoothstep(-halfFov, bottomGuardStart, pitch);
+                    color = mix(sampleYFace(vec3(0.0, -1.0, 0.0)), color, t);
+                }
+
+                gl_FragColor = color;
             }
         `);
 

@@ -116,6 +116,7 @@ Tab         设置面板
 ./launch.sh --setup-input
 ```
 
+![](asset/display/screenshot-20260703-011815.png)
 ![](asset/display/20260703-005006.jpg)
 ![](asset/display/20260703-005023.jpg)
 
@@ -128,7 +129,7 @@ yaw   = pi - (u + 0.5) / W * 2pi
 pitch = vfov / 2 - (v + 0.5) / H * vfov
 ```
 
-这保证投影模型与 YOPO_360 的 ERP 相机一致；区别是数据来源为 Cesium 渲染视图，而不是仿真栅格的直接 raycast。放置阶段会后台创建全景采样 viewer；确认出生点后会在用户可控前预采样一张全景首帧。飞行中默认 `panoMs=16`、`panoFace=192`、每个采样方向等待 `panoFrameDelayMs=8`，并最多等待 `panoFaceTileTimeoutMs=900` 让当前方向 tiles idle；首帧预加载使用 `panoPreloadFrameDelayMs=96`、`panoPreloadFaceTileTimeoutMs=6000` 和 `panoPreloadTimeoutMs=60000`，默认 `panoPreloadRequired=1`，未拿到完整 6 面首帧不会进入可控飞行。为了避免 Google Tiles 天空/极区采样在 ERP 顶部形成海市蜃楼状伪影，默认对顶部 10 度和底部 2 度做极区 guard，可用 `panoTopPoleGuard` / `panoBottomPoleGuard` 调整或设为 0 关闭。
+这保证投影模型与 YOPO_360 的 ERP 相机一致；区别是数据来源为 Cesium 渲染视图，而不是仿真栅格的直接 raycast。放置阶段会后台创建全景采样 viewer；确认出生点后会在用户可控前预采样一张全景首帧。飞行中默认 `panoMs=16`、`panoFace=192`、每个采样方向等待 `panoFrameDelayMs=8`，并最多等待 `panoFaceTileTimeoutMs=900` 让当前方向 tiles idle；首帧预加载使用 `panoPreloadFrameDelayMs=96`、`panoPreloadFaceTileTimeoutMs=6000` 和 `panoPreloadTimeoutMs=60000`，默认 `panoPreloadRequired=1`，未拿到完整 6 面首帧不会进入可控飞行。为了避免 Google Tiles 天空/极区采样在 ERP 顶部形成海市蜃楼状伪影，默认对顶部 10 度和底部 2 度做极区 guard；guard 区域保持 ERP 坐标，只向上下极点采样淡出，不会把整张图压缩到 guard 边界。可用 `panoTopPoleGuard` / `panoBottomPoleGuard` 调整或设为 0 关闭。
 
 进入可控飞行前，主 Cesium 视图会预加载出生点周围区域，并分别等待第一人称和第三人称初始视角 tiles idle。默认 `flightPreloadStrict=0`，主视图只要目标区域覆盖率达标就继续；全景首帧预加载独立检查隐藏 viewer 的 6 个方向 tiles idle。只有显式设置 `?panoPreloadRequired=0` 时，才会允许全景首帧失败后进入飞行并让实时采样继续重试。
 
