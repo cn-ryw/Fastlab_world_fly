@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 DA360_ROOT="$PROJECT_ROOT/third_party/DA360"
 CHECKPOINT_DIR="$DA360_ROOT/checkpoints"
-MODEL_NAME="${1:-${DA360_MODEL:-small}}"
+MODEL_NAME="${1:-${DA360_MODEL:-large}}"
 
 case "$MODEL_NAME" in
     small)

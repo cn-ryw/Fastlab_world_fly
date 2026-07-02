@@ -38,13 +38,13 @@ except ImportError as exc:
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DA360_ROOT = Path(os.environ.get("DA360_ROOT", PROJECT_ROOT / "third_party" / "DA360")).resolve()
-DEFAULT_MODEL_NAME = os.environ.get("DA360_MODEL", "small")
+DEFAULT_MODEL_NAME = os.environ.get("DA360_MODEL", "large")
 DEFAULT_MODEL = Path(os.environ.get(
     "DA360_MODEL_PATH",
     DA360_ROOT / "checkpoints" / f"DA360_{DEFAULT_MODEL_NAME}.pth",
 ))
 PATCH_SIZE = 14
-DEFAULT_INPUT_SCALE = 0.46
+DEFAULT_INPUT_SCALE = 1.0
 
 
 def env_bool(name, default=False):

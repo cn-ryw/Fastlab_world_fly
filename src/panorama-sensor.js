@@ -18,8 +18,8 @@ function evenNumber(value) {
 const CAPTURE_INTERVAL_MS = urlNumber('panoMs', 16, 8, 10000);
 const DEPTH_INTERVAL_MS = urlNumber('depthMs', 600, 150, 10000);
 const DA360_TIMEOUT_MS = urlNumber('da360TimeoutMs', 12000, 1000, 60000);
-const DA360_UPLOAD_SCALE = urlNumber('da360UploadScale', 0.75, 0.25, 1);
-const DA360_UPLOAD_WIDTH = Math.round(urlNumber('da360UploadWidth', 504, 0, 5760));
+const DA360_UPLOAD_SCALE = urlNumber('da360UploadScale', 0.2, 0.05, 1);
+const DA360_UPLOAD_WIDTH = Math.round(urlNumber('da360UploadWidth', 0, 0, 5760));
 const DA360_UPLOAD_HEIGHT = Math.round(urlNumber('da360UploadHeight', 0, 0, 2880));
 const PANORAMA_WIDTH = evenNumber(urlNumber('panoWidth', 672, 280, 5760));
 const PANORAMA_HEIGHT = evenNumber(urlNumber('panoHeight', Math.round(PANORAMA_WIDTH / 2), 140, 2880));

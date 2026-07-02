@@ -31,4 +31,4 @@ COPY scripts/da360_server.py /opt/mindcloud-da360/scripts/da360_server.py
 
 EXPOSE 5688
 
-CMD ["python", "/opt/mindcloud-da360/scripts/da360_server.py", "--model-path", "/models/DA360_small.pth", "--host", "0.0.0.0", "--port", "5688"]
+CMD ["python", "/opt/mindcloud-da360/scripts/da360_server.py", "--model-path", "/models/DA360_large.pth", "--host", "0.0.0.0", "--port", "5688"]

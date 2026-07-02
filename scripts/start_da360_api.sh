@@ -7,11 +7,12 @@ MODE="${DA360_MODE:-docker}"
 IMAGE="${DA360_IMAGE:-mindcloud-da360:latest}"
 NAME="${DA360_CONTAINER_NAME:-mindcloud-da360-api}"
 PORT="${DA360_PORT:-5688}"
-MODEL_NAME="${DA360_MODEL:-small}"
+MODEL_NAME="${1:-${DA360_MODEL:-large}}"
 MODEL_PATH="${DA360_MODEL_PATH:-$PROJECT_ROOT/third_party/DA360/checkpoints/DA360_${MODEL_NAME}.pth}"
 BASE_IMAGE="${DA360_BASE_IMAGE:-pytorch/pytorch:2.1.1-cuda12.1-cudnn8-runtime}"
 BUILD_NETWORK="${DA360_BUILD_NETWORK:-host}"
 BUILD_RETRIES="${DA360_BUILD_RETRIES:-3}"
+RESAMPLE="${DA360_RESAMPLE:-bicubic}"
 if ! [[ "$BUILD_RETRIES" =~ ^[0-9]+$ ]] || (( BUILD_RETRIES < 1 )); then
     BUILD_RETRIES=1
 fi
@@ -106,7 +107,7 @@ MODEL_BASENAME="$(basename "$MODEL_PATH")"
 
 if [[ "$MODE" == "local" ]]; then
     PYTHON_BIN="${DA360_PYTHON:-python3}"
-    exec "$PYTHON_BIN" "$SCRIPT_DIR/da360_server.py" --model-path "$MODEL_PATH" --port "$PORT"
+    DA360_RESAMPLE="$RESAMPLE" exec "$PYTHON_BIN" "$SCRIPT_DIR/da360_server.py" --model-path "$MODEL_PATH" --port "$PORT"
 fi
 
 command -v docker >/dev/null 2>&1 || {
@@ -182,9 +183,10 @@ run_args=(
     --name "$NAME"
     -p "$PORT:5688"
     -e "DA360_NO_WARMUP=${DA360_NO_WARMUP:-0}"
-    -e "DA360_INPUT_SCALE=${DA360_INPUT_SCALE:-0.46}"
+    -e "DA360_INPUT_SCALE=${DA360_INPUT_SCALE:-1.0}"
     -e "DA360_INPUT_WIDTH=${DA360_INPUT_WIDTH:-0}"
     -e "DA360_INPUT_HEIGHT=${DA360_INPUT_HEIGHT:-0}"
+    -e "DA360_RESAMPLE=$RESAMPLE"
     -e "DA360_OUTPUT_FORMAT=${DA360_OUTPUT_FORMAT:-jpeg}"
     -e "DA360_JPEG_QUALITY=${DA360_JPEG_QUALITY:-72}"
     -e "DA360_AMP=${DA360_AMP:-1}"

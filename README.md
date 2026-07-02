@@ -50,34 +50,42 @@ python3 -m pip install --user gdown
 ./scripts/download_da360_model.sh
 ./scripts/start_da360_api.sh
 
-# 自检：curl http://127.0.0.1:5688/health
+# 心跳包自检：curl http://127.0.0.1:5688/health
 ```
 
-默认使用 `DA360_small`，并以实时优先的 `DA360_INPUT_SCALE=0.46` 推理，模型输入约为 `476x238`。右下角 RGB 全景仍保持原始显示尺寸；只有发送给 DA360 的深度请求会单独缩小，前端默认上传约 `504x252` 的 JPEG。
-
-需要更高精度的模型时：
+停止感知的推理服务，只保留主进程飞飞机的功能的话就关掉这个docker就行了：
 
 ```bash
-DA360_MODEL=large ./scripts/download_da360_model.sh
-DA360_MODEL=large ./scripts/start_da360_api.sh
+docker rm -f mindcloud-da360-api
 ```
 
-需要提高 DA360 精度但接受更慢推理时：
+注意，默认使用 `DA360_large`，DA360 服务端按 checkpoint 的官方输入尺寸 `1036x518` 推理。右下角 RGB 全景仍保持原始显示尺寸；只有发送给 DA360 的深度请求会单独缩小，前端默认按 `da360UploadScale=0.2` 上传约 `134x67` 的 JPEG，再由服务端 resize 到模型输入尺寸。
+
+需要换成其他 DA360 模型时，可选 `small`、`base` 或 `large`：
 
 ```bash
-DA360_INPUT_SCALE=0.65 ./scripts/start_da360_api.sh
+# 方式一：脚本参数
+./scripts/download_da360_model.sh small
+./scripts/start_da360_api.sh small
+
+# 方式二：环境变量
+DA360_MODEL=base ./scripts/download_da360_model.sh
+DA360_MODEL=base ./scripts/start_da360_api.sh
+```
+
+如需主动调整 DA360 服务端模型输入尺寸，可设置推理 scale 或指定模型输入宽高；过低的 `DA360_INPUT_SCALE` 可能让 large 模型输出条带化深度，不建议默认低于 `0.46`。服务端 resize 默认使用 `DA360_RESAMPLE=bicubic`，与 DA360 原项目的输入缩放方式保持一致：
+
+```bash
+DA360_INPUT_SCALE=0.46 ./scripts/start_da360_api.sh
+DA360_INPUT_WIDTH=476 ./scripts/start_da360_api.sh
+DA360_INPUT_WIDTH=672 DA360_INPUT_HEIGHT=336 ./scripts/start_da360_api.sh
+DA360_RESAMPLE=bilinear ./scripts/start_da360_api.sh
 ```
 
 推理服务不在本机时：
 
 ```text
 http://127.0.0.1:8080/?da360Url=http://<host>:5688/depth
-```
-
-停止推理服务，只要主进程功能：
-
-```bash
-docker rm -f mindcloud-da360-api
 ```
 
 ## 使用流程说明
@@ -143,6 +151,7 @@ http://127.0.0.1:8080/?flightPreloadRadius=600&flightPreloadMinCoverage=0.98
 # 调整 RGB / 深度更新间隔
 http://127.0.0.1:8080/?panoMs=1000&depthMs=1200
 
-# 调整仅用于 DA360 的上传尺寸，不影响 RGB 全景显示
+# 调整仅用于 DA360 的上传尺寸或缩放，不影响 RGB 全景显示
+http://127.0.0.1:8080/?da360UploadScale=0.35
 http://127.0.0.1:8080/?da360UploadWidth=672
 ```
