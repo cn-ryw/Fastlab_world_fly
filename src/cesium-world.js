@@ -1612,6 +1612,7 @@ export class CesiumWorld {
         const frameDelayMs = Math.max(0, Math.min(1000, Number(options.frameDelayMs) || 0));
         const tileTimeoutMs = Math.max(0, Math.min(120000, Number(options.tileTimeoutMs) || 0));
         const tileQuietMs = Math.max(0, Math.min(5000, Number(options.tileQuietMs) || 0));
+        const captureAnyway = !!options.captureAnyway;
         const progressCb = typeof options.progressCb === 'function' ? options.progressCb : null;
         const sleep = (ms) => new Promise(resolve => window.setTimeout(resolve, ms));
 
@@ -1648,6 +1649,10 @@ export class CesiumWorld {
                         viewer
                     );
                     if (!tilesReady) {
+                        if (captureAnyway) {
+                            projector.updateFace(faceDef.name, viewer.scene.canvas);
+                            continue;
+                        }
                         return {
                             canvas: null,
                             complete: false,

@@ -140,6 +140,7 @@ export class PanoramaSensor {
             frameDelayMs: preload ? PANORAMA_PRELOAD_FRAME_DELAY_MS : PANORAMA_FRAME_DELAY_MS,
             tileTimeoutMs: preload ? PANORAMA_PRELOAD_FACE_TILE_TIMEOUT_MS : PANORAMA_FACE_TILE_TIMEOUT_MS,
             tileQuietMs: preload ? PANORAMA_PRELOAD_FACE_TILE_QUIET_MS : PANORAMA_FACE_TILE_QUIET_MS,
+            captureAnyway: preload ? false : PANORAMA_CAPTURE_ANYWAY,
             timeoutMs: preload ? PANORAMA_PRELOAD_TIMEOUT_MS : 0,
         };
     }
