@@ -6,4 +6,4 @@ __pycache__
 .DS_Store
 scene/*
 asset/gate-paths/*.tmp
-third_party/DA360
+# third_party/DA360 — allowed for local base-image builds

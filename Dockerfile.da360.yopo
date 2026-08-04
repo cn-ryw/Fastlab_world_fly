@@ -1,0 +1,23 @@
+FROM dzp_yopo:sim-u2004-noetic-py38
+
+ENV PYTHONUNBUFFERED=1 \
+    OPENCV_IO_ENABLE_OPENEXR=1 \
+    DA360_ROOT=/opt/DA360
+
+# Use the venv's python
+ENV PATH="/opt/venv/bin:$PATH"
+
+# Copy pre-downloaded wheels and install offline (avoid proxy issues)
+COPY third_party/wheels /tmp/wheels
+RUN python3 -m pip install --no-cache-dir --no-deps --no-index --find-links /tmp/wheels flask-cors timm \
+    && rm -rf /tmp/wheels
+
+# Copy DA360 source from host (avoid git clone during build)
+COPY third_party/DA360 "$DA360_ROOT"
+
+WORKDIR /opt/mindcloud-da360
+COPY scripts/da360_server.py /opt/mindcloud-da360/scripts/da360_server.py
+
+EXPOSE 5688
+
+CMD ["python3", "/opt/mindcloud-da360/scripts/da360_server.py", "--model-path", "/models/DA360_large.pth", "--host", "0.0.0.0", "--port", "5688"]

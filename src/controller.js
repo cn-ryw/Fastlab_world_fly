@@ -102,8 +102,8 @@ const KEYBOARD_MAP = {
     'KeyD':       { action: 'yaw',      value: 1 },
     'ArrowUp':    { action: 'pitch',    value: -1 },
     'ArrowDown':  { action: 'pitch',    value: 1 },
-    'ArrowLeft':  { action: 'roll',     value: -1 },
-    'ArrowRight': { action: 'roll',     value: 1 },
+    'ArrowLeft':  { action: 'roll',     value: 1 },
+    'ArrowRight': { action: 'roll',     value: -1 },
     'KeyQ':       { action: 'cameraTilt', value: 1 },
     'KeyE':       { action: 'cameraTilt', value: -1 },
 };
