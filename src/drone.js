@@ -155,9 +155,20 @@ export class Drone {
 
         // Spawn
         this._spawnX = 0; this._spawnY = 2; this._spawnZ = 0;
+
+        // ---- Ideal controller state ----
+        this._idealGoal = null;      // {x,y,z,yaw} or null
+        this._idealCruiseMps = 15;   // cruise speed (m/s)
+        this._idealYawRate = 60;     // max yaw rate (deg/s)
     }
 
     // ---- Public API ----
+
+    setIdealGoal(goal) {
+        this._idealGoal = goal ? { x: goal.x, y: goal.y, z: goal.z, yaw: goal.yaw } : null;
+    }
+
+    clearIdealGoal() { this._idealGoal = null; }
 
     setSpawnPoint(x, y, z) {
         this._spawnX = x; this._spawnY = y; this._spawnZ = z;
@@ -258,10 +269,22 @@ export class Drone {
         // 1. Control law → updates orientation quaternion and thrustOutput
         if (!input.armed) {
             this._updateDisarmed(dt);
+        } else if (this.flightMode === 'ideal') {
+            this._controlIdeal(dt, input, collisionProvider);
         } else if (this.flightMode === 'drone') {
             this._controlDrone(dt, input);
         } else {
             this._controlFPV(dt, input);
+        }
+
+        // Ideal mode: position & orientation directly controlled, skip physics
+        if (this.flightMode === 'ideal') {
+            this._updateEulerFromQuat();
+            this.groundSpeed = Math.sqrt(this.vx * this.vx + this.vz * this.vz);
+            this.airSpeed = Math.sqrt(this.vx * this.vx + this.vy * this.vy + this.vz * this.vz);
+            this.speed = this.groundSpeed;
+            this.verticalSpeed = this.vy;
+            return;
         }
 
         // 2. Extract rotation matrix from orientation
@@ -763,6 +786,85 @@ export class Drone {
         this.throttlePercent = this.maxThrust > 0
             ? Math.max(0, Math.min(1, this.thrustOutput / (this.maxThrust * boost)))
             : 0;
+    }
+
+    // ---- Ideal controller (direct position/orientation, no physics) ----
+
+    _controlIdeal(dt, input, _collisionProvider) {
+        const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+        const maxSpd = this._idealCruiseMps * (input.boost ? 2.0 : 1.0);
+        this.boostActive = !!input.boost;
+        this.effectiveMaxSpeed = maxSpd;
+        this.thrustOutput = this.maxThrust;
+        this.throttlePercent = 1.0;
+
+        // --- Body-frame basis (world velocity from body commands) ---
+        _mat4.setTRS(pc.Vec3.ZERO, this.orientation, pc.Vec3.ONE);
+        _mat4.getZ(_v3);
+        let fwdX = -_v3.x, fwdZ = -_v3.z;  // forward = -body_Z
+        _mat4.getX(_v3);
+        let rightX = _v3.x, rightZ = _v3.z; // right = +body_X
+        const fwdLen = Math.sqrt(fwdX * fwdX + fwdZ * fwdZ);
+        if (fwdLen > 1e-4) { fwdX /= fwdLen; fwdZ /= fwdLen; }
+        const rightLen = Math.sqrt(rightX * rightX + rightZ * rightZ);
+        if (rightLen > 1e-4) { rightX /= rightLen; rightZ /= rightLen; }
+
+        // --- Handle goal or direct input ---
+        const goal = this._idealGoal;
+        let desVxW, desVyW, desVzW, desYawRate = 0;  // world-frame desired velocity
+
+        if (goal) {
+            const dx = goal.x - this.x;
+            const dy = goal.y - this.y;
+            const dz = goal.z - this.z;
+            const distH = Math.sqrt(dx * dx + dz * dz);
+            const dist3D = Math.sqrt(dx * dx + dy * dy + dz * dz);
+
+            if (dist3D < 1.0) {
+                this._idealGoal = null;
+            } else {
+                const speedH = clamp(distH * 0.8, 0, maxSpd);
+                const nx = distH > 0.1 ? dx / distH : 0;
+                const nz = distH > 0.1 ? dz / distH : 0;
+                desVxW = nx * speedH;
+                desVzW = nz * speedH;
+                desVyW = clamp(dy * 2.0, -this.droneMaxVSpeed, this.droneMaxVSpeed);
+            }
+        } else {
+            // Direct stick → body-frame velocity → convert to world
+            const rates = input.rates || { roll: 1, pitch: 1, yaw: 1 };
+            const cmdFwd   = -input.pitch * maxSpd * rates.pitch;
+            const cmdRight =  input.roll  * maxSpd * rates.roll;
+            desVxW = cmdFwd * fwdX + cmdRight * rightX;
+            desVzW = cmdFwd * fwdZ + cmdRight * rightZ;
+            desVyW = input.throttle * this.droneMaxVSpeed;
+            desYawRate = input.yaw * this._idealYawRate * rates.yaw;
+        }
+
+        // --- Smooth velocity toward desired ---
+        const alpha = 1 - Math.exp(-8 * dt);
+        this.vx += (desVxW - this.vx) * alpha;
+        this.vy += (desVyW - this.vy) * alpha;
+        this.vz += (desVzW - this.vz) * alpha;
+
+        // --- Position integration ---
+        this.x += this.vx * dt;
+        this.y += this.vy * dt;
+        this.z += this.vz * dt;
+
+        // --- Orientation: yaw from velocity direction + stick yaw ---
+        if (Math.abs(this.vx) > 0.1 || Math.abs(this.vz) > 0.1) {
+            const velYaw = Math.atan2(-this.vx, -this.vz);
+            const targetYaw = velYaw + desYawRate * dt * DEG2RAD;
+            const yawErr = targetYaw - this.yaw * DEG2RAD;
+            const yawStep = clamp(yawErr * RAD2DEG * 5.0 * dt, -this._idealYawRate * dt, this._idealYawRate * dt);
+            this._applyBodyRotation(0, 1, 0, yawStep);
+        }
+
+        // Derive speed
+        this.commandedGroundSpeed = Math.sqrt(desVx * desVx + desVz * desVz);
+        this.targetGroundSpeed = maxSpd;
+        this.pilotGroundSpeedCommand = Math.sqrt(input.pitch * input.pitch + input.roll * input.roll) * maxSpd;
     }
 
     // ---- Collision ----
