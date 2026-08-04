@@ -857,7 +857,6 @@ export class CesiumWorld {
         const minCoverageRatio = clampNumber(options.minCoverageRatio, 0, 1, 0.72);
         const repairPasses = Math.round(clampNumber(options.repairPasses, 0, 3, verifyCoverage ? 1 : 0));
         const repairTargets = Math.round(clampNumber(options.repairTargets, 4, 32, 16));
-        const fastScan = options.fastScan !== false;
         const progressCb = typeof options.progressCb === 'function' ? options.progressCb : null;
         const label = radius >= 1000 ? `${(radius / 1000).toFixed(1)} km` : `${Math.round(radius)} m`;
         const delay = (ms) => new Promise(resolve => window.setTimeout(resolve, ms));
@@ -870,8 +869,6 @@ export class CesiumWorld {
         };
 
         const runViews = async (views, passLabel) => {
-            const fastScan = !!(options.fastScan);
-            const tickMs = fastScan ? Math.min(20, dwellMs) : dwellMs; // fast scan: minimal tick to fire tile requests
             for (let i = 0; i < views.length; i++) {
                 const v = views[i];
                 const status = this.getTileLoadStatus();
@@ -897,24 +894,14 @@ export class CesiumWorld {
                     },
                 });
                 this.viewer.scene.requestRender();
-                await delay(tickMs);
-                if (fastScan) {
-                    report.views++;
-                } else {
-                    const idle = await this.waitForTilesIdle(perViewTimeoutMs);
-                    if (!idle) report.timedOutViews++;
-                    report.views++;
-                }
+                await delay(dwellMs);
+                const idle = await this.waitForTilesIdle(perViewTimeoutMs);
+                if (!idle) report.timedOutViews++;
+                report.views++;
             }
         };
 
-        let savedPreload;
         try {
-            savedPreload = this.tileset && 'preloadWhenHidden' in this.tileset ? this.tileset.preloadWhenHidden : undefined;
-            if (fastScan && this.tileset && 'preloadWhenHidden' in this.tileset) {
-                this.tileset.preloadWhenHidden = true;
-            }
-
             const initialViews = this._buildLocalAreaPreloadViews(
                 centerLocal,
                 radius,
@@ -924,8 +911,7 @@ export class CesiumWorld {
                 maxTargets
             );
             await runViews(initialViews, 'scan');
-            if (fastScan && progressCb) progressCb(`Preloading ${label} collision tiles — waiting for concurrent downloads...`);
-            report.finalIdle = await this.waitForTilesIdle(finalIdleTimeoutMs, fastScan ? 100 : 350);
+            report.finalIdle = await this.waitForTilesIdle(finalIdleTimeoutMs, 350);
 
             for (let pass = 0; verifyCoverage && pass <= repairPasses; pass++) {
                 if (progressCb) progressCb(`Verifying ${label} collision tile coverage...`);
@@ -941,9 +927,6 @@ export class CesiumWorld {
                 report.finalIdle = await this.waitForTilesIdle(finalIdleTimeoutMs, 350);
             }
         } finally {
-            if (savedPreload !== undefined && this.tileset && 'preloadWhenHidden' in this.tileset) {
-                this.tileset.preloadWhenHidden = savedPreload;
-            }
             camera.setView({
                 destination: saved.position,
                 orientation: {
@@ -1658,10 +1641,6 @@ export class CesiumWorld {
                     this._renderViewerNow(viewer);
                 }
                 if (tileTimeoutMs > 0) {
-                    if (captureAnyway) {
-                        projector.updateFace(faceDef.name, viewer.scene.canvas);
-                        continue;
-                    }
                     const tilesReady = await this.waitForTilesIdle(
                         tileTimeoutMs,
                         tileQuietMs,
