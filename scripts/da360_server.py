@@ -299,6 +299,9 @@ class DA360Runner:
         valid = np.isfinite(depth) & (depth > 0)
         if np.any(valid):
             depth = depth / max(float(depth[valid].min()), 1e-6)
+        scale = env_float("DA360_DEPTH_SCALE", 1.0)
+        if abs(scale - 1.0) > 1e-6:
+            depth = depth * scale
         return depth
 
     def infer_raw(self, image):
@@ -380,6 +383,7 @@ def create_app(runner):
             "resample": runner.resample_name,
             "amp": runner.use_amp,
             "channels_last": runner.channels_last,
+            "depth_scale": env_float("DA360_DEPTH_SCALE", 1.0),
         })
 
     @app.route("/depth/raw", methods=["POST", "OPTIONS"])
