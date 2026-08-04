@@ -94,11 +94,23 @@ export class PanoramaSensor {
         this.lastDepthTime = 0;
         this.hasRgb = false;
         this.hasDepth = false;
+        this._depthLatency = '';
 
         if (this.rgbCanvas) {
             this.rgbCanvas.width = PANORAMA_WIDTH;
             this.rgbCanvas.height = PANORAMA_HEIGHT;
             this._drawPlaceholder(this.rgbCanvas, 'RGB PANORAMA');
+        }
+        if (this.depthImg) {
+            this.depthImg.onload = () => {
+                this.hasDepth = true;
+                this._updateDepthDisplay();
+            };
+            this.depthImg.onerror = () => {
+                this.hasDepth = false;
+                this._setStatus(this.hasRgb ? 'ready' : 'idle', 'decode error');
+                this._setDepthPlaceholder('decode error');
+            };
         }
         this._setDepthPlaceholder('DA360 offline');
         this._setStatus('idle', 'offline');
@@ -167,7 +179,26 @@ export class PanoramaSensor {
         if (!this.panel || !this.rgbCanvas || !world || !transform) return;
         this._applyVisibility();
         if (!this._shouldRun()) return;
+
+        // B6 fix: stuck capture watchdog — force-reset if captureAnyway is on
+        if (this.capturing) {
+            const stuckMs = PANORAMA_FACE_TILE_TIMEOUT_MS * 6 + 500;
+            if (PANORAMA_CAPTURE_ANYWAY && now - this.lastCaptureStartTime > stuckMs) {
+                this.capturing = false;
+            } else {
+                // B7: depth still triggers independently even while capture is stuck
+                if (this.hasRgb && !this.depthPending && now - this.lastDepthTime >= DEPTH_INTERVAL_MS) {
+                    this._requestDepth(this.rgbCanvas);
+                }
+                return;
+            }
+        }
         if (this.capturing || now - this.lastCaptureStartTime < CAPTURE_INTERVAL_MS) return;
+
+        // B7: also trigger depth at normal update rate when no capture is active
+        if (this.hasRgb && !this.depthPending && now - this.lastDepthTime >= DEPTH_INTERVAL_MS) {
+            this._requestDepth(this.rgbCanvas);
+        }
         this._capture(world, transform);
     }
 
@@ -234,6 +265,10 @@ export class PanoramaSensor {
     _setStatus(rgbStatus, depthStatus) {
         if (this.rgbStatusEl) this.rgbStatusEl.textContent = rgbStatus;
         if (this.depthStatusEl) this.depthStatusEl.textContent = depthStatus;
+    }
+
+    _updateDepthDisplay() {
+        this._setStatus(this.hasRgb ? 'ready' : 'idle', this._depthLatency || 'ready');
     }
 
     _formatRelativeDepth(value) {
@@ -386,12 +421,11 @@ export class PanoramaSensor {
             }
             this.depthImg.src = payload.depth_image;
             this._setDepthLegend(payload.depth_scale);
-            this.hasDepth = true;
             this.lastDepthTime = performance.now();
-            const latency = Number.isFinite(payload.latency_ms)
+            this._depthLatency = Number.isFinite(payload.latency_ms)
                 ? `${Math.round(payload.latency_ms)}ms`
                 : `${Math.round(this.lastDepthTime - started)}ms`;
-            this._setStatus('ready', latency);
+            // hasDepth and status set in depthImg.onload
         } catch (error) {
             reportUserError('DA360 depth request failed', error, {
                 key: 'da360-depth-request',

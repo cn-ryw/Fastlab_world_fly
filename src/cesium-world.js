@@ -697,7 +697,6 @@ export class CesiumWorld {
                     renderViewer.scene
                 ) {
                     renderViewer.scene.requestRender();
-                    this._renderViewerNow(renderViewer);
                 }
                 const now = performance.now();
                 const pending = loadState ? loadState.pending : this._tileLoadPending;
@@ -1560,7 +1559,12 @@ export class CesiumWorld {
         }
 
         if (!this._panoramaInitPromise) {
-            this._panoramaInitPromise = this._createPanoramaCaptureViewer(faceSize)
+            const initTimeoutMs = 20000;
+            const initPromise = this._createPanoramaCaptureViewer(faceSize);
+            this._panoramaInitPromise = Promise.race([
+                initPromise,
+                new Promise((_, reject) => setTimeout(() => reject(new Error('Panorama capture viewer init timed out')), initTimeoutMs))
+            ])
                 .finally(() => {
                     this._panoramaInitPromise = null;
                 });
@@ -1699,6 +1703,7 @@ export class CesiumWorld {
             frameDelayMs: options.frameDelayMs,
             tileTimeoutMs: options.tileTimeoutMs,
             tileQuietMs: options.tileQuietMs,
+            captureAnyway: options.captureAnyway,
             progressCb: options.progressCb,
         });
     }
@@ -1720,6 +1725,7 @@ export class CesiumWorld {
             frameDelayMs: options.frameDelayMs,
             tileTimeoutMs: options.tileTimeoutMs,
             tileQuietMs: options.tileQuietMs,
+            captureAnyway: options.captureAnyway,
             progressCb: options.progressCb,
         });
     }
