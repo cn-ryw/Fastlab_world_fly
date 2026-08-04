@@ -908,8 +908,9 @@ export class CesiumWorld {
             }
         };
 
+        let savedPreload;
         try {
-            const savedPreload = this.tileset && 'preloadWhenHidden' in this.tileset ? this.tileset.preloadWhenHidden : undefined;
+            savedPreload = this.tileset && 'preloadWhenHidden' in this.tileset ? this.tileset.preloadWhenHidden : undefined;
             if (fastScan && this.tileset && 'preloadWhenHidden' in this.tileset) {
                 this.tileset.preloadWhenHidden = true;
             }
