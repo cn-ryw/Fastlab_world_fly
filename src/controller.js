@@ -100,10 +100,12 @@ const KEYBOARD_MAP = {
     'KeyS':       { action: 'throttle', value: -1 },
     'KeyA':       { action: 'yaw',      value: -1 },
     'KeyD':       { action: 'yaw',      value: 1 },
+    // Arrow keys = drone position control (Easy/Drone mode):
+    //   pitch → fwd/back velocity,  roll → left/right velocity
     'ArrowUp':    { action: 'pitch',    value: -1 },
     'ArrowDown':  { action: 'pitch',    value: 1 },
-    'ArrowLeft':  { action: 'roll',     value: 1 },
-    'ArrowRight': { action: 'roll',     value: -1 },
+    'ArrowLeft':  { action: 'roll',     value: -1 },
+    'ArrowRight': { action: 'roll',     value: 1 },
     'KeyQ':       { action: 'cameraTilt', value: 1 },
     'KeyE':       { action: 'cameraTilt', value: -1 },
 };

@@ -532,7 +532,7 @@ export class Drone {
 
         // Sticks → target angular rates (body frame), scaled by rate
         const tPR = input.pitch * this.maxPitchRate * rates.pitch * boost;
-        const tRR = -input.roll * this.maxRollRate * rates.roll * boost;
+        const tRR = input.roll * this.maxRollRate * rates.roll * boost;
         const tYR = input.yaw  * this.maxYawRate  * rates.yaw  * boost;
 
         // Smooth rate tracking
