@@ -871,6 +871,7 @@ export class CesiumWorld {
 
         const runViews = async (views, passLabel) => {
             const fastScan = !!(options.fastScan);
+            const tickMs = fastScan ? Math.min(20, dwellMs) : dwellMs; // fast scan: minimal tick to fire tile requests
             for (let i = 0; i < views.length; i++) {
                 const v = views[i];
                 const status = this.getTileLoadStatus();
@@ -896,7 +897,7 @@ export class CesiumWorld {
                     },
                 });
                 this.viewer.scene.requestRender();
-                await delay(dwellMs);
+                await delay(tickMs);
                 if (fastScan) {
                     report.views++;
                 } else {
@@ -922,7 +923,8 @@ export class CesiumWorld {
                 maxTargets
             );
             await runViews(initialViews, 'scan');
-            report.finalIdle = await this.waitForTilesIdle(finalIdleTimeoutMs, 350);
+            if (fastScan && progressCb) progressCb(`Preloading ${label} collision tiles — waiting for concurrent downloads...`);
+            report.finalIdle = await this.waitForTilesIdle(finalIdleTimeoutMs, fastScan ? 100 : 350);
 
             for (let pass = 0; verifyCoverage && pass <= repairPasses; pass++) {
                 if (progressCb) progressCb(`Verifying ${label} collision tile coverage...`);
