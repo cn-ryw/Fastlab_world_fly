@@ -857,6 +857,7 @@ export class CesiumWorld {
         const minCoverageRatio = clampNumber(options.minCoverageRatio, 0, 1, 0.72);
         const repairPasses = Math.round(clampNumber(options.repairPasses, 0, 3, verifyCoverage ? 1 : 0));
         const repairTargets = Math.round(clampNumber(options.repairTargets, 4, 32, 16));
+        const fastScan = options.fastScan !== false;
         const progressCb = typeof options.progressCb === 'function' ? options.progressCb : null;
         const label = radius >= 1000 ? `${(radius / 1000).toFixed(1)} km` : `${Math.round(radius)} m`;
         const delay = (ms) => new Promise(resolve => window.setTimeout(resolve, ms));
@@ -869,6 +870,7 @@ export class CesiumWorld {
         };
 
         const runViews = async (views, passLabel) => {
+            const fastScan = !!(options.fastScan);
             for (let i = 0; i < views.length; i++) {
                 const v = views[i];
                 const status = this.getTileLoadStatus();
@@ -895,9 +897,13 @@ export class CesiumWorld {
                 });
                 this.viewer.scene.requestRender();
                 await delay(dwellMs);
-                const idle = await this.waitForTilesIdle(perViewTimeoutMs);
-                if (!idle) report.timedOutViews++;
-                report.views++;
+                if (fastScan) {
+                    report.views++;
+                } else {
+                    const idle = await this.waitForTilesIdle(perViewTimeoutMs);
+                    if (!idle) report.timedOutViews++;
+                    report.views++;
+                }
             }
         };
 
