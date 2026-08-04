@@ -1742,4 +1742,137 @@ export class CesiumWorld {
             `alt ${Number(altitudeMeters || 0).toFixed(1)} m`,
         ].join(' | ');
     }
+
+    /**
+     * Sample sparse metric-depth anchors via Cesium ray-casting against
+     * the currently-loaded 3D Tiles (Google Photorealistic).
+     *
+     * Each anchor is an ERP grid cell centre projected into a body-frame
+     * direction, then ray-cast through `pickLocalRay`.  The returned object
+     * contains both successful hits and per-anchor failure reasons so the
+     * downstream metric-fitting stage can decide how to handle missing data.
+     *
+     * @param {object} transform  – { position: {x,y,z}, orientation: quaternion }
+     * @param {object} [options]
+     * @param {number} [options.gridCols=16]
+     * @param {number} [options.gridRows=8]
+     * @param {number} [options.maxRangeM=100]
+     * @param {number} [options.excludeTopDeg=15]   – skip anchors within N° of top pole
+     * @param {number} [options.excludeBottomDeg=5] – skip anchors within N° of bottom pole
+     * @param {number} [options.imageWidth=384]     – ERP width for geometry
+     * @param {number} [options.imageHeight=192]    – ERP height for geometry
+     * @param {number} [options.verticalFovDeg=180]
+     * @returns {{ anchors: Array, failures: Array, metadata: object }}
+     */
+    sampleMetricDepthAnchors(transform, options = {}) {
+        const defaults = {
+            gridCols: 16, gridRows: 8,
+            maxRangeM: 100,
+            excludeTopDeg: 15, excludeBottomDeg: 5,
+            imageWidth: 384, imageHeight: 192,
+            verticalFovDeg: 180,
+        };
+        const opts = { ...defaults, ...options };
+        const vfovRad = opts.verticalFovDeg / 180 * Math.PI;
+
+        const anchors = [];
+        const failures = [];
+
+        // Pre-compute camera-to-body rotation (if any pitch offset)
+        const Rx = (typeof this._rotationBc === 'function')
+            ? this._rotationBc() : null;
+
+        for (let row = 0; row < opts.gridRows; row++) {
+            for (let col = 0; col < opts.gridCols; col++) {
+                const u = (col + 0.5) / opts.gridCols * opts.imageWidth;
+                const v = (row + 0.5) / opts.gridRows * opts.imageHeight;
+
+                // ERP pixel → body-frame direction
+                const yaw = Math.PI - (u + 0.5) / opts.imageWidth * 2.0 * Math.PI;
+                const pitchRad = vfovRad / 2.0 - (v + 0.5) / opts.imageHeight * vfovRad;
+                const pitchDeg = pitchRad * 180 / Math.PI;
+
+                // Pole exclusion
+                if (pitchDeg > (90 - opts.excludeTopDeg) || pitchDeg < (-90 + opts.excludeBottomDeg)) {
+                    failures.push({ col, row, u, v, reason: 'pole_excluded', pitchDeg });
+                    continue;
+                }
+
+                const cosP = Math.cos(pitchRad);
+                let dx = cosP * Math.cos(yaw);
+                let dy = cosP * Math.sin(yaw);
+                let dz = Math.sin(pitchRad);
+
+                // Apply camera-to-body rotation if present
+                if (Rx) {
+                    const rdx = Rx[0] * dx + Rx[1] * dy + Rx[2] * dz;
+                    const rdy = Rx[3] * dx + Rx[4] * dy + Rx[5] * dz;
+                    const rdz = Rx[6] * dx + Rx[7] * dy + Rx[8] * dz;
+                    dx = rdx; dy = rdy; dz = rdz;
+                }
+
+                // Normalise
+                const len = Math.hypot(dx, dy, dz);
+                if (len < 1e-9) {
+                    failures.push({ col, row, u, v, reason: 'zero_direction' });
+                    continue;
+                }
+                const dir = { x: dx / len, y: dy / len, z: dz / len };
+
+                // Ray cast
+                const origin = transform.position;
+                const hit = this.pickLocalRay(origin, dir, opts.maxRangeM);
+
+                if (!hit) {
+                    // Distinguish failure modes
+                    const reason = this._tilesReady()
+                        ? 'no_hit' : 'tile_not_ready';
+                    failures.push({ col, row, u, v, reason });
+                    continue;
+                }
+
+                if (!Number.isFinite(hit.distance) || hit.distance > opts.maxRangeM) {
+                    failures.push({ col, row, u, v, reason: 'out_of_range', distance: hit.distance });
+                    continue;
+                }
+
+                anchors.push({
+                    col, row,
+                    u, v,
+                    yawDeg: yaw * 180 / Math.PI,
+                    pitchDeg,
+                    direction: dir,
+                    distance: hit.distance,
+                    position: hit.position,
+                });
+            }
+        }
+
+        return {
+            anchors,
+            failures,
+            metadata: {
+                gridCols: opts.gridCols,
+                gridRows: opts.gridRows,
+                maxRangeM: opts.maxRangeM,
+                excludeTopDeg: opts.excludeTopDeg,
+                excludeBottomDeg: opts.excludeBottomDeg,
+                imageWidth: opts.imageWidth,
+                imageHeight: opts.imageHeight,
+                verticalFovDeg: opts.verticalFovDeg,
+                totalCells: opts.gridCols * opts.gridRows,
+                validAnchors: anchors.length,
+                failureCount: failures.length,
+                tileState: this._tilesReady() ? 'ready' : 'loading',
+                timestamp: Date.now(),
+            },
+        };
+    }
+
+    _tilesReady() {
+        if (this.tileset && typeof this.tileset.tilesLoaded !== 'undefined') {
+            return this.tileset.tilesLoaded;
+        }
+        return true; // optimistic
+    }
 }
