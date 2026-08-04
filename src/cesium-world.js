@@ -1655,6 +1655,10 @@ export class CesiumWorld {
                     this._renderViewerNow(viewer);
                 }
                 if (tileTimeoutMs > 0) {
+                    if (captureAnyway) {
+                        projector.updateFace(faceDef.name, viewer.scene.canvas);
+                        continue;
+                    }
                     const tilesReady = await this.waitForTilesIdle(
                         tileTimeoutMs,
                         tileQuietMs,
