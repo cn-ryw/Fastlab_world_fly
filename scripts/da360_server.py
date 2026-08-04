@@ -4,6 +4,7 @@
 import argparse
 import base64
 import io
+import json
 import os
 import sys
 import threading
@@ -300,6 +301,58 @@ class DA360Runner:
             depth = depth / max(float(depth[valid].min()), 1e-6)
         return depth
 
+    def infer_raw(self, image):
+        """Return raw pred_disp without per-frame min-normalization.
+
+        Returns
+        -------
+        dict with keys:
+            pred_disp       — float32[H,W] raw disparity from DA360 (no per-frame rescale)
+            relative_depth  — float32[H,W] = 1 / max(pred_disp, epsilon); NOT divided by min
+            valid_mask      — bool[H,W]   finite(pred_disp) & pred_disp > epsilon
+            metadata         — dict with model info and inference context
+        """
+        with self.lock:
+            tensor = image_to_tensor(
+                image,
+                self.width,
+                self.height,
+                self.device,
+                self.mean,
+                self.std,
+                self.resample,
+                channels_last=self.channels_last,
+            )
+            with torch.inference_mode():
+                amp_context = torch.cuda.amp.autocast() if self.use_amp else nullcontext()
+                with amp_context:
+                    outputs = self.model(tensor)
+            disp = outputs["pred_disp"].detach().float().cpu().numpy()[0, 0]
+
+        eps = np.float32(1e-6)
+        valid = np.isfinite(disp) & (disp > eps)
+        rel_depth = np.where(valid, np.float32(1.0) / np.maximum(disp, eps), np.float32(0.0))
+
+        return {
+            "pred_disp": disp,
+            "relative_depth": rel_depth,
+            "valid_mask": valid.astype(np.uint8),
+            "metadata": {
+                "model": self.model_name,
+                "device": str(self.device),
+                "width": self.width,
+                "height": self.height,
+                "checkpoint_width": self.checkpoint_width,
+                "checkpoint_height": self.checkpoint_height,
+                "input_scale": self.input_scale,
+                "resample": self.resample_name,
+                "amp": self.use_amp,
+                "epsilon": float(eps),
+                "unit_pred_disp": "raw disparity (inverse depth), NOT per-frame normalized",
+                "unit_relative_depth": "1/pred_disp (not divided by frame min)",
+            },
+        }
+
 
 def create_app(runner):
     app = Flask(__name__)
@@ -329,6 +382,52 @@ def create_app(runner):
             "channels_last": runner.channels_last,
         })
 
+    @app.route("/depth/raw", methods=["POST", "OPTIONS"])
+    def depth_raw():
+        """Return raw pred_disp, relative_depth, and valid_mask in .npz format.
+
+        Input:  Content-Type: image/jpeg  (ERP RGB JPEG)
+        Output: Content-Type: application/x-npz
+                Contains: pred_disp (float32), relative_depth (float32),
+                          valid_mask (uint8), metadata_json (str)
+        """
+        if request.method == "OPTIONS":
+            return ("", 204)
+        started = time.time()
+
+        try:
+            image = decode_request_image(request)
+            request_width, request_height = image.size
+            raw = runner.infer_raw(image)
+
+            buf = io.BytesIO()
+            np.savez_compressed(
+                buf,
+                pred_disp=raw["pred_disp"],
+                relative_depth=raw["relative_depth"],
+                valid_mask=raw["valid_mask"],
+                metadata_json=json.dumps(raw["metadata"]),
+            )
+            raw_bytes = buf.getvalue()
+
+            response = app.response_class(
+                raw_bytes,
+                status=200,
+                mimetype="application/x-npz",
+                headers={
+                    "Content-Disposition": "attachment; filename=depth_raw.npz",
+                    "X-DA360-Model": raw["metadata"]["model"],
+                    "X-DA360-Width": str(raw["metadata"]["width"]),
+                    "X-DA360-Height": str(raw["metadata"]["height"]),
+                    "X-DA360-Latency-Ms": str((time.time() - started) * 1000.0),
+                },
+            )
+            return response
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        except Exception as exc:
+            print(f"[DA360] raw inference failed: {exc}", file=sys.stderr)
+            return jsonify({"error": str(exc)}), 500
     @app.route("/depth", methods=["POST", "OPTIONS"])
     def depth():
         if request.method == "OPTIONS":
