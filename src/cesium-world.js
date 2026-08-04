@@ -908,6 +908,11 @@ export class CesiumWorld {
         };
 
         try {
+            const savedPreload = this.tileset && 'preloadWhenHidden' in this.tileset ? this.tileset.preloadWhenHidden : undefined;
+            if (fastScan && this.tileset && 'preloadWhenHidden' in this.tileset) {
+                this.tileset.preloadWhenHidden = true;
+            }
+
             const initialViews = this._buildLocalAreaPreloadViews(
                 centerLocal,
                 radius,
@@ -933,6 +938,9 @@ export class CesiumWorld {
                 report.finalIdle = await this.waitForTilesIdle(finalIdleTimeoutMs, 350);
             }
         } finally {
+            if (savedPreload !== undefined && this.tileset && 'preloadWhenHidden' in this.tileset) {
+                this.tileset.preloadWhenHidden = savedPreload;
+            }
             camera.setView({
                 destination: saved.position,
                 orientation: {
