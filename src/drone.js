@@ -896,14 +896,22 @@ export class Drone {
             const dist3D = Math.sqrt(dx * dx + dy * dy + dz * dz);
 
             if (dist3D < 1.0) {
+                // Arrived — stop and hold
                 this._idealGoal = null;
+                this.vx = 0; this.vy = 0; this.vz = 0;
             } else {
-                const speedH = clamp(distH * 0.8, 0, maxSpd);
+                // Softer speed: gain 0.5, cap at maxSpd, decelerate near goal
+                const decelDist = 20; // start decelerating within 20m
+                const speedCap = Math.min(maxSpd, distH * (distH < decelDist ? 0.5 + 0.5 * distH / decelDist : 1.0));
+                const speedH = clamp(distH * 0.5, 0, speedCap);
                 const nx = distH > 0.1 ? dx / distH : 0;
                 const nz = distH > 0.1 ? dz / distH : 0;
                 desVxW = nx * speedH;
                 desVzW = nz * speedH;
-                desVyW = clamp(dy * 2.0, -this.droneMaxVSpeed, this.droneMaxVSpeed);
+                desVyW = clamp(dy * 1.5, -this.droneMaxVSpeed, this.droneMaxVSpeed);
+                // Prevent going below ground
+                const minY = 2; // minimum altitude above local origin
+                if (this.y + desVyW * dt < minY) desVyW = (minY - this.y) / Math.max(dt, 0.001);
             }
         } else {
             // Direct stick → body-frame velocity → convert to world
@@ -926,6 +934,9 @@ export class Drone {
         this.x += this.vx * dt;
         this.y += this.vy * dt;
         this.z += this.vz * dt;
+
+        // Floor: don't go below 2m above local ground origin
+        if (this.y < 2) { this.y = 2; if (this.vy < 0) this.vy = 0; }
 
         // --- Orientation: yaw from velocity direction + stick yaw ---
         if (Math.abs(this.vx) > 0.1 || Math.abs(this.vz) > 0.1) {
