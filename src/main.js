@@ -1007,6 +1007,7 @@ function setupKeyboard() {
             // G key: hold to click goal in ideal mode
             if (e.code === 'KeyG' && drone && drone.flightMode === 'ideal') {
                 placementKeysDown.add(e.code);
+                e.preventDefault();
                 return;
             }
             if (e.code === 'KeyV') {
