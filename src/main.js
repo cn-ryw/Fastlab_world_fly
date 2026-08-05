@@ -424,20 +424,26 @@ function setupFlightGoalClickHandler() {
     const Cesium = world.Cesium;
     const canvas = world.viewer.scene.canvas;
 
-    const onMouseDown = async (e) => {
+    let lastClickTime = 0;
+    const onMouseDown = (e) => {
         if (mode !== 'flight' || !drone) return;
-        if (drone.flightMode !== 'ideal') { console.log('[goal] not ideal:', drone.flightMode); return; }
-        if (!placementKeysDown.has('KeyG')) { console.log('[goal] G not held'); return; }
+        if (drone.flightMode !== 'ideal') return;
 
-        // Disable Cesium camera control during G+click
+        // G+click: single click with G held
+        // Double-click (no G): set goal directly
+        const isG = placementKeysDown.has('KeyG');
+        const now = performance.now();
+        const isDouble = (now - lastClickTime < 400);
+        lastClickTime = now;
+
+        if (!isG && !isDouble) return;
+
         e.stopPropagation();
         e.preventDefault();
 
         const rect = canvas.getBoundingClientRect();
         const clickPos = new Cesium.Cartesian2(e.clientX - rect.left, e.clientY - rect.top);
 
-        console.log('[goal] picking...');
-        // Try pickPosition first, fall back to pickEllipsoid
         let cartesian = null;
         try {
             if (world.viewer.scene.pickPositionSupported) {
@@ -451,19 +457,7 @@ function setupFlightGoalClickHandler() {
                 if (Cesium.defined(p)) cartesian = p;
             } catch (_) {}
         }
-        if (!cartesian) {
-            try {
-                const ray = world.viewer.camera.getPickRay(clickPos);
-                if (ray && world.viewer.scene.pickFromRay) {
-                    const hit = world.viewer.scene.pickFromRay(ray);
-                    if (hit && Cesium.defined(hit.position)) cartesian = hit.position;
-                }
-            } catch (_) {}
-        }
-        if (!cartesian) {
-            console.log('[goal] pick failed — no geometry at cursor');
-            return;
-        }
+        if (!cartesian) return;
 
         const local = world.cartesianToLocal(cartesian);
         console.log('[goal] SET:', local.x.toFixed(1), goalAltitudeMeters, local.z.toFixed(1));
