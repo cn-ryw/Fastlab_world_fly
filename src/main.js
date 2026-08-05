@@ -1075,6 +1075,12 @@ function setupKeyboard() {
     window.addEventListener('keydown', (e) => {
         if (controller && controller.isSettingsOpen && controller.isSettingsOpen()) return;
         if (isTextEntryTarget(e.target)) {
+            // G key for goal setting works even when focus is on a text input
+            if (e.code === 'KeyG' && mode === 'flight' && drone && drone.flightMode === 'ideal') {
+                placementKeysDown.add(e.code);
+                e.preventDefault();
+                return;
+            }
             if (mode === 'placement' && e.code === 'KeyI' && isPointerOverCesiumCanvas()) {
                 placementKeysDown.add(e.code);
                 e.preventDefault();
