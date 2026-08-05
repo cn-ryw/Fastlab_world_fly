@@ -739,6 +739,73 @@ function getCameraHFov(now = performance.now()) {
     return cachedHFov;
 }
 
+function drawRadar() {
+    const panel = document.getElementById('radar-panel');
+    const canvas = document.getElementById('radar-canvas');
+    if (!panel || !canvas || !drone) return;
+    if (mode !== 'flight') { panel.classList.remove('visible'); return; }
+    panel.classList.add('visible');
+
+    const ctx = canvas.getContext('2d');
+    const w = canvas.width, h = canvas.height, cx = w/2, cy = h/2;
+    const range = 200; // meters
+    const scale = (w/2 - 10) / range;
+
+    ctx.clearRect(0, 0, w, h);
+    // Background
+    ctx.fillStyle = 'rgba(3,7,18,0.95)';
+    ctx.fillRect(0, 0, w, h);
+
+    // Range rings
+    for (let r = 50; r <= range; r += 50) {
+        ctx.beginPath();
+        ctx.arc(cx, cy, r * scale, 0, Math.PI * 2);
+        ctx.strokeStyle = 'rgba(125,211,252,0.15)';
+        ctx.stroke();
+    }
+
+    // North indicator
+    ctx.strokeStyle = '#f44';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(cx, cy); ctx.lineTo(cx, 8);
+    ctx.stroke();
+
+    // Drone (green dot, facing direction)
+    const dx = drone.x * scale, dz = -drone.z * scale; // x=east→right, z=north→up
+    const droneSx = cx + dx, droneSy = cy + dz;
+    ctx.fillStyle = '#0f0';
+    ctx.beginPath();
+    ctx.arc(droneSx, droneSy, 5, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Goal (red dot)
+    const goal = drone._idealGoal;
+    if (goal) {
+        const gx = goal.x * scale, gz = -goal.z * scale;
+        const goalSx = cx + gx, goalSy = cy + gz;
+        ctx.fillStyle = '#f44';
+        ctx.beginPath();
+        ctx.arc(goalSx, goalSy, 4, 0, Math.PI * 2);
+        ctx.fill();
+        // Line from drone to goal
+        ctx.strokeStyle = 'rgba(255,64,43,0.5)';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(droneSx, droneSy);
+        ctx.lineTo(goalSx, goalSy);
+        ctx.stroke();
+    }
+
+    // Range text
+    document.querySelector('.radar-range').textContent = `${range}m`;
+    // Drone position text
+    ctx.fillStyle = '#7dd3fc';
+    ctx.font = '8px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText(`${drone.x.toFixed(0)},${drone.z.toFixed(0)}`, droneSx, droneSy + 16);
+}
+
 function gameLoop(now) {
     const frameDt = Math.min(MAX_PHYSICS_FRAME_DT, Math.max(0.001, (now - lastFrameTime) / 1000));
     lastFrameTime = now;
@@ -818,6 +885,9 @@ function updateFlight(dt) {
             drone.yaw
         );
     }
+
+    // Radar minimap
+    drawRadar();
     hud?.update(drone, controller, null);
     applyDisplaySettings();
     osd?.update(drone, controller);

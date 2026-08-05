@@ -284,6 +284,32 @@
             font-size: 10px;
         }
 
+        /* Radar minimap */
+        #radar-panel {
+            position: fixed;
+            bottom: 10px;
+            left: 10px;
+            width: 160px;
+            height: 160px;
+            background: rgba(3,7,18,0.88);
+            border: 1px solid rgba(125,211,252,0.42);
+            border-radius: 6px;
+            z-index: 200;
+            display: none;
+        }
+        #radar-panel.visible { display: block; }
+        #radar-canvas { width: 100%; height: 100%; display: block; }
+        .radar-label {
+            position: absolute; top: 4px; left: 50%;
+            transform: translateX(-50%);
+            color: #f44; font-size: 11px; font-weight: 700;
+            pointer-events: none;
+        }
+        .radar-range {
+            position: absolute; bottom: 4px; right: 6px;
+            color: #7dd3fc; font-size: 9px; pointer-events: none;
+        }
+
         /* Race timing panel (F1 timing-tower style, left-middle). */
         #hud-race-panel {
             position: absolute;
@@ -724,6 +750,20 @@
                 <span id="panorama-depth-far-label">far --</span>
             </div>
         </div>
+    </div>
+
+    <!-- Radar minimap -->
+    <div id="radar-panel">
+        <canvas id="radar-canvas" width="160" height="160"></canvas>
+        <div class="radar-label">N</div>
+        <div class="radar-range">200m</div>
+    </div>
+
+    <!-- Waypoint input -->
+    <div id="waypoint-input" style="display:none;">
+        <input type="text" id="waypoint-x" placeholder="X (east)" style="width:70px;">
+        <input type="text" id="waypoint-z" placeholder="Z (north)" style="width:70px;">
+        <button id="waypoint-go-btn">Go</button>
     </div>
 
     <!-- Gear button -->
