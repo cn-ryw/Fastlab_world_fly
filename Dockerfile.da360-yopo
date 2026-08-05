@@ -1,0 +1,31 @@
+FROM dzp_yopo:sim-u2004-noetic-py38
+
+ENV PYTHONUNBUFFERED=1 \
+    OPENCV_IO_ENABLE_OPENEXR=1 \
+    DA360_ROOT=/opt/DA360 \
+    YOPO_ROOT=/opt/YOPO_360 \
+    YOPO_CONFIG=x5_cruise15_18m_a12_mask_wc3.yaml \
+    DA360_MODEL=large
+
+ENV PATH="/opt/venv/bin:$PATH"
+
+# DA360 code
+COPY third_party/DA360 "$DA360_ROOT"
+COPY third_party/wheels /tmp/wheels
+RUN python3 -m pip install --no-cache-dir --no-deps --no-index --find-links /tmp/wheels flask-cors timm \
+    && rm -rf /tmp/wheels
+COPY scripts/da360_server.py /opt/mindcloud-da360/scripts/da360_server.py
+
+# YOPO code
+COPY third_party/YOPO /opt/YOPO_360/YOPO
+
+# Combined entry point
+COPY scripts/yopo_bridge.py /opt/yopo-bridge/yopo_bridge.py
+
+EXPOSE 5688 5699
+
+CMD python3 /opt/mindcloud-da360/scripts/da360_server.py \
+      --model-path /models/DA360_large.pth --host 0.0.0.0 --port 5688 & \
+    sleep 10 && \
+    python3 /opt/yopo-bridge/yopo_bridge.py \
+      --model-path /models/epoch10.pth --host 0.0.0.0 --port 5699

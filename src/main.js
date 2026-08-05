@@ -426,15 +426,19 @@ function setupFlightGoalClickHandler() {
     flightGoalHandler = new Cesium.ScreenSpaceEventHandler(world.viewer.scene.canvas);
     flightGoalHandler.setInputAction(async (click) => {
         if (mode !== 'flight' || !drone) return;
-        if (drone.flightMode !== 'ideal') return;
-        if (!placementKeysDown.has('KeyG')) return;
+        if (drone.flightMode !== 'ideal') { console.log('[goal] not ideal mode:', drone.flightMode); return; }
+        if (!placementKeysDown.has('KeyG')) { console.log('[goal] G not held'); return; }
 
+        console.log('[goal] picking spawn...');
         const picked = await world.pickSpawn(click.position, goalAltitudeMeters);
         if (picked) {
+            console.log('[goal] SET goal:', picked.x, goalAltitudeMeters, picked.z);
             drone.setIdealGoal({ x: picked.x, y: goalAltitudeMeters, z: picked.z });
             world.showGoalMarker({ x: picked.x, y: goalAltitudeMeters, z: picked.z });
+        } else {
+            console.log('[goal] pickSpawn returned null');
         }
-    }, Cesium.ScreenSpaceEventType.LEFT_CLICK);
+    }, Cesium.ScreenSpaceEventType.LEFT_DOWN);
 
     // mouse wheel adjusts goal altitude when G is held
     flightGoalHandler.setInputAction((delta) => {
