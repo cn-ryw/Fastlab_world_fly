@@ -41,7 +41,11 @@ def _load_model(model_path, device):
         raise FileNotFoundError(f"YOPO checkpoint missing: {model_path}")
     payload = torch.load(model_path, map_location=device, weights_only=False)
     state_dict = payload.get("model_state_dict", payload)
-    net = YopoNetwork(cfg)
+    net = YopoNetwork(
+        observation_dim=9,
+        output_dim=10,
+        hidden_state=64,
+    )
     net.load_state_dict(state_dict, strict=False)
     net.to(device)
     net.eval()
@@ -108,17 +112,17 @@ class YopoRunner:
         self.device = device
 
         self.net = _load_model(model_path, device)
-        self.width = cfg.image_width          # 384
-        self.height = cfg.image_height         # 192
-        self.in_channels = cfg.image_channels  # 2
-        self.max_dis = cfg.depth_max_m         # 20.0
-        self.min_dis = cfg.depth_min_m         # 0.04
-        self.mask_valid_threshold = cfg.depth_mask_threshold  # 127
-        self.fixed_height = cfg.fixed_height   # 0.8
-        self.traj_time = 2 * cfg.radio_range / cfg.vel_max_train  # 1.125s
+        self.width = cfg["image_width"]
+        self.height = cfg["image_height"]
+        self.in_channels = cfg["image_channels"]
+        self.max_dis = cfg["depth_max_m"]
+        self.min_dis = cfg["depth_min_m"]
+        self.mask_valid_threshold = cfg["depth_mask_threshold"]
+        self.fixed_height = cfg["fixed_height"]
+        self.traj_time = 2 * cfg["radio_range"] / cfg["vel_max_train"]
         self.Rotation_bc = R.from_euler("z", 0, degrees=True).as_matrix()  # identity
 
-        self.state_transform = StateTransform(cfg)
+        self.state_transform = StateTransform()
         self._warmup()
 
     def _warmup(self):
@@ -173,9 +177,16 @@ class YopoRunner:
         endstate_pred, score_pred = endstate_pred.cpu().numpy(), score_pred.cpu().numpy()
 
         # 4. decode best candidate
-        selected_id = int(np.argmin(score_pred.reshape(-1)))
-        from policy.state_transform import pred_to_endstate_cpu  # noqa: E402
-        endstate = pred_to_endstate_cpu(endstate_pred, score_pred, cfg)[selected_id]
+        traj_num = cfg["horizon_num"] * cfg["vertical_num"] * cfg["radio_num"]  # 72
+        endstate_flat = endstate_pred.reshape(9, traj_num).T  # [72, 9]
+        score_flat = score_pred.reshape(traj_num)
+        action_id = int(np.argmin(score_flat))
+        lattice_id = traj_num - 1 - action_id
+        endstate = self.state_transform.pred_to_endstate_cpu(
+            endstate_flat[action_id, :][np.newaxis, :],
+            torch.tensor([lattice_id], dtype=torch.long)
+        )
+        score = float(score_flat[action_id])
 
         endstate_c = endstate.reshape(-1, 3, 3).transpose(0, 2, 1)
         endstate_w = np.matmul(Rotation_wc, endstate_c)
@@ -189,7 +200,6 @@ class YopoRunner:
             best[1, 0] + pos[1], best[1, 1], best[1, 2],  # py, vy, ay
             best[2, 0] + pos[2], best[2, 1], best[2, 2],  # pz, vz, az
         ], dtype=np.float32)
-        score = float(score_pred.reshape(-1)[selected_id])
 
         return result, score, self.traj_time
 

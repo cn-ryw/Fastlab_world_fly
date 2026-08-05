@@ -1,0 +1,125 @@
+# ======================== 推理/控制参数 ========================
+# velocity 是网络/基元速度能力上限（16 m/s），任务巡航目标由 cruise_target_mps（15 m/s）给出。
+# 推理时速度上限等于 velocity，加速度上限按 (velocity / vel_max_train)^2 缩放，
+# 单段轨迹时长则为 2*radio_range/velocity。
+# 测试速度若明显超出训练速度分布，网络输出可能失真，应重新训练或至少充分闭环验证。
+velocity: 16.0
+fixed_height: 0.8  # 固定飞行高度，单位 m；训练时约束整段轨迹，在线规划时还会覆盖预测末端的 z 位移
+# 到达判定距离，单位 m。当前位置到目标点的三维距离小于该值时立即判定到达。
+# 官方原版 YOPO 使用 4.0 m；原 YOPO_360 使用 2.0 m。如需切换，只修改下面这一项。
+arrival_distance_m: 4.0
+cruise_target_mps: 15.0  # 巡航目标速度，单位 m/s；不改变 velocity 容量，仅用于状态面板显示
+
+# ======================== 训练动力学尺度 ========================
+# 训练数据、状态归一化和网络末端速度/加速度解码所使用的尺度。
+# 这两个值不是控制器的硬限幅；推理阶段会根据 velocity/vel_max_train 重新缩放。
+# 相关计算见 policy/primitive.py。切换 checkpoint 时必须使用与该权重训练时一致的值。
+vel_max_train: 16.0
+acc_max_train: 12.0
+
+# ======================== 训练损失权重 ========================
+# 以下权重只在训练/微调时生效，修改后直接运行已有 checkpoint 不会改变其避障行为。
+# ws 和 wa 会在 loss_function.py 中按训练速度尺度反归一化；其余权重直接参与损失加权。
+wg: 0.13   # 引导损失：鼓励轨迹沿目标方向取得进展
+ws: 10.0   # 平滑损失：惩罚轨迹 jerk，数值越大通常越平滑但响应可能更保守
+wa: 1.0    # 加速度损失：抑制过大的轨迹加速度
+wc: 3.0    # 安全损失总权重：调节避障代价相对于引导、平滑等目标的重要程度
+wh: 20.0   # 高度损失：惩罚未来轨迹偏离 fixed_height 平面
+
+# ======================== 数据集与网络图像输入 ========================
+# 数据目录由数据加载器以 YOPO/ 为基准解析；可由 YOPO_CONFIG 指定的叠加配置覆盖。
+dataset_path: "../dataset"
+# ResNet-18 总下采样倍数为 32，因此必须满足：
+# image_width=horizon_num*32，image_height=vertical_num*32。
+# 当前 ERP 输入为 384×192，对应网络输出的 12×6 特征网格。
+image_height: 192
+image_width: 384
+# image_channels 表示送入网络的图像通道总数，而不是某种模式编号。
+# 当前取 2，即每个像素输入两个数：通道0为归一化深度，通道1为有效性掩码（1=有效，0=无效）。
+# 若取 1，网络只接收深度；修改通道数会改变首层卷积形状，必须使用按相同通道数训练的 checkpoint。
+image_channels: 2
+
+# ======================== 轨迹基元与相机模型 ========================
+# 每个网络特征格对应一个方向基元；当前共 vertical_num*horizon_num*radio_num=72 条候选。
+horizon_num: 12               # 水平特征格数：384/32=12；ERP 下覆盖 360°，相邻中心方向间隔 30°
+vertical_num: 6               # 垂直特征格数：192/32=6；ERP 下覆盖 180°，相邻中心方向间隔 30°
+
+# 基元锚点的射线模型必须与 Simulator/src/config/config.yaml 中实际生成的图像模型一致：
+# - "erp"：按水平/垂直视场均匀分配球面角度，适用于当前 360°×180° ERP 全景；
+# - "multicam_pinhole"：按多针孔相机拼接图中每个特征格中心像素的真实射线计算。
+camera_model: "erp"   # 可选值："erp" 或 "multicam_pinhole"
+
+# 以下 cam_* 参数仅在 camera_model="multicam_pinhole" 时使用，ERP 模式会忽略。
+cam_sub_width: 256                 # 每个针孔子图的宽度，单位像素
+cam_yaw_deg: [90.0, 0.0, -90.0, -180.0]  # 各子相机相对机体的偏航角：左、前、右、后，单位 °
+cam_fx: 128.0                      # 子相机水平焦距，单位像素
+cam_fy: 128.0                      # 子相机垂直焦距，单位像素
+cam_cx: 128.0                      # 子相机主点横坐标，单位像素
+cam_cy: 96.0                       # 子相机主点纵坐标，单位像素
+
+# 以下视场参数用于 camera_model="erp" 的均匀球面锚点布置。
+horizon_camera_fov: 360.0          # ERP 水平总视场，单位 °
+vertical_camera_fov: 180.0         # ERP 垂直总视场，单位 °
+leveled_depth: true               # 深度图是否已水平校准（gravity-leveled）；ERP 下应与传感器一致设为 true
+# 兼容旧配置的字段；当前代码实际根据相邻锚点中心方向自动计算网络可预测的角度修正范围。
+horizon_anchor_fov: 30.0
+vertical_anchor_fov: 30.0
+
+# 网络径向输出范围为 [0, 2*radio_range]，而不是 [0, radio_range]。
+# 训练单段轨迹时长 sgm_time=2*radio_range/vel_max_train；当前基础配置为最大18 m、约1.125 s。
+radio_range: 9.0
+radio_num: 1        # 径向层数；当前实现及已有权重只按 1 层使用，不建议直接增大
+
+# ======================== 安全损失距离参数 ========================
+# SafetyLoss 使用 ESDF 距离 d（单位 m）计算 exp(-(d-d0)/r)：
+# - d0 是代价等于 1 的参考净空距离，不是硬障碍膨胀半径，也不会禁止轨迹进入该距离；
+# - r 是指数衰减尺度，越大表示较远障碍仍保持较强影响；
+# - 固定 r 时，增大 d0 数学上等价于按 exp(Δd0/r) 放大整体安全损失，作用与增大 wc 相近。
+# ESDF 体素分辨率当前在 safety_loss.py 中固定为 0.2 m，推理阶段没有独立的硬碰撞检查。
+d0: 1.2
+r: 0.6
+# 可选双尺度远场项。0 表示关闭，完全保持原版单指数代价；
+# 启用时总安全代价为 near_exp + safety_far_weight * far_exp。
+safety_far_weight: 0.0
+safety_far_r: 1.2
+# SafetyLoss 沿每条未来轨迹均匀采样的点数。18 m 高速轨迹默认使用 60，
+# 以降低细柱或短时贴障区落在相邻采样点之间而被漏检的概率。
+safety_loss_eval_points: 60
+
+# ======================== 训练状态随机采样分布 ========================
+# 可运行 `python policy/yopo_dataset.py` 查看采样统计。
+# *_mean_unit 和 *_std_unit 均为无量纲系数：速度乘 vel_max_train，加速度乘 acc_max_train。
+# 若叠加配置定义了 speed_mixture，它会优先接管速度采样，下面的速度均值/标准差不再生效；
+# 加速度仍使用下面配置的高斯分布。
+#
+# 360°避障且锁定航向时，无人机可能向任意水平方向运动，因此默认令 vx、vy 零均值且同方差。
+# vx_isotropic=true：vx/vy/vz 均使用高斯采样；false：vx 使用前向偏置的对数正态采样。
+vx_isotropic: true
+vx_mean_unit: 0.0             # x 方向速度均值系数
+vy_mean_unit: 0.0             # y 方向速度均值系数
+vz_mean_unit: 0.0             # z 方向速度均值系数
+vx_std_unit: 0.45             # x 方向速度标准差系数；非各向同性模式下用于构造对数正态分布
+vy_std_unit: 0.45             # y 方向速度标准差系数
+vz_std_unit: 0.3              # z 方向速度标准差系数
+ax_mean_unit: 0.0             # x 方向加速度均值系数
+ay_mean_unit: 0.0             # y 方向加速度均值系数
+az_mean_unit: 0.0             # z 方向加速度均值系数
+ax_std_unit: 0.5              # x 方向加速度标准差系数
+ay_std_unit: 0.5              # y 方向加速度标准差系数
+az_std_unit: 0.3              # z 方向加速度标准差系数
+
+# 训练目标方向的角度分布，单位均为度。
+goal_pitch_std: 0.0           # 目标俯仰角高斯分布标准差；0 表示目标保持在 fixed_height 高度平面
+goal_yaw_std: 180.0           # 仅 goal_yaw_uniform=false 时生效，为目标偏航角高斯分布标准差
+goal_yaw_uniform: true        # true：在 [-180°,180°] 均匀采样；false：按 N(0,goal_yaw_std) 采样
+
+# HeightLoss 在每条五次多项式轨迹上均匀采样的未来点数；不包含 t=0 的当前状态。
+# 增大可提高高度约束积分精度，但会增加训练计算量。
+height_loss_eval_points: 30
+
+# ======================== ESDF 地图边界扩展 ========================
+# 在点云最小/最大包围盒外额外扩展的 [x,y,z] 距离，单位 m。
+# 该设置只扩展用于训练安全损失的 ESDF 查询范围，不会膨胀障碍物几何。
+# z 正方向预留较大空间，可避免高处轨迹越界后因边界裁剪产生错误距离。
+map_expand_min: [0, 0, 0.2]   # 从点云最小边界向负方向扩展
+map_expand_max: [0, 0, 6.0]   # 从点云最大边界向正方向扩展
