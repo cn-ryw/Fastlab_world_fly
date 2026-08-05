@@ -417,6 +417,8 @@ function setupCesiumPlacementHandler() {
     }, Cesium.ScreenSpaceEventType.LEFT_CLICK);
 }
 
+let goalAltitudeMeters = 50;
+
 function setupFlightGoalClickHandler() {
     if (!world || !world.viewer || flightGoalHandler) return;
     const Cesium = world.Cesium;
@@ -427,12 +429,20 @@ function setupFlightGoalClickHandler() {
         if (drone.flightMode !== 'ideal') return;
         if (!placementKeysDown.has('KeyG')) return;
 
-        const picked = await world.pickSpawn(click.position, spawnAltitudeMeters);
+        const picked = await world.pickSpawn(click.position, goalAltitudeMeters);
         if (picked) {
-            drone.setIdealGoal({ x: picked.x, y: spawnAltitudeMeters, z: picked.z });
-            world.showGoalMarker(picked);
+            drone.setIdealGoal({ x: picked.x, y: goalAltitudeMeters, z: picked.z });
+            world.showGoalMarker({ x: picked.x, y: goalAltitudeMeters, z: picked.z });
         }
     }, Cesium.ScreenSpaceEventType.LEFT_CLICK);
+
+    // mouse wheel adjusts goal altitude when G is held
+    flightGoalHandler.setInputAction((delta) => {
+        if (mode !== 'flight' || !drone || drone.flightMode !== 'ideal') return;
+        if (!placementKeysDown.has('KeyG')) return;
+        const step = placementKeysDown.has('ShiftLeft') || placementKeysDown.has('ShiftRight') ? 25 : 5;
+        goalAltitudeMeters = Math.max(SPAWN_ALTITUDE_MIN, Math.min(SPAWN_ALTITUDE_MAX, goalAltitudeMeters - Math.sign(delta) * step));
+    }, Cesium.ScreenSpaceEventType.WHEEL);
 }
 
 async function enterPlacementMode(autoPick = false) {

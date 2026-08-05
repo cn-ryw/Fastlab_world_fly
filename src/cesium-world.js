@@ -38,6 +38,10 @@ const DEFAULT_VIEW = {
     height: 1800,
 };
 const CESIUM_DRONE_MODEL_URI = 'asset/models/CesiumDrone.glb';
+const CESIUM_DRONE_MODEL_SCALE = clampNumber(
+    urlNumber('droneScale', 1.35),
+    0.1, 10.0, 1.35
+);
 const HEIGHT_CACHE_TTL_MS = 140;
 const HEIGHT_CACHE_LIMIT = 256;
 const PANORAMA_FACE_DEFS = [
@@ -1122,9 +1126,26 @@ export class CesiumWorld {
     showGoalMarker(local) {
         const Cesium = this.Cesium;
         if (this._goalMarker) this.viewer.entities.remove(this._goalMarker);
+        const pos = this.localToCartesian(local);
+        const groundPos = this.localToCartesian({ x: local.x, y: 0, z: local.z });
         this._goalMarker = this.viewer.entities.add({
-            position: this.localToCartesian({ x: local.x, y: local.y + 1, z: local.z }),
-            point: { pixelSize: 12, color: Cesium.Color.LIME, outlineColor: Cesium.Color.BLACK, outlineWidth: 2 },
+            position: pos,
+            point: { pixelSize: 10, color: Cesium.Color.LIME, outlineColor: Cesium.Color.BLACK, outlineWidth: 2 },
+            label: {
+                text: `${Math.round(local.y)}m`,
+                font: '18px Chakra Petch, monospace',
+                fillColor: Cesium.Color.LIME,
+                outlineColor: Cesium.Color.BLACK,
+                outlineWidth: 3,
+                style: Cesium.LabelStyle.FILL_AND_OUTLINE,
+                verticalOrigin: Cesium.VerticalOrigin.BOTTOM,
+                pixelOffset: new Cesium.Cartesian2(0, -14),
+            },
+            polyline: {
+                positions: [groundPos, pos],
+                material: new Cesium.PolylineDashMaterialProperty({ color: Cesium.Color.LIME.withAlpha(0.6), dashLength: 8 }),
+                width: 2,
+            },
         });
     }
 
@@ -1158,7 +1179,7 @@ export class CesiumWorld {
             ), false),
             model: {
                 uri: CESIUM_DRONE_MODEL_URI,
-                scale: 1.35,
+                scale: CESIUM_DRONE_MODEL_SCALE,
                 minimumPixelSize: 44,
                 maximumScale: 18,
                 runAnimations: true,
