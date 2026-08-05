@@ -425,6 +425,7 @@ function setupFlightGoalClickHandler() {
     flightGoalHandler.setInputAction(async (click) => {
         if (mode !== 'flight' || !drone) return;
         if (drone.flightMode !== 'ideal') return;
+        if (!placementKeysDown.has('KeyG')) return;
 
         const picked = await world.pickSpawn(click.position, spawnAltitudeMeters);
         if (picked) {
@@ -993,6 +994,11 @@ function setupKeyboard() {
                 enterPlacementMode(false);
             }
         } else if (mode === 'flight') {
+            // G key: hold to click goal in ideal mode
+            if (e.code === 'KeyG' && drone && drone.flightMode === 'ideal') {
+                placementKeysDown.add(e.code);
+                return;
+            }
             if (e.code === 'KeyV') {
                 e.preventDefault();
                 cameraMode = cameraMode === 'third' ? 'first' : 'third';
