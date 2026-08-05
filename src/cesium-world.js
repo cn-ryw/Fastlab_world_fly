@@ -1133,7 +1133,7 @@ export class CesiumWorld {
             point: { pixelSize: 10, color: Cesium.Color.LIME, outlineColor: Cesium.Color.BLACK, outlineWidth: 2 },
             label: {
                 text: `${Math.round(local.y)}m`,
-                font: '18px Chakra Petch, monospace',
+                font: `${(typeof window !== 'undefined' && window._goalFontSize) || 18}px Chakra Petch, monospace`,
                 fillColor: Cesium.Color.LIME,
                 outlineColor: Cesium.Color.BLACK,
                 outlineWidth: 3,

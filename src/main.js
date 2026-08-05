@@ -807,6 +807,42 @@ function setupDisplaySettingsListeners() {
         el._tilesDisplayBound = true;
         el.addEventListener('change', applyDisplaySettings);
     }
+    // Drone model scale slider
+    const modelScaleSlider = document.getElementById('drone-model-scale');
+    const modelScaleNum = document.getElementById('drone-model-scale-num');
+    if (modelScaleSlider && modelScaleNum && !modelScaleSlider._bound) {
+        modelScaleSlider._bound = true;
+        const sync = () => {
+            const v = parseFloat(modelScaleSlider.value);
+            modelScaleNum.value = v;
+            if (world && world._aircraftModelEntity && world._aircraftModelEntity.model) {
+                world._aircraftModelEntity.model.scale = v;
+            }
+        };
+        modelScaleSlider.addEventListener('input', sync);
+        modelScaleNum.addEventListener('change', () => {
+            modelScaleSlider.value = modelScaleNum.value;
+            sync();
+        });
+    }
+    // Goal font size slider
+    const goalFontSlider = document.getElementById('goal-font-size');
+    const goalFontNum = document.getElementById('goal-font-size-num');
+    if (goalFontSlider && goalFontNum && !goalFontSlider._bound) {
+        goalFontSlider._bound = true;
+        const sync = () => {
+            const v = parseInt(goalFontSlider.value);
+            goalFontNum.value = v;
+            // stored for showGoalMarker
+            window._goalFontSize = v;
+        };
+        goalFontSlider.addEventListener('input', sync);
+        goalFontNum.addEventListener('change', () => {
+            goalFontSlider.value = goalFontNum.value;
+            sync();
+        });
+        sync();
+    }
 }
 
 function setupSpawnAltitudeControls() {
