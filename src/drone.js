@@ -861,13 +861,13 @@ export class Drone {
             const t = Math.min(this._yopoTrackerTime, this._yopoTrajTime);
             if (t >= this._yopoTrajTime - 0.001) {
                 this.x = this._yopoPolyX.position(this._yopoTrajTime);
-                this.y = this._yopoPolyY.position(this._yopoTrajTime);
+                this.y = Math.max(2, this._yopoPolyY.position(this._yopoTrajTime));
                 this.z = this._yopoPolyZ.position(this._yopoTrajTime);
                 this.vx = 0; this.vy = 0; this.vz = 0;
                 this._yopoPolyX = this._yopoPolyY = this._yopoPolyZ = null;
             } else {
                 this.x = this._yopoPolyX.position(t);
-                this.y = this._yopoPolyY.position(t);
+                this.y = Math.max(2, this._yopoPolyY.position(t));
                 this.z = this._yopoPolyZ.position(t);
                 this.vx = this._yopoPolyX.velocity(t);
                 this.vy = this._yopoPolyY.velocity(t);
@@ -886,7 +886,7 @@ export class Drone {
 
         // --- Handle goal or direct input ---
         const goal = this._idealGoal;
-        let desVxW, desVyW, desVzW, desYawRate = 0;  // world-frame desired velocity
+        let desVxW = 0, desVyW = 0, desVzW = 0, desYawRate = 0;
 
         if (goal) {
             const dx = goal.x - this.x;

@@ -146,6 +146,9 @@ export class PanoramaSensor {
         this.lastDepthTime = 0;
         this.hasRgb = false;
         this.hasDepth = false;
+        this._yopoGoal = null;
+        this._yopoPose = null;
+        this._yopoPending = false;
         if (this.rgbCanvas) this._drawPlaceholder(this.rgbCanvas, 'RGB PANORAMA');
         this._setDepthPlaceholder('DA360 offline');
         this._setStatus('idle', 'offline');

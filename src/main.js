@@ -450,7 +450,7 @@ function setupFlightGoalClickHandler() {
                 if (Cesium.defined(p)) cartesian = p;
             } catch (_) {}
         }
-        if (!cartesian) return;
+        if (!cartesian) { console.log('[goal] no ground — click on buildings/terrain, not sky'); return; }
 
         const local = world.cartesianToLocal(cartesian);
         console.log('[goal] SET:', local.x.toFixed(1), goalAltitudeMeters, local.z.toFixed(1));
@@ -471,7 +471,7 @@ function setupFlightGoalClickHandler() {
     }, true);
     window.addEventListener('blur', () => { _goalGdown = false; });
 
-    canvas.addEventListener('mousedown', onMouseDown, true);
+    canvas.addEventListener('pointerdown', onMouseDown, true);
 
     // Click on radar minimap also sets goal
     const radarCanvas = document.getElementById('radar-canvas');

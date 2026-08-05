@@ -158,14 +158,24 @@ class YopoRunner:
         stacked = np.stack([depth_norm, valid.astype(np.float32)], axis=0)
         depth_input = torch.from_numpy(stacked.reshape(1, self.in_channels, self.height, self.width)).to(self.device)
 
-        # 2. observation
-        Rotation_wb = R.from_euler("Z", yaw, degrees=False).as_matrix()
+        # 2. coordinate mapping: sim (east, up, north) → YOPO world (x=east, y=north, z=up)
+        # Sim: x=east, y=up, z=north
+        # YOPO world: x=east, y=north, z=up
+        # -> YOPO x = sim_x, YOPO y = sim_z, YOPO z = sim_y
+        yopo_pos = np.array([pos[0], pos[2], pos[1]], dtype=np.float32)
+        yopo_vel = np.array([vel[0], vel[2], vel[1]], dtype=np.float32) if vel is not None else np.zeros(3, dtype=np.float32)
+        yopo_acc = np.array([acc[0], acc[2], acc[1]], dtype=np.float32) if acc is not None else np.zeros(3, dtype=np.float32)
+        yopo_goal = np.array([goal[0], goal[2], goal[1]], dtype=np.float32)
+
+        # Sim yaw in degrees (0=south) → YOPO yaw in radians (0=east, -90=south)
+        yopo_yaw_rad = np.deg2rad(yaw - 90.0)
+        Rotation_wb = R.from_euler("Z", yopo_yaw_rad, degrees=False).as_matrix()
         Rotation_wc = np.dot(Rotation_wb, self.Rotation_bc)
         Rotation_cw = Rotation_wc.T
 
-        vel_c = np.dot(Rotation_cw, vel)
-        acc_c = np.dot(Rotation_cw, acc)
-        goal_w = goal - pos
+        vel_c = np.dot(Rotation_cw, yopo_vel)
+        acc_c = np.dot(Rotation_cw, yopo_acc)
+        goal_w = yopo_goal - yopo_pos
         goal_c = np.dot(Rotation_cw, goal_w)
 
         obs = np.concatenate([vel_c, acc_c, goal_c], axis=0).astype(np.float32)
@@ -177,8 +187,8 @@ class YopoRunner:
         endstate_pred, score_pred = endstate_pred.cpu().numpy(), score_pred.cpu().numpy()
 
         # 4. decode best candidate
-        traj_num = cfg["horizon_num"] * cfg["vertical_num"] * cfg["radio_num"]  # 72
-        endstate_flat = endstate_pred.reshape(9, traj_num).T  # [72, 9]
+        traj_num = cfg["horizon_num"] * cfg["vertical_num"] * cfg["radio_num"]
+        endstate_flat = endstate_pred.reshape(9, traj_num).T
         score_flat = score_pred.reshape(traj_num)
         action_id = int(np.argmin(score_flat))
         lattice_id = traj_num - 1 - action_id
@@ -191,14 +201,21 @@ class YopoRunner:
         endstate_c = endstate.reshape(-1, 3, 3).transpose(0, 2, 1)
         endstate_w = np.matmul(Rotation_wc, endstate_c)
 
-        # z is forced to fixed_height
-        endstate_w[:, 2, 0] = self.fixed_height - pos[2]
+        # z (YOPO Z = altitude) is forced to fixed_height
+        endstate_w[:, 2, 0] = self.fixed_height - yopo_pos[2]
 
         best = endstate_w[0]
+        yopo_result = np.array([
+            best[0, 0] + yopo_pos[0], best[0, 1], best[0, 2],
+            best[1, 0] + yopo_pos[1], best[1, 1], best[1, 2],
+            best[2, 0] + yopo_pos[2], best[2, 1], best[2, 2],
+        ], dtype=np.float32)
+
+        # 5. convert back: YOPO world → sim (x=east, y=up, z=north)
         result = np.array([
-            best[0, 0] + pos[0], best[0, 1], best[0, 2],  # px, vx, ax
-            best[1, 0] + pos[1], best[1, 1], best[1, 2],  # py, vy, ay
-            best[2, 0] + pos[2], best[2, 1], best[2, 2],  # pz, vz, az
+            yopo_result[0], yopo_result[1], yopo_result[2],  # px, vx, ax = YOPO x
+            yopo_result[6], yopo_result[7], yopo_result[8],  # py, vy, ay = YOPO z → sim y
+            yopo_result[3], yopo_result[4], yopo_result[5],  # pz, vz, az = YOPO y → sim z
         ], dtype=np.float32)
 
         return result, score, self.traj_time
