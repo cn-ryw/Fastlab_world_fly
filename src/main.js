@@ -422,32 +422,75 @@ let goalAltitudeMeters = 50;
 function setupFlightGoalClickHandler() {
     if (!world || !world.viewer || flightGoalHandler) return;
     const Cesium = world.Cesium;
+    const canvas = world.viewer.scene.canvas;
 
-    flightGoalHandler = new Cesium.ScreenSpaceEventHandler(world.viewer.scene.canvas);
-    flightGoalHandler.setInputAction(async (click) => {
+    const onMouseDown = async (e) => {
         if (mode !== 'flight' || !drone) return;
-        if (drone.flightMode !== 'ideal') { console.log('[goal] not ideal mode:', drone.flightMode); return; }
+        if (drone.flightMode !== 'ideal') { console.log('[goal] not ideal:', drone.flightMode); return; }
         if (!placementKeysDown.has('KeyG')) { console.log('[goal] G not held'); return; }
 
-        console.log('[goal] picking spawn...');
-        const picked = await world.pickSpawn(click.position, goalAltitudeMeters);
-        if (picked) {
-            console.log('[goal] SET goal:', picked.x, goalAltitudeMeters, picked.z);
-            drone.setIdealGoal({ x: picked.x, y: goalAltitudeMeters, z: picked.z });
-            world.showGoalMarker({ x: picked.x, y: goalAltitudeMeters, z: picked.z });
-            panoramaSensor?.setYopoGoal({ x: picked.x, y: goalAltitudeMeters, z: picked.z });
-        } else {
-            console.log('[goal] pickSpawn returned null');
+        // Disable Cesium camera control during G+click
+        e.stopPropagation();
+        e.preventDefault();
+
+        const rect = canvas.getBoundingClientRect();
+        const clickPos = new Cesium.Cartesian2(e.clientX - rect.left, e.clientY - rect.top);
+
+        console.log('[goal] picking...');
+        // Try pickPosition first, fall back to pickEllipsoid
+        let cartesian = null;
+        try {
+            if (world.viewer.scene.pickPositionSupported) {
+                const p = world.viewer.scene.pickPosition(clickPos);
+                if (Cesium.defined(p)) cartesian = p;
+            }
+        } catch (_) {}
+        if (!cartesian) {
+            try {
+                const p = world.viewer.camera.pickEllipsoid(clickPos, Cesium.Ellipsoid.WGS84);
+                if (Cesium.defined(p)) cartesian = p;
+            } catch (_) {}
         }
-    }, Cesium.ScreenSpaceEventType.LEFT_DOWN);
+        if (!cartesian) {
+            try {
+                const ray = world.viewer.camera.getPickRay(clickPos);
+                if (ray && world.viewer.scene.pickFromRay) {
+                    const hit = world.viewer.scene.pickFromRay(ray);
+                    if (hit && Cesium.defined(hit.position)) cartesian = hit.position;
+                }
+            } catch (_) {}
+        }
+        if (!cartesian) {
+            console.log('[goal] pick failed — no geometry at cursor');
+            return;
+        }
+
+        const local = world.cartesianToLocal(cartesian);
+        console.log('[goal] SET:', local.x.toFixed(1), goalAltitudeMeters, local.z.toFixed(1));
+        drone.setIdealGoal({ x: local.x, y: goalAltitudeMeters, z: local.z });
+        world.showGoalMarker({ x: local.x, y: goalAltitudeMeters, z: local.z });
+        panoramaSensor?.setYopoGoal({ x: local.x, y: goalAltitudeMeters, z: local.z });
+    };
+
+    canvas.addEventListener('mousedown', onMouseDown, true);
 
     // mouse wheel adjusts goal altitude when G is held
-    flightGoalHandler.setInputAction((delta) => {
+    const onWheel = (e) => {
         if (mode !== 'flight' || !drone || drone.flightMode !== 'ideal') return;
         if (!placementKeysDown.has('KeyG')) return;
+        e.stopPropagation();
+        e.preventDefault();
         const step = placementKeysDown.has('ShiftLeft') || placementKeysDown.has('ShiftRight') ? 25 : 5;
-        goalAltitudeMeters = Math.max(SPAWN_ALTITUDE_MIN, Math.min(SPAWN_ALTITUDE_MAX, goalAltitudeMeters - Math.sign(delta) * step));
-    }, Cesium.ScreenSpaceEventType.WHEEL);
+        goalAltitudeMeters = Math.max(SPAWN_ALTITUDE_MIN, Math.min(SPAWN_ALTITUDE_MAX, goalAltitudeMeters - Math.sign(e.deltaY) * step));
+        console.log('[goal] altitude:', goalAltitudeMeters, 'm');
+    };
+    canvas.addEventListener('wheel', onWheel, { passive: false, capture: true });
+
+    // Store for cleanup
+    flightGoalHandler = { destroy: () => {
+        canvas.removeEventListener('mousedown', onMouseDown, true);
+        canvas.removeEventListener('wheel', onWheel, { capture: true });
+    }};
 }
 
 async function enterPlacementMode(autoPick = false) {
