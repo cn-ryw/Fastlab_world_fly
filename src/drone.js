@@ -861,16 +861,15 @@ export class Drone {
             const t = Math.min(this._yopoTrackerTime, this._yopoTrajTime);
             if (t >= this._yopoTrajTime - 0.001) {
                 this.x = this._yopoPolyX.position(this._yopoTrajTime);
-                this.y = Math.max(2, this._yopoPolyY.position(this._yopoTrajTime));
+                // YOPO is fixed-height planner — ignore altitude, maintain current
                 this.z = this._yopoPolyZ.position(this._yopoTrajTime);
                 this.vx = 0; this.vy = 0; this.vz = 0;
                 this._yopoPolyX = this._yopoPolyY = this._yopoPolyZ = null;
             } else {
                 this.x = this._yopoPolyX.position(t);
-                this.y = Math.max(2, this._yopoPolyY.position(t));
                 this.z = this._yopoPolyZ.position(t);
                 this.vx = this._yopoPolyX.velocity(t);
-                this.vy = this._yopoPolyY.velocity(t);
+                this.vy = 0;  // YOPO fixed-height: ignore vertical velocity
                 this.vz = this._yopoPolyZ.velocity(t);
                 if (Math.abs(this.vx) > 0.2 || Math.abs(this.vz) > 0.2) {
                     const velYaw = Math.atan2(-this.vx, -this.vz);
