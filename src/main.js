@@ -424,19 +424,11 @@ function setupFlightGoalClickHandler() {
     const Cesium = world.Cesium;
     const canvas = world.viewer.scene.canvas;
 
-    let lastClickTime = 0;
+    let _goalGdown = false;
     const onMouseDown = (e) => {
         if (mode !== 'flight' || !drone) return;
         if (drone.flightMode !== 'ideal') return;
-
-        // G+click: single click with G held
-        // Double-click (no G): set goal directly
-        const isG = placementKeysDown.has('KeyG');
-        const now = performance.now();
-        const isDouble = (now - lastClickTime < 400);
-        lastClickTime = now;
-
-        if (!isG && !isDouble) return;
+        if (!_goalGdown) return;
 
         e.stopPropagation();
         e.preventDefault();
@@ -465,6 +457,17 @@ function setupFlightGoalClickHandler() {
         world.showGoalMarker({ x: local.x, y: goalAltitudeMeters, z: local.z });
         panoramaSensor?.setYopoGoal({ x: local.x, y: goalAltitudeMeters, z: local.z });
     };
+
+    // Track G key state independently (more reliable than placementKeysDown during flight)
+    window.addEventListener('keydown', (e) => {
+        if (e.code === 'KeyG' && mode === 'flight' && drone && drone.flightMode === 'ideal') {
+            _goalGdown = true;
+        }
+    }, true);
+    window.addEventListener('keyup', (e) => {
+        if (e.code === 'KeyG') _goalGdown = false;
+    }, true);
+    window.addEventListener('blur', () => { _goalGdown = false; });
 
     canvas.addEventListener('mousedown', onMouseDown, true);
 
