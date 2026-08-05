@@ -435,6 +435,7 @@ function setupFlightGoalClickHandler() {
             console.log('[goal] SET goal:', picked.x, goalAltitudeMeters, picked.z);
             drone.setIdealGoal({ x: picked.x, y: goalAltitudeMeters, z: picked.z });
             world.showGoalMarker({ x: picked.x, y: goalAltitudeMeters, z: picked.z });
+            panoramaSensor?.setYopoGoal({ x: picked.x, y: goalAltitudeMeters, z: picked.z });
         } else {
             console.log('[goal] pickSpawn returned null');
         }
@@ -623,6 +624,13 @@ function startFlight(viewMode = 'first') {
     if (!panoramaSensor?.hasRgbFrame?.()) panoramaSensor?.reset();
     panoramaSensor?.setActive(true);
 
+    // Wire YOPO: depth → YOPO plan → drone trajectory
+    if (panoramaSensor) {
+        panoramaSensor.onYopoResult = (endstate, trajTime) => {
+            drone?.setYopoTrajectory(endstate, trajTime);
+        };
+    }
+
     // Setup click-to-goal for ideal mode
     setupFlightGoalClickHandler();
 
@@ -766,6 +774,13 @@ function updateFlight(dt) {
 
     const panoramaTransform = drone.getPanoramaTransform ? drone.getPanoramaTransform() : bodyTransform;
     panoramaSensor?.update(world, panoramaTransform, now);
+    // Update YOPO pose for planning
+    if (panoramaSensor && drone) {
+        panoramaSensor.setYopoPose(
+            { x: drone.x, y: drone.y, z: drone.z, vx: drone.vx, vy: drone.vy, vz: drone.vz },
+            drone.yaw
+        );
+    }
     hud?.update(drone, controller, null);
     applyDisplaySettings();
     osd?.update(drone, controller);

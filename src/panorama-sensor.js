@@ -51,6 +51,13 @@ function getDA360Endpoint() {
     return `http://${host}:${port}/depth`;
 }
 
+function getYopoEndpoint() {
+    const params = new URLSearchParams(window.location.search);
+    const host = params.get('da360Host') || window.location.hostname || '127.0.0.1';
+    const port = params.get('da360Port') || '5688';
+    return `http://${host}:${port}/yopo/plan_full`;
+}
+
 function shortError(error) {
     const message = error && error.message ? error.message : String(error || 'error');
     return message.length > 52 ? `${message.slice(0, 49)}...` : message;
@@ -95,6 +102,12 @@ export class PanoramaSensor {
         this.hasRgb = false;
         this.hasDepth = false;
         this._depthLatency = '';
+        // YOPO planning
+        this._yopoPending = false;
+        this._yopoGoal = null;
+        this._yopoPose = null;
+        this._yopoYaw = 0;
+        this.onYopoResult = null;  // set by main.js
 
         if (this.rgbCanvas) {
             this.rgbCanvas.width = PANORAMA_WIDTH;
@@ -105,6 +118,10 @@ export class PanoramaSensor {
             this.depthImg.onload = () => {
                 this.hasDepth = true;
                 this._updateDepthDisplay();
+                // Trigger YOPO planning after depth arrives
+                if (this._yopoGoal && this.rgbCanvas) {
+                    this._requestYopo(this.rgbCanvas);
+                }
             };
             this.depthImg.onerror = () => {
                 this.hasDepth = false;
@@ -438,4 +455,48 @@ export class PanoramaSensor {
             this.depthPending = false;
         }
     }
+
+    _requestYopo(canvas) {
+        if (this._yopoPending || !this._yopoGoal || !this._yopoPose) return;
+        this._yopoPending = true;
+        const goal = this._yopoGoal;
+        const pose = this._yopoPose;
+        const yaw = this._yopoYaw;
+
+        const qs = [
+            `px=${pose.x}`, `py=${pose.y}`, `pz=${pose.z}`,
+            `gx=${goal.x}`, `gy=${goal.y}`, `gz=${goal.z}`,
+            `vx=${pose.vx || 0}`, `vy=${pose.vy || 0}`, `vz=${pose.vz || 0}`,
+            `yaw=${yaw}`,
+        ].join('&');
+
+        canvas.toBlob(async (blob) => {
+            try {
+                const controller = new AbortController();
+                const timeout = setTimeout(() => controller.abort(), 15000);
+                const resp = await fetch(`${getYopoEndpoint()}?${qs}`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'image/jpeg' },
+                    body: blob,
+                    signal: controller.signal,
+                });
+                clearTimeout(timeout);
+                if (!resp.ok) throw new Error(`YOPO HTTP ${resp.status}`);
+                const payload = await resp.json();
+                if (payload.endstate && this.onYopoResult) {
+                    this.onYopoResult(payload.endstate, payload.traj_time);
+                }
+            } catch (error) {
+                reportUserError('YOPO planning failed', error, {
+                    key: 'yopo-plan',
+                    intervalMs: 5000,
+                });
+            } finally {
+                this._yopoPending = false;
+            }
+        }, 'image/jpeg', PANORAMA_JPEG_QUALITY);
+    }
+
+    setYopoGoal(goal) { this._yopoGoal = goal; }
+    setYopoPose(pose, yaw) { this._yopoPose = pose; this._yopoYaw = yaw; }
 }
