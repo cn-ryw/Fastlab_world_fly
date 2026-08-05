@@ -42,5 +42,8 @@ echo "=== 全部就绪 ==="
 echo "  Web:    http://127.0.0.1:8080"
 echo "  DA360:  http://127.0.0.1:5688/health"
 echo "  YOPO:   http://127.0.0.1:5688/yopo/health"
+# 修复 Clash 规则
+./fix-clash-rules.sh
+
 echo ""
 echo "  启动 Firefox: ./launch-firefox-gpu.sh"
