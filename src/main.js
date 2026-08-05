@@ -428,7 +428,8 @@ function setupFlightGoalClickHandler() {
     const onMouseDown = (e) => {
         if (mode !== 'flight' || !drone) return;
         if (drone.flightMode !== 'ideal') return;
-        if (!_goalGdown) return;
+        if (!_goalGdown) { console.log('[G+click] G not held, _goalGdown=' + _goalGdown); return; }
+        console.log('[G+click] picking...');
 
         e.stopPropagation();
         e.preventDefault();
@@ -458,14 +459,15 @@ function setupFlightGoalClickHandler() {
         panoramaSensor?.setYopoGoal({ x: local.x, y: goalAltitudeMeters, z: local.z });
     };
 
-    // Track G key state independently (more reliable than placementKeysDown during flight)
+    // Track G key state
     window.addEventListener('keydown', (e) => {
         if (e.code === 'KeyG' && mode === 'flight' && drone && drone.flightMode === 'ideal') {
             _goalGdown = true;
+            console.log('[G key] DOWN');
         }
     }, true);
     window.addEventListener('keyup', (e) => {
-        if (e.code === 'KeyG') _goalGdown = false;
+        if (e.code === 'KeyG') { _goalGdown = false; console.log('[G key] UP'); }
     }, true);
     window.addEventListener('blur', () => { _goalGdown = false; });
 
