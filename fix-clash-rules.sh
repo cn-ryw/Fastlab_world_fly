@@ -14,4 +14,6 @@ for f in "$PROFILE_DIR"/*.yaml; do
     fi
 done
 
-echo "Clash 规则已修复, 重启 Clash Verge 生效"
+echo "Clash 规则已修复"
+echo "正在重启 Clash 使规则生效..."
+sudo systemctl restart clash-verge-service 2>/dev/null && echo "Clash 已重启, 规则生效" || echo "请手动重启 Clash Verge"
