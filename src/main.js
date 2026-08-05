@@ -471,6 +471,26 @@ function setupFlightGoalClickHandler() {
 
     canvas.addEventListener('mousedown', onMouseDown, true);
 
+    // Click on radar minimap also sets goal
+    const radarCanvas = document.getElementById('radar-canvas');
+    if (radarCanvas) {
+        radarCanvas.addEventListener('mousedown', (e) => {
+            if (mode !== 'flight' || !drone || drone.flightMode !== 'ideal') return;
+            e.stopPropagation();
+            const rw = radarCanvas.width, rh = radarCanvas.height;
+            const range = 200; // must match drawRadar
+            const scale = (rw/2 - 10) / range;
+            const rx = (e.offsetX - rw/2) / scale;
+            const rz = -(e.offsetY - rh/2) / scale; // invert Y
+            const goalX = drone.x + rx;
+            const goalZ = drone.z + rz;
+            console.log('[radar goal] SET:', goalX.toFixed(1), goalAltitudeMeters, goalZ.toFixed(1));
+            drone.setIdealGoal({ x: goalX, y: goalAltitudeMeters, z: goalZ });
+            world.showGoalMarker({ x: goalX, y: goalAltitudeMeters, z: goalZ });
+            panoramaSensor?.setYopoGoal({ x: goalX, y: goalAltitudeMeters, z: goalZ });
+        });
+    }
+
     // mouse wheel adjusts goal altitude when G is held
     const onWheel = (e) => {
         if (mode !== 'flight' || !drone || drone.flightMode !== 'ideal') return;
