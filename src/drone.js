@@ -50,6 +50,29 @@ const _quat2 = new pc.Quat();
 const _mat4  = new pc.Mat4();
 const _v3    = new pc.Vec3();
 
+// ── Poly5Solver — YOPO 5th-order polynomial trajectory ──────────────────
+// Ported from YOPO_360_v15/YOPO/policy/poly_solver.py
+class Poly5Solver {
+    constructor(pos0, vel0, acc0, pos1, vel1, acc1, Tf) {
+        const t = Tf;
+        const Coef_inv = [
+            [1, 0, 0, 0, 0, 0],
+            [0, 1, 0, 0, 0, 0],
+            [0, 0, 0.5, 0, 0, 0],
+            [-10/t**3, -6/t**2, -1.5/t, 10/t**3, -4/t**2, 0.5/t],
+            [15/t**4, 8/t**3, 1.5/t**2, -15/t**4, 7/t**3, -1/t**2],
+            [-6/t**5, -3/t**4, -0.5/t**3, 6/t**5, -3/t**4, 0.5/t**3],
+        ];
+        const s = [pos0, vel0, acc0, pos1, vel1, acc1];
+        this.A = Array.from({length: 6}, (_, i) =>
+            Coef_inv[i].reduce((sum, c, j) => sum + c * s[j], 0)
+        );
+    }
+    position(t) { return this.A[0]+this.A[1]*t+this.A[2]*t*t+this.A[3]*t**3+this.A[4]*t**4+this.A[5]*t**5; }
+    velocity(t) { return this.A[1]+2*this.A[2]*t+3*this.A[3]*t*t+4*this.A[4]*t**3+5*this.A[5]*t**4; }
+    acceleration(t) { return 2*this.A[2]+6*this.A[3]*t+12*this.A[4]*t*t+20*this.A[5]*t**3; }
+}
+
 export class Drone {
     constructor() {
         // ---- Geometry ----
@@ -160,15 +183,37 @@ export class Drone {
         this._idealGoal = null;      // {x,y,z,yaw} or null
         this._idealCruiseMps = 15;   // cruise speed (m/s)
         this._idealYawRate = 60;     // max yaw rate (deg/s)
+
+        // ---- YOPO trajectory tracking ----
+        this._yopoPolyX = null;      // Poly5Solver | null
+        this._yopoPolyY = null;
+        this._yopoPolyZ = null;
+        this._yopoTrajTime = 0;      // trajectory duration (s)
+        this._yopoTrackerTime = 0;   // current time along trajectory
+        this._yopoGoalYaw = 0;       // locked yaw for this trajectory
     }
 
     // ---- Public API ----
 
+    /** Set ideal goal (point-to-point, no YOPO trajectory). */
     setIdealGoal(goal) {
         this._idealGoal = goal ? { x: goal.x, y: goal.y, z: goal.z, yaw: goal.yaw } : null;
     }
 
     clearIdealGoal() { this._idealGoal = null; }
+
+    /** Load a YOPO trajectory endpoint → fit 5th-order polynomials. */
+    setYopoTrajectory(endpoint, trajTime) {
+        // endpoint: [px,py,pz, vx,vy,vz, ax,ay,az] world-frame
+        const trajT = trajTime || 1.125;
+        this._yopoPolyX = new Poly5Solver(this.x, this.vx, 0, endpoint[0], endpoint[3], endpoint[6], trajT);
+        this._yopoPolyY = new Poly5Solver(this.y, this.vy, 0, endpoint[1], endpoint[4], endpoint[7], trajT);
+        this._yopoPolyZ = new Poly5Solver(this.z, this.vz, 0, endpoint[2], endpoint[5], endpoint[8], trajT);
+        this._yopoTrajTime = trajT;
+        this._yopoTrackerTime = 0;
+        this._yopoGoalYaw = this.yaw;
+        this._idealGoal = null;  // disable point-to-point goal mode
+    }
 
     setSpawnPoint(x, y, z) {
         this._spawnX = x; this._spawnY = y; this._spawnZ = z;
@@ -809,6 +854,36 @@ export class Drone {
         const rightLen = Math.sqrt(rightX * rightX + rightZ * rightZ);
         if (rightLen > 1e-4) { rightX /= rightLen; rightZ /= rightLen; }
 
+
+        // --- YOPO trajectory mode ---
+        if (this._yopoPolyX) {
+            this._yopoTrackerTime += dt;
+            const t = Math.min(this._yopoTrackerTime, this._yopoTrajTime);
+            if (t >= this._yopoTrajTime - 0.001) {
+                this.x = this._yopoPolyX.position(this._yopoTrajTime);
+                this.y = this._yopoPolyY.position(this._yopoTrajTime);
+                this.z = this._yopoPolyZ.position(this._yopoTrajTime);
+                this.vx = 0; this.vy = 0; this.vz = 0;
+                this._yopoPolyX = this._yopoPolyY = this._yopoPolyZ = null;
+            } else {
+                this.x = this._yopoPolyX.position(t);
+                this.y = this._yopoPolyY.position(t);
+                this.z = this._yopoPolyZ.position(t);
+                this.vx = this._yopoPolyX.velocity(t);
+                this.vy = this._yopoPolyY.velocity(t);
+                this.vz = this._yopoPolyZ.velocity(t);
+                if (Math.abs(this.vx) > 0.2 || Math.abs(this.vz) > 0.2) {
+                    const velYaw = Math.atan2(-this.vx, -this.vz);
+                    const yawStep = clamp((velYaw - this.yaw * DEG2RAD) * RAD2DEG * 5 * dt, -this._idealYawRate * dt, this._idealYawRate * dt);
+                    this._applyBodyRotation(0, 1, 0, yawStep);
+                }
+            }
+            this.commandedGroundSpeed = Math.sqrt(this.vx * this.vx + this.vz * this.vz);
+            this.targetGroundSpeed = this._idealCruiseMps;
+            this.pilotGroundSpeedCommand = 0;
+            return;
+        }
+
         // --- Handle goal or direct input ---
         const goal = this._idealGoal;
         let desVxW, desVyW, desVzW, desYawRate = 0;  // world-frame desired velocity
@@ -862,7 +937,7 @@ export class Drone {
         }
 
         // Derive speed
-        this.commandedGroundSpeed = Math.sqrt(desVx * desVx + desVz * desVz);
+        this.commandedGroundSpeed = Math.sqrt(desVxW * desVxW + desVzW * desVzW);
         this.targetGroundSpeed = maxSpd;
         this.pilotGroundSpeedCommand = Math.sqrt(input.pitch * input.pitch + input.roll * input.roll) * maxSpd;
     }
