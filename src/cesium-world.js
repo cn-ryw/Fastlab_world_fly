@@ -429,6 +429,7 @@ export class CesiumWorld {
         this.enuToFixed = null;
         this.fixedToEnu = null;
         this.spawnMarker = null;
+        this._goalMarker = null;
         this.aircraftEntities = [];
         this.aircraftModelEntity = null;
         this._aircraftModelPosition = null;
@@ -1116,6 +1117,15 @@ export class CesiumWorld {
 
     hideSpawnMarker() {
         if (this.spawnMarker) this.spawnMarker.show = false;
+    }
+
+    showGoalMarker(local) {
+        const Cesium = this.Cesium;
+        if (this._goalMarker) this.viewer.entities.remove(this._goalMarker);
+        this._goalMarker = this.viewer.entities.add({
+            position: this.localToCartesian({ x: local.x, y: local.y + 1, z: local.z }),
+            point: { pixelSize: 12, color: Cesium.Color.LIME, outlineColor: Cesium.Color.BLACK, outlineWidth: 2 },
+        });
     }
 
     _collisionExclusions() {

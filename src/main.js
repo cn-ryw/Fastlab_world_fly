@@ -50,6 +50,7 @@ let lastFrameTime = 0;
 let placementKeysDown = new Set();
 let placementInitClickUntil = 0;
 let screenHandler = null;
+let flightGoalHandler = null;
 let spawnConfirmInProgress = false;
 let startTilesModeInProgress = false;
 let panoramaWarmupPromise = null;
@@ -234,6 +235,10 @@ export async function startTilesMode() {
             screenHandler.destroy();
             screenHandler = null;
         }
+        if (flightGoalHandler) {
+            flightGoalHandler.destroy();
+            flightGoalHandler = null;
+        }
         if (world) world.destroy();
         panoramaWarmupPromise = null;
         world = new CesiumWorld('cesium-container');
@@ -412,6 +417,23 @@ function setupCesiumPlacementHandler() {
     }, Cesium.ScreenSpaceEventType.LEFT_CLICK);
 }
 
+function setupFlightGoalClickHandler() {
+    if (!world || !world.viewer || flightGoalHandler) return;
+    const Cesium = world.Cesium;
+
+    flightGoalHandler = new Cesium.ScreenSpaceEventHandler(world.viewer.scene.canvas);
+    flightGoalHandler.setInputAction(async (click) => {
+        if (mode !== 'flight' || !drone) return;
+        if (drone.flightMode !== 'ideal') return;
+
+        const picked = await world.pickSpawn(click.position, spawnAltitudeMeters);
+        if (picked) {
+            drone.setIdealGoal({ x: picked.x, y: spawnAltitudeMeters, z: picked.z });
+            world.showGoalMarker(picked);
+        }
+    }, Cesium.ScreenSpaceEventType.LEFT_CLICK);
+}
+
 async function enterPlacementMode(autoPick = false) {
     if (!world) return;
     mode = 'placement';
@@ -585,6 +607,9 @@ function startFlight(viewMode = 'first') {
     hud?.show();
     if (!panoramaSensor?.hasRgbFrame?.()) panoramaSensor?.reset();
     panoramaSensor?.setActive(true);
+
+    // Setup click-to-goal for ideal mode
+    setupFlightGoalClickHandler();
 
     const transform = drone.getBodyTransform ? drone.getBodyTransform() : drone.getCameraTransform();
     if (cameraMode === 'third') {
