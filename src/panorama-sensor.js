@@ -13,15 +13,21 @@ function evenNumber(value) {
     return n % 2 === 0 ? n : n + 1;
 }
 
-const CAPTURE_INTERVAL_MS = urlNumber('panoMs', 16, 0, 10000);
-const DEPTH_INTERVAL_MS = urlNumber('depthMs', 33, 16, 10000);
-const DA360_TIMEOUT_MS = urlNumber('da360TimeoutMs', 12000, 1000, 60000);
+// 全景采集间隔：每面 6 次同步 GPU 渲染，RTX 5070 Ti 上 30 Hz 可平稳完成
+const CAPTURE_INTERVAL_MS = urlNumber('panoMs', 33, 16, 10000);
+// 深度请求间隔：50Hz 名义，由 _depthGate 非阻塞漏桶调节实际吞吐
+const DEPTH_INTERVAL_MS = urlNumber('depthMs', 20, 16, 10000);
+// DA360 超时：含冷启动首次推理裕度
+const DA360_TIMEOUT_MS = urlNumber('da360TimeoutMs', 20000, 2000, 60000);
 const DA360_UPLOAD_SCALE = urlNumber('da360UploadScale', 0.35, 0.05, 1);
 const DA360_UPLOAD_WIDTH = Math.round(urlNumber('da360UploadWidth', 0, 0, 5760));
 const DA360_UPLOAD_HEIGHT = Math.round(urlNumber('da360UploadHeight', 0, 0, 2880));
 const PANORAMA_WIDTH = evenNumber(urlNumber('panoWidth', 384, 280, 5760));
 const PANORAMA_HEIGHT = evenNumber(urlNumber('panoHeight', Math.round(PANORAMA_WIDTH / 2), 140, 2880));
-const PANORAMA_FACE_SIZE = Math.round(urlNumber('panoFace', 256, 128, 2048));
+// 每面渲染分辨率：ERP 384px / 360° × 130°(每面FOV) ≈ 139 px。
+// 144 刚好匹配输出（1.04×），256 是 1.84× 冗余——对 DA360+YOPO 无感知增益，
+// 但会浪费 68% 的每面 GPU 填充率。
+const PANORAMA_FACE_SIZE = Math.round(urlNumber('panoFace', 144, 96, 2048));
 const PANORAMA_VERTICAL_FOV = urlNumber('panoVfov', 180, 30, 180);
 const PANORAMA_JPEG_QUALITY = urlNumber('panoJpeg', 0.74, 0.35, 0.95);
 const PANORAMA_FACE_FOV = urlNumber('panoFaceFov', 130, 90, 170);
@@ -49,6 +55,20 @@ function getDA360Endpoint() {
     const host = params.get('da360Host') || window.location.hostname || '127.0.0.1';
     const port = params.get('da360Port') || '5688';
     return `http://${host}:${port}/depth`;
+}
+
+function getDA360RawEndpoint() {
+    const params = new URLSearchParams(window.location.search);
+    const host = params.get('da360Host') || window.location.hostname || '127.0.0.1';
+    const port = params.get('da360Port') || '5688';
+    return `http://${host}:${port}/depth/raw`;
+}
+
+function getYopoPlanEndpoint() {
+    const params = new URLSearchParams(window.location.search);
+    const host = params.get('da360Host') || window.location.hostname || '127.0.0.1';
+    const port = params.get('da360Port') || '5688';
+    return `http://${host}:${port}/yopo/plan`;
 }
 
 function getYopoEndpoint() {
@@ -86,7 +106,11 @@ export class PanoramaSensor {
     constructor() {
         this.panel = document.getElementById('panorama-sensor-panel');
         this.rgbCanvas = document.getElementById('panorama-rgb-canvas');
-        this.depthImg = document.getElementById('panorama-depth-image');
+        this.depthCanvas = document.getElementById('panorama-depth-canvas');
+        if (this.depthCanvas) {
+            this.depthCanvas.width = PANORAMA_WIDTH;
+            this.depthCanvas.height = PANORAMA_HEIGHT;
+        }
         this.rgbStatusEl = document.getElementById('panorama-rgb-status');
         this.depthStatusEl = document.getElementById('panorama-depth-status');
         this.depthNearLabelEl = document.getElementById('panorama-depth-near-label');
@@ -103,33 +127,26 @@ export class PanoramaSensor {
         this.hasDepth = false;
         this._depthLatency = '';
         // YOPO planning
+        // YOPO planning — 缓存 DA360 推理结果，直通 /yopo/plan 避免二次推理
+        this._lastDepthArray = null;  // float32[H][W] 嵌套二维数组，来自 /depth 响应
+        this._depthGate = false;       // RuntimeRateGate: 防止深度请求堆积
+        this._depthFpsTimer = 0;       // 深度帧率打点
+        this._depthFpsCount = 0;
+        this._yopoGeneration = 0;    // 取消/到达时递增，丢弃过期响应
         this._yopoPending = false;
         this._yopoGoal = null;
         this._yopoPose = null;
         this._yopoYaw = 0;
-        this.onYopoResult = null;  // set by main.js
+        this.onYopoResult = null;    // main.js: YOPO endstate → drone trajectory
+        this.onDepthResult = null;   // main.js: depth latency → flight logger perf
+        this.onYopoLatency = null;   // main.js: YOPO latency → flight logger perf
 
         if (this.rgbCanvas) {
             this.rgbCanvas.width = PANORAMA_WIDTH;
             this.rgbCanvas.height = PANORAMA_HEIGHT;
             this._drawPlaceholder(this.rgbCanvas, 'RGB PANORAMA');
         }
-        if (this.depthImg) {
-            this.depthImg.onload = () => {
-                this.hasDepth = true;
-                this._updateDepthDisplay();
-                // Trigger YOPO planning after depth arrives
-                if (this._yopoGoal && this.rgbCanvas) {
-                    this._requestYopo(this.rgbCanvas);
-                }
-            };
-            this.depthImg.onerror = () => {
-                this.hasDepth = false;
-                this._setStatus(this.hasRgb ? 'ready' : 'idle', 'decode error');
-                this._setDepthPlaceholder('decode error');
-            };
-        }
-        this._setDepthPlaceholder('DA360 offline');
+        this._drawDepthPlaceholder('DA360 offline');
         this._setStatus('idle', 'offline');
     }
 
@@ -146,11 +163,13 @@ export class PanoramaSensor {
         this.lastDepthTime = 0;
         this.hasRgb = false;
         this.hasDepth = false;
+        this._lastDepthArray = null;
+        this._yopoGeneration++;   // 取消/到达时递增，使在途响应过期
         this._yopoGoal = null;
         this._yopoPose = null;
         this._yopoPending = false;
         if (this.rgbCanvas) this._drawPlaceholder(this.rgbCanvas, 'RGB PANORAMA');
-        this._setDepthPlaceholder('DA360 offline');
+        this._drawDepthPlaceholder('DA360 offline');
         this._setStatus('idle', 'offline');
         this._setDepthLegend(null);
     }
@@ -172,7 +191,7 @@ export class PanoramaSensor {
             frameDelayMs: preload ? PANORAMA_PRELOAD_FRAME_DELAY_MS : PANORAMA_FRAME_DELAY_MS,
             tileTimeoutMs: preload ? PANORAMA_PRELOAD_FACE_TILE_TIMEOUT_MS : PANORAMA_FACE_TILE_TIMEOUT_MS,
             tileQuietMs: preload ? PANORAMA_PRELOAD_FACE_TILE_QUIET_MS : PANORAMA_FACE_TILE_QUIET_MS,
-            captureAnyway: preload ? false : PANORAMA_CAPTURE_ANYWAY,
+            captureAnyway: PANORAMA_CAPTURE_ANYWAY,  // Always captureAnyway: skip tile-wait for preload too, else face 1/6 times out
             timeoutMs: preload ? PANORAMA_PRELOAD_TIMEOUT_MS : 0,
         };
     }
@@ -266,20 +285,73 @@ export class PanoramaSensor {
         ctx.fillText(label, canvas.width * 0.5, canvas.height * 0.52);
     }
 
-    _setDepthPlaceholder(label) {
-        if (!this.depthImg) return;
-        const canvas = document.createElement('canvas');
-        canvas.width = PANORAMA_WIDTH;
-        canvas.height = PANORAMA_HEIGHT;
-        this._drawPlaceholder(canvas, label);
-        try {
-            this.depthImg.src = canvas.toDataURL('image/png');
-        } catch (error) {
-            reportUserError('Depth placeholder render failed', error, {
-                key: 'depth-placeholder',
-                intervalMs: 10000,
-            });
+    _drawDepthPlaceholder(label) {
+        if (!this.depthCanvas) return;
+        this._drawPlaceholder(this.depthCanvas, label);
+    }
+
+    /** 将 float32 深度数组直接渲染到 Canvas，零编解码延迟。 */
+    _renderDepthToCanvas(depthArray) {
+        if (!this.depthCanvas || !depthArray || !depthArray.length) return;
+        const H = depthArray.length;
+        const W = depthArray[0] ? depthArray[0].length : 0;
+        if (W === 0) return;
+
+        // 兼容尺寸：服务器可能返回不同于 PANORAMA_WIDTH/PANORAMA_HEIGHT 的尺寸
+        if (this.depthCanvas.width !== W) this.depthCanvas.width = W;
+        if (this.depthCanvas.height !== H) this.depthCanvas.height = H;
+
+        const ctx = this.depthCanvas.getContext('2d', { willReadFrequently: false });
+        const imgData = ctx.createImageData(W, H);
+        const buf = imgData.data;
+
+        // Inferno 伪彩色：t=0 暗(黑) → t=1 亮(黄)。
+        // depth_array 是 1/pred_disp min-归一化：近处≈1、远处≈很大。
+        // 需要翻转：近→t=1（亮黄）、远→t=0（暗黑），与服务端 depth_to_color 一致。
+        const inferno = (t) => {
+            t = Math.max(0, Math.min(1, t));
+            let r, g, b;
+            if (t < 0.333) {
+                const s = t / 0.333;
+                r = Math.round(s * 100);
+                g = 0;
+                b = Math.round(s * 100 + 30 * (1 - s));
+            } else if (t < 0.666) {
+                const s = (t - 0.333) / 0.333;
+                r = Math.round(100 + s * 155);
+                g = Math.round(s * 50);
+                b = Math.round(100 * (1 - s));
+            } else {
+                const s = (t - 0.666) / 0.334;
+                r = 255;
+                g = Math.round(50 + s * 205);
+                b = Math.round(s * 40);
+            }
+            return [r, g, b, 255];
+        };
+
+        // 一趟扫描：min/max + 映射（t 翻转：近=1→黄，远=0→黑）
+        let vmin = Infinity, vmax = -Infinity;
+        for (let y = 0; y < H; y++) {
+            for (let x = 0; x < W; x++) {
+                const v = depthArray[y][x];
+                if (Number.isFinite(v)) {
+                    if (v < vmin) vmin = v;
+                    if (v > vmax) vmax = v;
+                }
+            }
         }
+        const range = vmax > vmin ? vmax - vmin : 1;
+        for (let y = 0; y < H; y++) {
+            for (let x = 0; x < W; x++) {
+                const v = depthArray[y][x];
+                const t = Number.isFinite(v) ? 1.0 - (v - vmin) / range : 0;
+                const [r, g, b, a] = inferno(t);
+                const idx = (y * W + x) * 4;
+                buf[idx] = r; buf[idx + 1] = g; buf[idx + 2] = b; buf[idx + 3] = a;
+            }
+        }
+        ctx.putImageData(imgData, 0, 0);
     }
 
     _setStatus(rgbStatus, depthStatus) {
@@ -408,6 +480,10 @@ export class PanoramaSensor {
     }
 
     async _requestDepth(canvas) {
+        // RuntimeRateGate：上一次深度请求未返回时跳过本轮
+        if (this._depthGate) { console.log('[depth-gate] skipped'); return; }
+        if (!canvas) { console.log('[depth] no canvas'); return; }
+        this._depthGate = true;
         this.depthPending = true;
         this._setStatus('ready', 'inferring');
         const controller = new AbortController();
@@ -436,16 +512,35 @@ export class PanoramaSensor {
                 throw new Error(`DA360 HTTP ${response.status}`);
             }
             const payload = await response.json();
-            if (!payload || !payload.depth_image) {
-                throw new Error('DA360 response missing depth_image');
+            if (!payload || !payload.depth_array) {
+                throw new Error('DA360 response missing depth_array');
             }
-            this.depthImg.src = payload.depth_image;
+            // 缓存深度数组，后续 _requestYopoPlan 直通 /yopo/plan，不重新跑 DA360
+            // 深度显示：Canvas 直绘（不走 JPEG 编解码）
+            if (payload.depth_array) {
+                this._lastDepthArray = payload.depth_array;
+                this._renderDepthToCanvas(payload.depth_array);
+                this.hasDepth = true;
+                this._updateDepthDisplay();
+            }
+            // YOPO 规划：有目标时每帧深度触发一次，与显示解耦
+            this._requestYopoPlan();
+            // 帧率打点：每 2 秒打印一次
+            const now = performance.now();
+            this._depthFpsCount++;
+            if (now - this._depthFpsTimer > 2000) {
+                const fps = this._depthFpsCount / ((now - this._depthFpsTimer) / 1000);
+                console.log(`[depth] ${fps.toFixed(1)} Hz  latency=${Math.round(payload.latency_ms || 0)}ms  gate=${this._depthGate}`);
+                this._depthFpsTimer = now;
+                this._depthFpsCount = 0;
+            }
+
             this._setDepthLegend(payload.depth_scale);
             this.lastDepthTime = performance.now();
             this._depthLatency = Number.isFinite(payload.latency_ms)
                 ? `${Math.round(payload.latency_ms)}ms`
                 : `${Math.round(this.lastDepthTime - started)}ms`;
-            // hasDepth and status set in depthImg.onload
+            if (this.onDepthResult) this.onDepthResult(payload.latency_ms);
         } catch (error) {
             reportUserError('DA360 depth request failed', error, {
                 key: 'da360-depth-request',
@@ -456,50 +551,54 @@ export class PanoramaSensor {
         } finally {
             window.clearTimeout(timeout);
             this.depthPending = false;
+            this._depthGate = false;  // 释放漏桶，允许下一帧发起请求
         }
     }
 
-    _requestYopo(canvas) {
-        if (this._yopoPending || !this._yopoGoal || !this._yopoPose) return;
+    /** 将 /depth 返回的 depth_array 直通 /yopo/plan，避免二次 DA360 推理。 */
+    async _requestYopoPlan() {
+        if (this._yopoPending || !this._yopoGoal || !this._yopoPose || !this._lastDepthArray) return;
         this._yopoPending = true;
+        const gen = this._yopoGeneration;  // 快照，用于检测请求发出后目标是否被重置
         const goal = this._yopoGoal;
         const pose = this._yopoPose;
         const yaw = this._yopoYaw;
 
-        const qs = [
-            `px=${pose.x}`, `py=${pose.y}`, `pz=${pose.z}`,
-            `gx=${goal.x}`, `gy=${goal.y}`, `gz=${goal.z}`,
-            `vx=${pose.vx || 0}`, `vy=${pose.vy || 0}`, `vz=${pose.vz || 0}`,
-            `yaw=${yaw}`,
-        ].join('&');
-
-        canvas.toBlob(async (blob) => {
-            try {
-                const controller = new AbortController();
-                const timeout = setTimeout(() => controller.abort(), 15000);
-                const resp = await fetch(`${getYopoEndpoint()}?${qs}`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'image/jpeg' },
-                    body: blob,
-                    signal: controller.signal,
-                });
-                clearTimeout(timeout);
-                if (!resp.ok) throw new Error(`YOPO HTTP ${resp.status}`);
-                const payload = await resp.json();
-                if (payload.endstate && this.onYopoResult) {
-                    this.onYopoResult(payload.endstate, payload.traj_time);
-                }
-            } catch (error) {
-                reportUserError('YOPO planning failed', error, {
-                    key: 'yopo-plan',
-                    intervalMs: 5000,
-                });
-            } finally {
-                this._yopoPending = false;
+        try {
+            const controller = new AbortController();
+            const timeout = setTimeout(() => controller.abort(), 15000);
+            // 不发送 depth_array —— 服务端从 /depth 缓存中取，省 ~1.4MB JSON 序列化
+            const resp = await fetch(getYopoPlanEndpoint(), {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    pose: { x: pose.x, y: pose.y, z: pose.z },
+                    goal: { x: goal.x, y: goal.y, z: goal.z },
+                    vel:  { vx: pose.vx || 0, vy: pose.vy || 0, vz: pose.vz || 0 },
+                    yaw:  yaw,
+                }),
+                signal: controller.signal,
+            });
+            clearTimeout(timeout);
+            if (!resp.ok) throw new Error(`YOPO HTTP ${resp.status}`);
+            const payload = await resp.json();
+            // 守卫：若请求在途期间目标被重置（取消/到达/设新目标），丢弃过期响应
+            if (gen !== this._yopoGeneration) return;
+            if (payload.endstate && this.onYopoResult) {
+                this.onYopoResult(payload.endstate, payload.traj_time);
+                if (this.onYopoLatency) this.onYopoLatency(payload.latency_ms);
             }
-        }, 'image/jpeg', PANORAMA_JPEG_QUALITY);
+        } catch (error) {
+            reportUserError('YOPO planning failed', error, {
+                key: 'yopo-plan',
+                intervalMs: 5000,
+            });
+        } finally {
+            this._yopoPending = false;
+        }
     }
 
     setYopoGoal(goal) { this._yopoGoal = goal; }
+    resetYopoGoal() { this._yopoGeneration++; this._yopoGoal = null; this._yopoPending = false; }
     setYopoPose(pose, yaw) { this._yopoPose = pose; this._yopoYaw = yaw; }
 }

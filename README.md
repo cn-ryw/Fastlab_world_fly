@@ -59,7 +59,7 @@ python3 -m pip install --user gdown
 docker rm -f mindcloud-da360-api
 ```
 
-注意，默认使用 `DA360_large`，DA360 服务端以实时优先的 `DA360_INPUT_SCALE=0.65` 推理，模型输入约为 `672x336`；在 RTX 4070 Ti SUPER 上真实 HTTP 端到端约 70 ms。右下角 RGB 全景仍保持原始显示尺寸；只有发送给 DA360 的深度请求会单独缩小，前端默认按 `da360UploadScale=0.2` 上传约 `134x67` 的 JPEG，再由服务端 resize 到模型输入尺寸。前端默认 `depthMs=100`，推理未完成时不会堆积请求。
+注意，默认使用 `DA360_large`。`start_da360_api.sh` 以实时优先的 `DA360_INPUT_SCALE=0.65` 推理；本项目的一键脚本 `start-all.sh` 走 DA360+YOPO 合并容器，用的是 `DA360_INPUT_SCALE=0.5`。右下角 RGB 全景仍保持原始显示尺寸；只有发送给 DA360 的深度请求会单独缩小，前端默认按 `da360UploadScale=0.35` 上传约 `134x67` 的 JPEG，再由服务端 resize 到模型输入尺寸。前端默认 `depthMs=33`，推理未完成时不会堆积请求。
 
 默认不建议换模型；实验中 `DA360_large` 的 fast 档比 `DA360_small` 保留了更好的深度排序和边缘一致性。只有显存、功耗或部署体积受限时，再自行覆盖模型名：
 
@@ -122,21 +122,21 @@ Tab         设置面板
 
 ## 全景相机实现原理
 
-全景 RGB 默认从机头 360 相机位置采集，输出 `672x336` ERP 图。实现方式是对 Cesium/Google Tiles 渲染结果进行 6 个方向采样，然后在 GPU 中按 ERP 射线模型重投影：
+全景 RGB 默认从机头 360 相机位置采集，输出 `384x192` ERP 图（刻意对齐 YOPO 的训练分辨率，改动前先读 `YOPO/config/traj_opt.yaml` 的 `image_width/image_height` 约束）。实现方式是对 Cesium/Google Tiles 渲染结果进行 6 个方向采样，然后在 GPU 中按 ERP 射线模型重投影：
 
 ```text
 yaw   = pi - (u + 0.5) / W * 2pi
 pitch = vfov / 2 - (v + 0.5) / H * vfov
 ```
 
-这保证投影模型与 YOPO_360 的 ERP 相机一致；区别是数据来源为 Cesium 渲染视图，而不是仿真栅格的直接 raycast。放置阶段会后台创建全景采样 viewer；确认出生点后会在用户可控前预采样一张全景首帧。飞行中默认 `panoMs=16`、`panoFace=192`、每个采样方向等待 `panoFrameDelayMs=8`，并最多等待 `panoFaceTileTimeoutMs=900` 让当前方向 tiles idle；首帧预加载使用 `panoPreloadFrameDelayMs=96`、`panoPreloadFaceTileTimeoutMs=6000` 和 `panoPreloadTimeoutMs=60000`，默认 `panoPreloadRequired=1`，未拿到完整 6 面首帧不会进入可控飞行。为了避免 Google Tiles 天空/极区采样在 ERP 顶部形成海市蜃楼状伪影，默认对顶部 10 度和底部 2 度做极区 guard；guard 区域保持 ERP 坐标，只向上下极点采样淡出，不会把整张图压缩到 guard 边界。可用 `panoTopPoleGuard` / `panoBottomPoleGuard` 调整或设为 0 关闭。
+这保证投影模型与 YOPO_360 的 ERP 相机一致；区别是数据来源为 Cesium 渲染视图，而不是仿真栅格的直接 raycast。放置阶段会后台创建全景采样 viewer；确认出生点后会在用户可控前预采样一张全景首帧。飞行中默认 `panoMs=33`、`panoFace=144`、`panoFrameDelayMs=0`，并最多等待 `panoFaceTileTimeoutMs=400` 让当前方向 tiles idle；首帧预加载使用 `panoPreloadFrameDelayMs=96`、`panoPreloadFaceTileTimeoutMs=6000` 和 `panoPreloadTimeoutMs=60000`。默认 `panoPreloadRequired=0`（配合默认开启的 `panoCaptureAnyway=1`，首帧不完整也允许进入飞行，实时采样继续重试）；设 `panoPreloadRequired=1` 可要求拿到完整 6 面首帧才可控。为了避免 Google Tiles 天空/极区采样在 ERP 顶部形成海市蜃楼状伪影，默认对顶部 10 度和底部 2 度做极区 guard；guard 区域保持 ERP 坐标，只向上下极点采样淡出，不会把整张图压缩到 guard 边界。可用 `panoTopPoleGuard` / `panoBottomPoleGuard` 调整或设为 0 关闭。
 
 进入可控飞行前，主 Cesium 视图会预加载出生点周围区域，并分别等待第一人称和第三人称初始视角 tiles idle。默认 `flightPreloadStrict=0`，主视图只要目标区域覆盖率达标就继续；全景首帧预加载独立检查隐藏 viewer 的 6 个方向 tiles idle。只有显式设置 `?panoPreloadRequired=0` 时，才会允许全景首帧失败后进入飞行并让实时采样继续重试。
 
 常用参数：
 
 ```text
-# 更高输出分辨率
+# 更高输出分辨率（注意：偏离 384x192 会脱离 YOPO 训练分辨率，仅用于看图，不要用于闭环）
 http://127.0.0.1:8080/?panoWidth=1036&panoFace=768
 
 # 调整采样视图等待时间

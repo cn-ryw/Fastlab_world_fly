@@ -23,9 +23,10 @@ export function erpPixelToDirection(u, v, W, H, vfovRad = Math.PI) {
     const yaw = Math.PI - (u + 0.5) / W * 2.0 * Math.PI;
     const pitch = vfovRad / 2.0 - (v + 0.5) / H * vfovRad;
     const cosPitch = Math.cos(pitch);
+    // dy negated to mirror left/right: matches YOPO training ERP layout
     return {
         dx: cosPitch * Math.cos(yaw),
-        dy: cosPitch * Math.sin(yaw),
+        dy: -cosPitch * Math.sin(yaw),
         dz: Math.sin(pitch),
     };
 }
@@ -36,7 +37,8 @@ export function erpPixelToDirection(u, v, W, H, vfovRad = Math.PI) {
  * Returns {u, v} in continuous pixel coordinates (not snapped to integer).
  */
 export function erpDirectionToPixel(dx, dy, dz, W, H, vfovRad = Math.PI) {
-    const yaw = Math.atan2(dy, dx);               // (-π, π]
+    // negate dy to match mirrored erpPixelToDirection
+    const yaw = Math.atan2(-dy, dx);               // (-π, π]
     const pitch = Math.asin(Math.max(-1, Math.min(1, dz)));
     const u = (Math.PI - yaw) / (2.0 * Math.PI) * W - 0.5;
     const v = (vfovRad / 2.0 - pitch) / vfovRad * H - 0.5;

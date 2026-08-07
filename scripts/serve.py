@@ -32,6 +32,12 @@ import sys
 PORT = 8080
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PATHS_DIR = os.path.join(PROJECT_ROOT, 'asset', 'gate-paths')
+# Cesium 静态资源目录：优先用环境变量，其次检查常见 Docker 镜像挂载点
+CESIUM_DIR = os.environ.get(
+    'CESIUM_DIR',
+    '/var/www/ThirdParty/Cesium' if os.path.isdir('/var/www/ThirdParty/Cesium')
+    else os.path.join(PROJECT_ROOT, 'third_party', 'Cesium')
+)
 MAX_PATH_BODY = 64 * 1024  # 64 KB — tracks are a few hundred bytes each
 SAFE_NAME_RE = re.compile(r'^[A-Za-z0-9._-]{1,200}\.json$')
 
@@ -60,6 +66,13 @@ class Handler(http.server.SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=PROJECT_ROOT, **kwargs)
 
+    def translate_path(self, path):
+        """将 /ThirdParty/Cesium/... 映射到 third_party/Cesium/..."""
+        if path.startswith('/ThirdParty/Cesium/'):
+            rel = path[len('/ThirdParty/Cesium/'):]
+            return os.path.join(CESIUM_DIR, rel)
+        return super().translate_path(path)
+
     def handle(self):
         try:
             super().handle()
@@ -71,11 +84,17 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         self.send_header('Access-Control-Allow-Origin', '*')
         self.send_header('Access-Control-Allow-Methods', 'GET, PUT, DELETE, OPTIONS')
         self.send_header('Access-Control-Allow-Headers', 'Content-Type')
-        self.send_header('Cross-Origin-Opener-Policy', 'same-origin')
-        self.send_header('Cross-Origin-Embedder-Policy', 'require-corp')
-        self.send_header('Cache-Control', 'no-cache, no-store, must-revalidate')
-        self.send_header('Pragma', 'no-cache')
-        self.send_header('Expires', '0')
+        # Per-path caching: immutable assets get long max-age; HTML revalidates
+        path_no_query = (self.path or '').split('?', 1)[0]
+        # 开发服务器：所有动态资源 no-cache。长缓存只用于版本化的第三方库。
+        if path_no_query.startswith('/src/') or path_no_query.startswith('/api/'):
+            self.send_header('Cache-Control', 'no-store')
+        elif path_no_query.startswith('/ThirdParty/') or path_no_query.startswith('/asset/vendor/'):
+            self.send_header('Cache-Control', 'public, max-age=86400')
+        else:
+            self.send_header('Cache-Control', 'no-cache')
+            self.send_header('Pragma', 'no-cache')
+            self.send_header('Expires', '0')
         super().end_headers()
 
     def guess_type(self, path):

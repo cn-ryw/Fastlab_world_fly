@@ -38,9 +38,14 @@ const DEFAULT_VIEW = {
     height: 1800,
 };
 const CESIUM_DRONE_MODEL_URI = 'asset/models/CesiumDrone.glb';
+// CesiumDrone.glb 的原始包围盒为 3.964 × 1.120 × 4.668 单位（水平最大跨度 4.668）。
+// 目标是让渲染尺寸匹配物理机体：半径约 0.4 m，即跨度 0.8 m。
+//   scale = 0.8 / 4.668 ≈ 0.171
+// 旧默认值 1.35 会渲染出 6.3 m 跨度（等效半径 3.15 m），比物理碰撞半径
+// (collisionRadius = 0.6 m) 大一个数量级，视觉上完全失真。
 const CESIUM_DRONE_MODEL_SCALE = clampNumber(
-    urlNumber('droneScale', 1.35),
-    0.1, 10.0, 1.35
+    urlNumber('droneScale', 0.171),
+    0.01, 10.0, 0.171
 );
 const HEIGHT_CACHE_TTL_MS = 140;
 const HEIGHT_CACHE_LIMIT = 256;
@@ -230,8 +235,9 @@ class PanoramaEquirectProjector {
             vec3 directionFromPitchYaw(float pitch, float yaw) {
                 float cosPitch = cos(pitch);
                 float forward = cosPitch * cos(yaw);
-                float left = cosPitch * sin(yaw);
-                return normalize(vec3(left, sin(pitch), -forward));
+                float right = cosPitch * sin(yaw);
+                // negate x → mirror left/right to match YOPO training ERP layout
+                return normalize(vec3(-right, sin(pitch), -forward));
             }
 
             void main() {
@@ -412,7 +418,7 @@ export class CesiumWorld {
             2048
         ));
         this.panoramaTileSSE = clampNumber(
-            urlNumber('panoramaTileSse', options.panoramaTileSSE ?? 32),
+            urlNumber('panoramaTileSse', options.panoramaTileSSE ?? 96),
             4,
             128,
             32
@@ -481,7 +487,7 @@ export class CesiumWorld {
                 webgl: {
                     alpha: false,
                     antialias: false,
-                    preserveDrawingBuffer: true,
+                    preserveDrawingBuffer: false,
                     powerPreference: 'high-performance',
                     failIfMajorPerformanceCaveat: false,
                 },
@@ -522,7 +528,7 @@ export class CesiumWorld {
         this.viewer.scene.requestRender();
         if (progressCb) progressCb('Waiting for initial Google 3D Tiles...');
         await new Promise(resolve => window.setTimeout(resolve, 150));
-        await this.waitForTilesIdle(4500, 250);
+        await this.waitForTilesIdle(3000, 250);
 
         this.ready = true;
         this.viewer.scene.requestRender();
@@ -1149,6 +1155,13 @@ export class CesiumWorld {
         });
     }
 
+    clearGoalMarker() {
+        if (this._goalMarker) {
+            this.viewer.entities.remove(this._goalMarker);
+            this._goalMarker = null;
+        }
+    }
+
     _collisionExclusions() {
         const excluded = [];
         if (this.spawnMarker) excluded.push(this.spawnMarker);
@@ -1180,8 +1193,11 @@ export class CesiumWorld {
             model: {
                 uri: CESIUM_DRONE_MODEL_URI,
                 scale: CESIUM_DRONE_MODEL_SCALE,
-                minimumPixelSize: 44,
-                maximumScale: 18,
+                // minimumPixelSize 会在远距离强行把模型撑到给定屏占像素，
+                // 从而让实际观感脱离物理尺寸。之前的 44 是视觉过大的第二个原因，
+                // 这里降到刚好保证远处可见的程度。
+                minimumPixelSize: 8,
+                maximumScale: 4,
                 runAnimations: true,
                 incrementallyLoadTextures: false,
                 shadows: Cesium.ShadowMode.DISABLED,

@@ -6,4 +6,9 @@ __pycache__
 .DS_Store
 scene/*
 asset/gate-paths/*.tmp
-# third_party/DA360 — allowed for local base-image builds
+# third_party/DA360 heavy assets excluded from web image:
+# checkpoints are bind-mounted at runtime; web container never touches them
+third_party/DA360/checkpoints/
+third_party/DA360/data/
+third_party/DA360/datasets/
+# Keep third_party/DA360/networks/ and scripts inside for GPU image builds

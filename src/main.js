@@ -26,10 +26,11 @@
 import { CesiumWorld } from './cesium-world.js?v=20260703-panorama-tile-idle';
 import { TilesCollisionProvider } from './tiles-collision.js';
 import { Controller } from './controller.js';
-import { Drone } from './drone.js';
+import { Drone } from './drone.js?v=20260807';
 import { HUD } from './hud.js';
 import { OSD } from './osd.js';
-import { PanoramaSensor } from './panorama-sensor.js';
+import { PanoramaSensor } from './panorama-sensor.js?v=20260807';
+import { FlightLogger } from './flight-logger.js?v=20260807';
 import { reportUserError } from './error-report.js';
 
 let world = null;
@@ -39,11 +40,12 @@ let controller = null;
 let hud = null;
 let osd = null;
 let panoramaSensor = null;
+let flightLogger = null;
 
 let mode = 'loading'; // loading | placement | view-select | flight
 let cameraMode = 'first'; // first | third
 let spawnPoint = null;
-let spawnAltitudeMeters = 50;
+let spawnAltitudeMeters = 100;
 let sceneLoaded = false;
 let loopStarted = false;
 let lastFrameTime = 0;
@@ -214,9 +216,11 @@ function initSubsystems() {
 
     controller = new Controller();
     drone = new Drone();
+    window.__drone = drone;  // debug: inspect mass/thrust from console
     hud = new HUD();
     osd = new OSD('osd-canvas');
     panoramaSensor = new PanoramaSensor();
+    if (!flightLogger) flightLogger = new FlightLogger();
 
     setupDisplaySettingsListeners();
 }
@@ -343,9 +347,9 @@ async function preloadInitialFlightViewsBeforeControl() {
     const bodyTransform = drone.getBodyTransform ? drone.getBodyTransform() : drone.getCameraTransform();
     const cameraTransform = drone.getCameraTransform();
     const settleOptions = {
-        dwellMs: 260,
+        dwellMs: 180,
         timeoutMs: FLIGHT_PRELOAD_VIEW_TIMEOUT_MS,
-        quietMs: 650,
+        quietMs: 500,
     };
 
     world.setFlightPerformanceMode(true);
@@ -417,7 +421,10 @@ function setupCesiumPlacementHandler() {
     }, Cesium.ScreenSpaceEventType.LEFT_CLICK);
 }
 
-let goalAltitudeMeters = 50;
+// 目标高度覆盖值：null = 沿用无人机当前高度（等价于参考实现 callback_set_goal
+// 里"目标落在当前 fixed_height 平面"的行为）；用户按住 G 滚滚轮后变为显式高度，
+// 等价于 callback_set_goal_3d 移动整个高度平面。按 C 取消航点时复位。
+let goalAltitudeOverride = null;
 
 function setupFlightGoalClickHandler() {
     if (!world || !world.viewer || flightGoalHandler) return;
@@ -427,7 +434,7 @@ function setupFlightGoalClickHandler() {
     let _goalGdown = false;
     const onMouseDown = (e) => {
         if (mode !== 'flight' || !drone) return;
-        if (drone.flightMode !== 'ideal') return;
+        if (drone.flightMode !== 'so3') return;
         if (!_goalGdown) { console.log('[G+click] G not held, _goalGdown=' + _goalGdown); return; }
         console.log('[G+click] picking...');
 
@@ -453,15 +460,19 @@ function setupFlightGoalClickHandler() {
         if (!cartesian) { console.log('[goal] no ground — click on buildings/terrain, not sky'); return; }
 
         const local = world.cartesianToLocal(cartesian);
-        console.log('[goal] SET:', local.x.toFixed(1), goalAltitudeMeters, local.z.toFixed(1));
-        drone.setIdealGoal({ x: local.x, y: goalAltitudeMeters, z: local.z });
-        world.showGoalMarker({ x: local.x, y: goalAltitudeMeters, z: local.z });
-        panoramaSensor?.setYopoGoal({ x: local.x, y: goalAltitudeMeters, z: local.z });
+        const altY = goalAltitudeOverride != null ? goalAltitudeOverride : drone.y;
+        console.log('[goal] SET:', local.x.toFixed(1), altY.toFixed(1), local.z.toFixed(1),
+            goalAltitudeOverride != null ? '(高度已手动指定)' : '(沿用当前高度)');
+        drone.setIdealGoal({ x: local.x, y: altY, z: local.z });
+        world.showGoalMarker({ x: local.x, y: altY, z: local.z });
+        // 目标高度即 YOPO 的高度平面，服务端会把轨迹末端拉到该平面
+        panoramaSensor?.setYopoGoal({ x: local.x, y: altY, z: local.z });
+        flightLogger?.start({ x: local.x, y: altY, z: local.z }, spawnAltitudeMeters);
     };
 
     // Track G key state
     window.addEventListener('keydown', (e) => {
-        if (e.code === 'KeyG' && mode === 'flight' && drone && drone.flightMode === 'ideal') {
+        if (e.code === 'KeyG' && mode === 'flight' && drone && (drone.flightMode === 'so3')) {
             _goalGdown = true;
             console.log('[G key] DOWN');
         }
@@ -477,7 +488,7 @@ function setupFlightGoalClickHandler() {
     const radarCanvas = document.getElementById('radar-canvas');
     if (radarCanvas) {
         radarCanvas.addEventListener('mousedown', (e) => {
-            if (mode !== 'flight' || !drone || drone.flightMode !== 'ideal') return;
+            if (mode !== 'flight' || !drone || drone.flightMode !== 'so3') return;
             e.stopPropagation();
             const rw = radarCanvas.width, rh = radarCanvas.height;
             const range = 200; // must match drawRadar
@@ -486,22 +497,27 @@ function setupFlightGoalClickHandler() {
             const rz = -(e.offsetY - rh/2) / scale; // invert Y
             const goalX = drone.x + rx;
             const goalZ = drone.z + rz;
-            console.log('[radar goal] SET:', goalX.toFixed(1), goalAltitudeMeters, goalZ.toFixed(1));
-            drone.setIdealGoal({ x: goalX, y: goalAltitudeMeters, z: goalZ });
-            world.showGoalMarker({ x: goalX, y: goalAltitudeMeters, z: goalZ });
-            panoramaSensor?.setYopoGoal({ x: goalX, y: goalAltitudeMeters, z: goalZ });
+            const altY = goalAltitudeOverride != null ? goalAltitudeOverride : drone.y;
+            console.log('[radar goal] SET:', goalX.toFixed(1), altY.toFixed(1), goalZ.toFixed(1));
+            drone.setIdealGoal({ x: goalX, y: altY, z: goalZ });
+            world.showGoalMarker({ x: goalX, y: altY, z: goalZ });
+            panoramaSensor?.setYopoGoal({ x: goalX, y: altY, z: goalZ });
+            flightLogger?.start({ x: goalX, y: altY, z: goalZ }, spawnAltitudeMeters);
         });
     }
 
     // mouse wheel adjusts goal altitude when G is held
     const onWheel = (e) => {
-        if (mode !== 'flight' || !drone || drone.flightMode !== 'ideal') return;
+        if (mode !== 'flight' || !drone || drone.flightMode !== 'so3') return;
         if (!placementKeysDown.has('KeyG')) return;
         e.stopPropagation();
         e.preventDefault();
         const step = placementKeysDown.has('ShiftLeft') || placementKeysDown.has('ShiftRight') ? 25 : 5;
-        goalAltitudeMeters = Math.max(SPAWN_ALTITUDE_MIN, Math.min(SPAWN_ALTITUDE_MAX, goalAltitudeMeters - Math.sign(e.deltaY) * step));
-        console.log('[goal] altitude:', goalAltitudeMeters, 'm');
+        // 首次滚动从当前高度起步，之后才是纯粹的增量调整
+        const base = goalAltitudeOverride != null ? goalAltitudeOverride : drone.y;
+        goalAltitudeOverride = Math.max(SPAWN_ALTITUDE_MIN,
+            Math.min(SPAWN_ALTITUDE_MAX, base - Math.sign(e.deltaY) * step));
+        console.log('[goal] 目标高度:', goalAltitudeOverride.toFixed(1), 'm');
     };
     canvas.addEventListener('wheel', onWheel, { passive: false, capture: true });
 
@@ -513,6 +529,8 @@ function setupFlightGoalClickHandler() {
 }
 
 async function enterPlacementMode(autoPick = false) {
+    flightLogger?.stop(false);  // cancel any active recording
+
     if (!world) return;
     mode = 'placement';
 
@@ -586,14 +604,14 @@ async function confirmSpawnAndFly() {
                 gridSpacing: 160,
                 viewDistance: 240,
                 maxTargets: 22,
-                dwellMs: 220,
-                perViewTimeoutMs: 3200,
-                finalIdleTimeoutMs: 20000,
+                dwellMs: 160,
+                perViewTimeoutMs: 2500,
+                finalIdleTimeoutMs: 15000,
                 verifyCoverage: true,
                 coverageSpacing: 160,
                 minCoverageRatio: FLIGHT_PRELOAD_MIN_COVERAGE,
-                repairPasses: 2,
-                repairTargets: 22,
+                repairPasses: 1,
+                repairTargets: 12,
                 progressCb: setProgress,
             });
             const coverage = preload && preload.coverage ? preload.coverage.ratio : 0;
@@ -632,6 +650,10 @@ async function confirmSpawnAndFly() {
             rememberFlightStartWarning(`flight tile preload skipped: ${shortStatusMessage(msg)}`);
         }
 
+        // Run flight-view preload first to warm main tileset cache, then
+        // panorama preload second — serialized because parallel streaming
+        // from two independent Google tilesets competes for bandwidth and
+        // leaves both caches cold.
         try {
             await preloadInitialFlightViewsBeforeControl();
         } catch (e) {
@@ -691,6 +713,8 @@ function startFlight(viewMode = 'first') {
         panoramaSensor.onYopoResult = (endstate, trajTime) => {
             drone?.setYopoTrajectory(endstate, trajTime);
         };
+        panoramaSensor.onDepthResult = (latencyMs) => { flightLogger?.recordDepth(latencyMs); };
+        panoramaSensor.onYopoLatency = (latencyMs) => { flightLogger?.recordYopo(latencyMs); };
     }
 
     // Setup click-to-goal for ideal mode
@@ -901,14 +925,39 @@ function updateFlight(dt) {
         world.setCameraFromDroneTransform(cameraTransform, getCameraHFov(now));
     }
 
-    const panoramaTransform = drone.getPanoramaTransform ? drone.getPanoramaTransform() : bodyTransform;
+    // Level panorama horizon if checkbox enabled (default on, like YOPO use_leveled_depth)
+    const panoLevelEl = document.getElementById('pano-level-toggle');
+    const useLeveled = panoLevelEl ? panoLevelEl.checked : true;
+    const panoramaTransform = useLeveled && drone.getLeveledPanoramaTransform
+        ? drone.getLeveledPanoramaTransform()
+        : (drone.getPanoramaTransform ? drone.getPanoramaTransform() : bodyTransform);
+    if (!updateFlight._loggedPanoMode) {
+        console.log(`[pano] leveled=${useLeveled} method=${useLeveled && drone.getLeveledPanoramaTransform ? 'getLeveledPanoramaTransform' : 'getPanoramaTransform'}`);
+        updateFlight._loggedPanoMode = true;
+    }
     panoramaSensor?.update(world, panoramaTransform, now);
-    // Update YOPO pose for planning
+    // Update YOPO pose for planning (use fixed yaw if SO3 lock is active)
     if (panoramaSensor && drone) {
         panoramaSensor.setYopoPose(
             { x: drone.x, y: drone.y, z: drone.z, vx: drone.vx, vy: drone.vy, vz: drone.vz },
-            drone.yaw
+            drone.getFixedYaw ? drone.getFixedYaw() : drone.yaw
         );
+    }
+
+    // Flight log recording
+    if (flightLogger?.recording) {
+        const ref = drone._yopoPolyX ? drone._getYopoReference
+            ? drone._getYopoReference(drone._yopoTrackerTime || 0)
+            : { x: drone.x, y: drone.y, z: drone.z }
+            : (drone._idealGoal ? drone._idealGoal : { x: drone.x, y: drone.y, z: drone.z });
+        flightLogger.record(drone, ref?.x ?? drone.x, ref?.y ?? drone.y, ref?.z ?? drone.z);
+    }
+    // 到达判定：仅当 YOPO 轨迹曾被启动、目标已被清除、且无活跃轨迹/衰减时触发。
+    // _yopoPlanTriggered 门控防止"设目标即 4m 内"的假到达。
+    if (drone._yopoPlanTriggered && !drone._idealGoal && !drone._yopoPolyX && !drone._yopoDecayRef) {
+        panoramaSensor?.resetYopoGoal();  // 先停 YOPO，后续深度帧只显示不再规划
+        drone._yopoPlanTriggered = false;
+        flightLogger?.stop(true);
     }
 
     // Radar minimap
@@ -966,8 +1015,10 @@ function setupDisplaySettingsListeners() {
         const sync = () => {
             const v = parseFloat(modelScaleSlider.value);
             modelScaleNum.value = v;
-            if (world && world._aircraftModelEntity && world._aircraftModelEntity.model) {
-                world._aircraftModelEntity.model.scale = v;
+            // 属性名是 aircraftModelEntity（无下划线）。此前误写成 _aircraftModelEntity，
+            // 取到 undefined，滑块一直是空操作。
+            if (world && world.aircraftModelEntity && world.aircraftModelEntity.model) {
+                world.aircraftModelEntity.model.scale = v;
             }
         };
         modelScaleSlider.addEventListener('input', sync);
@@ -1038,14 +1089,30 @@ function updateKeyGuide() {
         el.classList.remove('visible');
         return;
     }
-    const isFPV = drone && drone.flightMode === 'fpv';
-    const title = isFPV ? 'FLIGHT CONTROLS - FPV' : 'FLIGHT CONTROLS - EASY';
+    const fm = drone ? drone.flightMode : '';
+    const isFPV = fm === 'fpv';
+    const isStab = fm === 'stabilized';
+    const isSO3 = fm === 'so3';
+    const title = isFPV ? 'FLIGHT CONTROLS - FPV' : isStab ? 'FLIGHT CONTROLS - STABILIZED' : isSO3 ? 'FLIGHT CONTROLS - SO3' : 'FLIGHT CONTROLS - EASY';
+
     const rows = isFPV ? [
         '<kbd>↑ ↓</kbd>  Pitch Forward / Back',
         '<kbd>← →</kbd>  Roll Left / Right',
         '<kbd>W S</kbd>  Motor Thrust',
         '<kbd>A D</kbd>  Yaw Left / Right',
         '<span style="color:#8cff8c">Nose down builds forward speed</span>',
+    ] : isStab ? [
+        '<kbd>↑ ↓</kbd>  Tilt Forward / Back',
+        '<kbd>← →</kbd>  Tilt Left / Right (auto-level)',
+        '<kbd>W S</kbd>  Throttle Up / Down',
+        '<kbd>A D</kbd>  Yaw Left / Right',
+    ] : isSO3 ? [
+        '<kbd>↑ ↓</kbd>  Forward / Back',
+        '<kbd>← →</kbd>  Strafe Left / Right',
+        '<kbd>W S</kbd>  Climb / Descend',
+        '<kbd>A D</kbd>  Yaw Left / Right',
+        '<kbd>G+click</kbd> Set waypoint (YOPO auto-plan)',
+        '<kbd>C</kbd>    Cancel waypoint',
     ] : [
         '<kbd>↑ ↓</kbd>  Forward / Back',
         '<kbd>← →</kbd>  Strafe Left / Right',
@@ -1160,12 +1227,22 @@ function setupThirdPersonPointerControls() {
     }, { passive: false });
 }
 
+function cancelWaypoint() {
+    flightLogger?.stop(false);
+    if (!drone) return;
+    drone.cancelWaypoint();
+    panoramaSensor?.resetYopoGoal();
+    goalAltitudeOverride = null;   // 复位高度覆盖，下次设点重新沿用当前高度
+    if (world && typeof world.clearGoalMarker === 'function') world.clearGoalMarker();
+    console.log('[waypoint] cancelled');
+}
+
 function setupKeyboard() {
     window.addEventListener('keydown', (e) => {
         if (controller && controller.isSettingsOpen && controller.isSettingsOpen()) return;
         if (isTextEntryTarget(e.target)) {
             // G key for goal setting works even when focus is on a text input
-            if (e.code === 'KeyG' && mode === 'flight' && drone && drone.flightMode === 'ideal') {
+            if (e.code === 'KeyG' && mode === 'flight' && drone && (drone.flightMode === 'so3')) {
                 placementKeysDown.add(e.code);
                 e.preventDefault();
                 return;
@@ -1198,9 +1275,14 @@ function setupKeyboard() {
             }
         } else if (mode === 'flight') {
             // G key: hold to click goal in ideal mode
-            if (e.code === 'KeyG' && drone && drone.flightMode === 'ideal') {
+            if (e.code === 'KeyG' && drone && (drone.flightMode === 'so3')) {
                 placementKeysDown.add(e.code);
                 e.preventDefault();
+                return;
+            }
+            if (e.code === 'KeyC') {
+                e.preventDefault();
+                cancelWaypoint();
                 return;
             }
             if (e.code === 'KeyV') {

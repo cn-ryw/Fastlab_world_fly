@@ -4,8 +4,17 @@
 POST /yopo/plan
   Input JSON: { depth: float32[192][384], pose: {x,y,z,qx,qy,qz,qw}, goal: {x,y,z},
                 vel: {vx,vy,vz}, yaw: float }
-  Output JSON: { endstate: [px,py,pz,vx,vy,vz,ax,ay,az], traj_time: 1.125,
-                 score: float, fixed_height: 0.8 }
+  Output JSON: { endstate: [px,vx,ax, py,vy,ay, pz,vz,az], traj_time: 1.125,
+                 score: float, fixed_height: float }
+  注：响应里的 fixed_height 是**训练配置值**（0.8m），仅供参考。实际规划所用的
+  高度平面取自请求中的 goal.z，不再是这个常量。
+
+endstate 采用**轴主序**：每个轴连续排布 位置/速度/加速度，坐标为 sim 世界系
+(x=east, y=up, z=north)。这与参考实现 test_yopo_ros.py 的
+endstate_w[id, axis, order] 布局一致，消费方是 drone.js:setYopoTrajectory。
+历史教训：本 docstring 曾错写成量主序 [px,py,pz,vx,vy,vz,ax,ay,az]，
+前端照着它实现，导致参考轨迹发散、无人机掉高。改动此顺序必须同步更新
+drone.js 与 tests/test_yopo_endstate_layout.js。
 """
 
 import argparse
@@ -13,6 +22,7 @@ import json
 import os
 import sys
 import time
+from contextlib import nullcontext
 from pathlib import Path
 
 import numpy as np
@@ -94,7 +104,7 @@ def plan():
         )
 
         return jsonify({
-            "endstate": endstate.tolist(),      # [px,py,pz,vx,vy,vz,ax,ay,az]
+            "endstate": endstate.tolist(),      # [px,vx,ax, py,vy,ay, pz,vz,az]（轴主序）
             "score": float(score),
             "traj_time": traj_time,
             "fixed_height": runner.fixed_height,
@@ -112,6 +122,12 @@ class YopoRunner:
         self.device = device
 
         self.net = _load_model(model_path, device)
+        # channels_last 在 RTX 5070 Ti + PyTorch 2.8 + Flask 主进程中有 200x 减速 bug，
+        # 症状同 DA360_CHANNELS_LAST。默认禁用，换 GPU/PyTorch 版本可重新启用。
+        self.use_amp = device == "cuda" and os.environ.get("YOPO_AMP", "1") != "0"
+        self.use_channels_last = device == "cuda" and os.environ.get("YOPO_CHANNELS_LAST", "0") != "0"
+        if self.use_channels_last:
+            self.net = self.net.to(memory_format=torch.channels_last)
         self.width = cfg["image_width"]
         self.height = cfg["image_height"]
         self.in_channels = cfg["image_channels"]
@@ -156,7 +172,10 @@ class YopoRunner:
                                  minimum_depth=self.min_dis / self.max_dis)
         depth_norm = fill_invalid_depth(depth_norm, valid, mode="valid_mean")
         stacked = np.stack([depth_norm, valid.astype(np.float32)], axis=0)
-        depth_input = torch.from_numpy(stacked.reshape(1, self.in_channels, self.height, self.width)).to(self.device)
+        depth_tensor = torch.from_numpy(stacked.reshape(1, self.in_channels, self.height, self.width))
+        if self.use_channels_last:
+            depth_tensor = depth_tensor.contiguous(memory_format=torch.channels_last)
+        depth_input = depth_tensor.to(self.device)
 
         # 2. coordinate mapping: sim (east, up, north) → YOPO world (x=east, y=north, z=up)
         # Sim: x=east, y=up, z=north
@@ -167,8 +186,22 @@ class YopoRunner:
         yopo_acc = np.array([acc[0], acc[2], acc[1]], dtype=np.float32) if acc is not None else np.zeros(3, dtype=np.float32)
         yopo_goal = np.array([goal[0], goal[2], goal[1]], dtype=np.float32)
 
-        # Sim yaw in degrees (0=south) → YOPO yaw in radians (0=east, -90=south)
-        yopo_yaw_rad = np.deg2rad(yaw - 90.0)
+        # 高度平面跟随目标高度，对齐参考实现 test_yopo_ros.py:callback_set_goal_3d
+        # (`self.fixed_height = data.pose.position.z`)。
+        #
+        # 这里刻意不做任何高度平移：网络输入 obs = [vel_c, acc_c, goal_c] 中
+        # goal_c = R_cw·(goal − pos) 只含**相对**位移，绝对高度根本不进网络。
+        # 此前的 altitude_shift 把 pos.z 和 goal.z 同减一个量，对 obs 是恒等变换
+        # （数值验证误差 < 3e-15），既没有让模型"看到训练分布"，还额外引入了
+        # 一次需要在输出端撤销的偏移。已删除。
+        height_plane = float(yopo_goal[2])
+        if not np.isfinite(height_plane):
+            height_plane = float(yopo_pos[2])   # 目标高度无效时退化为保持当前高度
+
+        # Sim yaw in degrees (0=south, +clockwise) → YOPO yaw in radians (0=east)
+        # Sim yaw=0(south) → YOPO yaw=-π/2; yaw=90(west) → YOPO yaw=π
+        # Mapping: yopo = -(sim_yaw + 90°) → deg2rad(-yaw - 90)
+        yopo_yaw_rad = np.deg2rad(-yaw - 90.0)
         Rotation_wb = R.from_euler("Z", yopo_yaw_rad, degrees=False).as_matrix()
         Rotation_wc = np.dot(Rotation_wb, self.Rotation_bc)
         Rotation_cw = Rotation_wc.T
@@ -182,8 +215,10 @@ class YopoRunner:
         obs_norm = self.state_transform.normalize_obs(torch.from_numpy(obs[None, :]))
         obs_input = self.state_transform.prepare_input(obs_norm.to(self.device))
 
-        # 3. forward
-        endstate_pred, score_pred = self.net(depth_input, obs_input)
+        # 3. forward (AMP autocast for fp16 matmul on CUDA)
+        amp_ctx = torch.cuda.amp.autocast() if self.use_amp else nullcontext()
+        with amp_ctx:
+            endstate_pred, score_pred = self.net(depth_input, obs_input)
         endstate_pred, score_pred = endstate_pred.cpu().numpy(), score_pred.cpu().numpy()
 
         # 4. decode best candidate
@@ -201,8 +236,8 @@ class YopoRunner:
         endstate_c = endstate.reshape(-1, 3, 3).transpose(0, 2, 1)
         endstate_w = np.matmul(Rotation_wc, endstate_c)
 
-        # z (YOPO Z = altitude) is forced to fixed_height
-        endstate_w[:, 2, 0] = self.fixed_height - yopo_pos[2]
+        # 把轨迹末端的 z 位移拉到高度平面上（同 test_yopo_ros.py:641）
+        endstate_w[:, 2, 0] = height_plane - yopo_pos[2]
 
         best = endstate_w[0]
         yopo_result = np.array([
@@ -211,7 +246,8 @@ class YopoRunner:
             best[2, 0] + yopo_pos[2], best[2, 1], best[2, 2],
         ], dtype=np.float32)
 
-        # 5. convert back: YOPO world → sim (x=east, y=up, z=north)
+        # 5. 换回 sim 坐标系 (x=east, y=up, z=north)；保持**轴主序**
+        #    [px,vx,ax, py,vy,ay, pz,vz,az]，消费方 drone.js:setYopoTrajectory
         result = np.array([
             yopo_result[0], yopo_result[1], yopo_result[2],  # px, vx, ax = YOPO x
             yopo_result[6], yopo_result[7], yopo_result[8],  # py, vy, ay = YOPO z → sim y

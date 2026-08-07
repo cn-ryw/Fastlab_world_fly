@@ -42,6 +42,9 @@ except ImportError:
     pass
 da360_runner = None
 yopo_runner = None
+# 服务端缓存最近一次 DA360 推理结果（由 /depth 写入，/yopo/plan 读取，避免前端回传 1.4MB）
+_depth_cache = {"data": None, "ts": 0}
+_depth_cache_lock = None  # 在 main() 中初始化为 threading.Lock()
 
 
 # ── DA360 endpoints ──────────────────────────────────────────────────────
@@ -77,12 +80,17 @@ def da360_depth():
         started = time.time()
         image = decode_request_image(request)
         pred_depth = da360_runner.infer(image)
-        colored, depth_scale = depth_to_color(pred_depth)
-        depth_image = encode_image(colored, "jpeg", env_int("DA360_JPEG_QUALITY", 72))
+        latency_ms = (time.time() - started) * 1000.0
+        # 缓存最近一次 DA360 结果，供 /yopo/plan 直接取用
+        if _depth_cache_lock:
+            with _depth_cache_lock:
+                _depth_cache["data"] = pred_depth
+                _depth_cache["ts"] = time.time()
+        if latency_ms > 100:
+            print(f"[depth] {latency_ms:.0f}ms  model={da360_runner.width}x{da360_runner.height}", flush=True)
         return jsonify({
-            "depth_image": depth_image,
-            "depth_scale": depth_scale,
-            "latency_ms": (time.time() - started) * 1000.0,
+            "depth_array": pred_depth.tolist(),
+            "latency_ms": latency_ms,
             "model": da360_runner.model_name,
             "device": str(da360_runner.device),
             "width": da360_runner.width,
@@ -113,21 +121,32 @@ def yopo_plan():
         import time
         data = request.get_json(force=True)
         started = time.time()
-        depth_arr = np.array(data["depth"], dtype=np.float32)
+        # 优先用请求中的 depth 数组；未提供时从服务端缓存取（省去前端 1.4MB JSON 回传）
+        if "depth" in data:
+            depth_arr = np.array(data["depth"], dtype=np.float32)
+        elif _depth_cache["data"] is not None:
+            if _depth_cache_lock:
+                with _depth_cache_lock:
+                    depth_arr = _depth_cache["data"].copy()
+            else:
+                depth_arr = _depth_cache["data"]
+        else:
+            return jsonify({"error": "no depth provided and cache empty"}), 400
         pose = data["pose"]
         goal = data["goal"]
         vel = data.get("vel", {"vx": 0, "vy": 0, "vz": 0})
         yaw = float(data.get("yaw", 0.0))
         acc = data.get("acc", {"ax": 0, "ay": 0, "az": 0})
 
-        endstate, score, traj_time = yopo_runner.infer(
-            depth_arr=depth_arr,
-            pos=np.array([pose["x"], pose["y"], pose["z"]], dtype=np.float32),
-            vel=np.array([vel["vx"], vel["vy"], vel["vz"]], dtype=np.float32),
-            acc=np.array([acc["ax"], acc["ay"], acc["az"]], dtype=np.float32),
-            goal=np.array([goal["x"], goal["y"], goal["z"]], dtype=np.float32),
-            yaw=yaw,
-        )
+        with yopo_runner.lock:
+            endstate, score, traj_time = yopo_runner.infer(
+                depth_arr=depth_arr,
+                pos=np.array([pose["x"], pose["y"], pose["z"]], dtype=np.float32),
+                vel=np.array([vel["vx"], vel["vy"], vel["vz"]], dtype=np.float32),
+                acc=np.array([acc["ax"], acc["ay"], acc["az"]], dtype=np.float32),
+                goal=np.array([goal["x"], goal["y"], goal["z"]], dtype=np.float32),
+                yaw=yaw,
+            )
         return jsonify({
             "endstate": endstate.tolist(),
             "score": float(score),
@@ -158,6 +177,11 @@ def yopo_plan_full():
         else:
             image = decode_request_image(request)
 
+        # 标定接入点：当你拿到有效的 (a,b) 后，把下面这行从 da360_runner.infer(image)
+        # 改为 da360_runner.infer_metric(image)。infer_metric 会先走 infer_raw()
+        # 拿原始 pred_disp，再查 DA360_DEPTH_CALIB_PATH 指向的 JSON 文件取 (a,b)，
+        # 做 1/z = a·pred_disp + b 得到米制深度。（文件不存在时自动回退到 infer 行为。）
+        # 验证方式：同一条街谷的同一个目标，标定前后的到达时间 / 轨迹平滑度对比。
         pred_depth = da360_runner.infer(image)
 
         # 2. Extract pose + goal from headers/query params
@@ -172,15 +196,16 @@ def yopo_plan_full():
         vel_vz = float(request.args.get("vz", request.headers.get("X-Vel-Z", 0)))
         drone_yaw = float(request.args.get("yaw", request.headers.get("X-Yaw", 0)))
 
-        # 3. YOPO inference
-        endstate, score, traj_time = yopo_runner.infer(
-            depth_arr=pred_depth,
-            pos=np.array([pose_x, pose_y, pose_z], dtype=np.float32),
-            vel=np.array([vel_vx, vel_vy, vel_vz], dtype=np.float32),
-            acc=np.zeros(3, dtype=np.float32),
-            goal=np.array([goal_x, goal_y, goal_z], dtype=np.float32),
-            yaw=drone_yaw,
-        )
+        # 3. YOPO inference (serialized by yopo lock for thread safety)
+        with yopo_runner.lock:
+            endstate, score, traj_time = yopo_runner.infer(
+                depth_arr=pred_depth,
+                pos=np.array([pose_x, pose_y, pose_z], dtype=np.float32),
+                vel=np.array([vel_vx, vel_vy, vel_vz], dtype=np.float32),
+                acc=np.zeros(3, dtype=np.float32),
+                goal=np.array([goal_x, goal_y, goal_z], dtype=np.float32),
+                yaw=drone_yaw,
+            )
         total_ms = (time.time() - started) * 1000.0
         return jsonify({
             "endstate": endstate.tolist(),
@@ -211,18 +236,26 @@ def main():
     args = parse_args()
     input_scale = env_float("DA360_INPUT_SCALE", DEFAULT_INPUT_SCALE)
 
-    # Load DA360
+    # 顺序加载：并行线程加载两个 CUDA 模型会导致 DA360 warmup 期间
+    # CUDA context 竞争，模型前向传递从 ~25ms 退化到 ~5.5s。
+    # 原项目 da360_server.py 只跑单一模型，没有这个问题。
+    import threading as _thr
+    torch.zeros(1, device="cuda")
     print("[combined] Loading DA360 model...")
     da360_runner = DA360Runner(args.da360_model, input_scale=input_scale)
     print(f"[combined] DA360 ready: {da360_runner.model_name} on {da360_runner.device}")
 
-    # Load YOPO
     print("[combined] Loading YOPO model...")
     yopo_runner = YopoRunner(args.yopo_model)
+    yopo_runner.lock = _thr.Lock()
+    global _depth_cache_lock
+    _depth_cache_lock = _thr.Lock()
+    print(f"[combined] YOPO ready on {yopo_runner.device}")
+    print(f"[combined] DA360 ready: {da360_runner.model_name} on {da360_runner.device}")
     print(f"[combined] YOPO ready on {yopo_runner.device}")
 
     print(f"[combined] Starting on 0.0.0.0:{args.port}")
-    app.run(host=args.host, port=args.port, debug=args.debug, threaded=False)
+    app.run(host=args.host, port=args.port, debug=args.debug, threaded=True)
 
 
 if __name__ == "__main__":

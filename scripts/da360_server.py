@@ -262,11 +262,52 @@ class DA360Runner:
         self.model.eval()
         self.model_name = Path(model_path).stem
         self.use_amp = self.device.type == "cuda" and env_bool("DA360_AMP", True)
-        self.channels_last = self.device.type == "cuda" and env_bool("DA360_CHANNELS_LAST", True)
+        # channels_last 在 RTX 5070 Ti + PyTorch 2.8 + Flask 主进程中会导致
+        # model forward 从 ~25ms 退化到 ~5.5s（200x 减速）。docker exec 子进程不受影响。
+        # 根因是 PyTorch CUDA kernel 调度与 Flask 线程模型的交互问题，非代码逻辑错误。
+        # 默认禁用；若换 GPU/PyTorch 版本可重新启用。
+        self.channels_last = self.device.type == "cuda" and env_bool("DA360_CHANNELS_LAST", False)
         if self.channels_last:
             self.model = self.model.to(memory_format=torch.channels_last)
         if env_bool("DA360_TORCH_COMPILE", False) and hasattr(torch, "compile"):
             self.model = torch.compile(self.model)
+        # Background async compilation: if requested, start torch.compile in a
+        # daemon thread so it does not block the /health check. The compiled
+        # model swaps in when ready; inference falls back to eager until then.
+        # Skip if sync compile was already applied (avoid double-compile).
+        elif env_bool("DA360_TORCH_COMPILE_ASYNC", False) and hasattr(torch, "compile"):
+            self._compiled_model = None
+            self._compile_error = None
+            def _compile_async():
+                try:
+                    compiled = torch.compile(self.model)
+                    # one warmup forward in the SAME autocast context as real inference
+                    warm = torch.randn(1, 3, self.height, self.width, device=self.device)
+                    if self.channels_last:
+                        warm = warm.contiguous(memory_format=torch.channels_last)
+                    with torch.inference_mode():
+                        amp_ctx = torch.cuda.amp.autocast() if self.use_amp else nullcontext()
+                        with amp_ctx:
+                            compiled(warm)
+                    self._compiled_model = compiled
+                except Exception as exc:
+                    self._compile_error = exc
+                    print(f"[DA360] async compile failed: {exc}", file=sys.stderr)
+            t = threading.Thread(target=_compile_async, daemon=True, name="da360-compile")
+            t.start()
+            # Check before each inference whether the compiled model is ready
+            _orig_infer = self.infer
+            _orig_infer_raw = self.infer_raw
+            def _infer_with_compile_swap(image):
+                if self._compiled_model is not None and self.model is not self._compiled_model:
+                    self.model = self._compiled_model
+                return _orig_infer(image)
+            def _infer_raw_with_compile_swap(image):
+                if self._compiled_model is not None and self.model is not self._compiled_model:
+                    self.model = self._compiled_model
+                return _orig_infer_raw(image)
+            self.infer = _infer_with_compile_swap
+            self.infer_raw = _infer_raw_with_compile_swap
         self.mean = torch.tensor([0.485, 0.456, 0.406], device=self.device).view(1, 3, 1, 1)
         self.std = torch.tensor([0.229, 0.224, 0.225], device=self.device).view(1, 3, 1, 1)
         resample_name = os.environ.get("DA360_RESAMPLE", "bilinear").strip().lower()
@@ -279,22 +320,28 @@ class DA360Runner:
             self.infer(warmup)
 
     def infer(self, image):
+        import time as _time
+        _t = [_time.time()]
+        def _lap(label):
+            _t.append(_time.time())
+            if _t[-1] - _t[-2] > 0.1:  # 只打印 >100ms 的步骤
+                print(f"  [da360 infer] {label}: {1000*(_t[-1]-_t[-2]):.0f}ms", flush=True)
+        # CPU work (resize, H2D, normalize) outside the GPU lock so the next
+        # frame's decode/resize overlaps the current frame's GPU forward.
+        tensor = image_to_tensor(
+            image, self.width, self.height, self.device,
+            self.mean, self.std, self.resample, channels_last=self.channels_last,
+        )
+        _lap("image_to_tensor")
         with self.lock:
-            tensor = image_to_tensor(
-                image,
-                self.width,
-                self.height,
-                self.device,
-                self.mean,
-                self.std,
-                self.resample,
-                channels_last=self.channels_last,
-            )
+            _lap("lock-acquired")
             with torch.inference_mode():
                 amp_context = torch.cuda.amp.autocast() if self.use_amp else nullcontext()
                 with amp_context:
                     outputs = self.model(tensor)
-            disp = outputs["pred_disp"].detach().float().cpu().numpy()[0, 0]
+            _lap("model-forward")
+        disp = outputs["pred_disp"].detach().float().cpu().numpy()[0, 0]
+        _lap("cpu-copy")
         depth = 1.0 / np.maximum(disp, 1e-6)
         valid = np.isfinite(depth) & (depth > 0)
         if np.any(valid):
@@ -302,7 +349,60 @@ class DA360Runner:
         scale = env_float("DA360_DEPTH_SCALE", 1.0)
         if abs(scale - 1.0) > 1e-6:
             depth = depth * scale
+        _lap("postprocess")
+        if _t[-1] - _t[0] > 0.5:
+            print(f"  [da360 infer] TOTAL: {1000*(_t[-1]-_t[0]):.0f}ms  ({self.width}x{self.height})", flush=True)
         return depth
+
+    def infer_metric(self, image):
+        """Run DA360 inference and convert raw pred_disp to metric depth.
+
+        使用离线拟合的线性标定参数 1/z = a·pred_disp + b，
+        跳过 per-frame min-归一化步骤。标定参数文件路径由环境变量
+        DA360_DEPTH_CALIB_PATH 指定；文件不存在时回退到 env_float 的
+        DA360_DEPTH_SCALE 粗调（当前默认行为）。
+
+        Returns
+        -------
+        np.ndarray  float32[H,W]  metric depth (metres), clamped to [min_dis, max_dis]
+        """
+        raw = self.infer_raw(image)
+        pred_disp = raw["pred_disp"]
+        calib = self._load_depth_calibration()
+        if calib is not None:
+            a, b = calib["a"], calib["b"]
+            min_d = calib.get("depth_min_m", self.min_dis)
+            max_d = calib.get("depth_max_m", self.max_dis)
+            metric = 1.0 / np.maximum(a * pred_disp + b, 1e-6)
+            metric = np.clip(metric, min_d, max_d)
+        else:
+            # 无标定文件时退回旧行为：per-frame min-归一化 + 常数缩放
+            depth = 1.0 / np.maximum(pred_disp, 1e-6)
+            valid = np.isfinite(depth) & (depth > 0)
+            if np.any(valid):
+                depth = depth / max(float(depth[valid].min()), 1e-6)
+            scale = env_float("DA360_DEPTH_SCALE", 1.0)
+            metric = depth * scale
+        return metric.astype(np.float32)
+
+    @staticmethod
+    def _load_depth_calibration():
+        """加载标定参数文件。文件不存在或格式无效时返回 None。"""
+        path = os.environ.get("DA360_DEPTH_CALIB_PATH", "")
+        if not path:
+            return None
+        try:
+            with open(path) as f:
+                calib = json.load(f)
+            a = float(calib.get("a", 0))
+            b = float(calib.get("b", 0))
+            if abs(a) < 1e-12:
+                return None
+            return {"a": a, "b": b,
+                    "depth_min_m": float(calib.get("depth_min_m", 0.04)),
+                    "depth_max_m": float(calib.get("depth_max_m", 20.0))}
+        except Exception:
+            return None
 
     def infer_raw(self, image):
         """Return raw pred_disp without per-frame min-normalization.
@@ -315,22 +415,23 @@ class DA360Runner:
             valid_mask      — bool[H,W]   finite(pred_disp) & pred_disp > epsilon
             metadata         — dict with model info and inference context
         """
+        # CPU work outside GPU lock (same as infer())
+        tensor = image_to_tensor(
+            image,
+            self.width,
+            self.height,
+            self.device,
+            self.mean,
+            self.std,
+            self.resample,
+            channels_last=self.channels_last,
+        )
         with self.lock:
-            tensor = image_to_tensor(
-                image,
-                self.width,
-                self.height,
-                self.device,
-                self.mean,
-                self.std,
-                self.resample,
-                channels_last=self.channels_last,
-            )
             with torch.inference_mode():
                 amp_context = torch.cuda.amp.autocast() if self.use_amp else nullcontext()
                 with amp_context:
                     outputs = self.model(tensor)
-            disp = outputs["pred_disp"].detach().float().cpu().numpy()[0, 0]
+        disp = outputs["pred_disp"].detach().float().cpu().numpy()[0, 0]
 
         eps = np.float32(1e-6)
         valid = np.isfinite(disp) & (disp > eps)
@@ -505,7 +606,7 @@ def main():
     print(f"Model: {args.model_path}")
     print(f"Device: {runner.device}")
     print(f"Input: {runner.width}x{runner.height} (checkpoint {runner.checkpoint_width}x{runner.checkpoint_height})")
-    app.run(host=args.host, port=args.port, debug=args.debug, threaded=False)
+    app.run(host=args.host, port=args.port, debug=args.debug, threaded=True)
 
 
 if __name__ == "__main__":

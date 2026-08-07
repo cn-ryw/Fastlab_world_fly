@@ -43,6 +43,7 @@ const DRONE_BOOST_MULTIPLIER = 2.0;
 const FPV_BOOST_MULTIPLIER = 1.7;
 const DRONE_MAX_SUPPORTED_SPEED = 300 / 3.6; // 300 km/h in m/s
 const DRONE_MAX_SUPPORTED_VSPEED = 25;
+const ARRIVAL_DISTANCE_M = 9.0;  // YOPO radio_range，格点离散误差下限
 
 // Reusable PlayCanvas math objects (avoid per-frame allocation)
 const _quat  = new pc.Quat();
@@ -73,6 +74,49 @@ class Poly5Solver {
     acceleration(t) { return 2*this.A[2]+6*this.A[3]*t+12*this.A[4]*t*t+20*this.A[5]*t**3; }
 }
 
+/**
+ * 推力矢量倾角限幅 —— 移植自 NetworkControl.cpp: get_Q_from_ACC()
+ * 与 SO3Control.cpp: calculateControl() 中的同一段解析解。
+ *
+ * 把期望力拆成 重力补偿 m*g*e_up 与 加速度项 f = F_d - m*g*e_up，
+ * 当 F_d 相对世界竖直方向的倾角超过 maxTiltDeg 时，**只对 f 缩放**：
+ *     F_d' = s * f + m*g*e_up
+ * 求 s 使 F_d' 的倾角恰好等于上限，解 A s² + B s + C = 0：
+ *     A = c²|f|² - f_up²,  B = 2(c²-1) f_up m g,  C = (c²-1)(m g)²,  c = cos(θ)
+ *
+ * 绝不能改成对整个 F_d 等比缩放：那会把重力补偿一起缩掉，垂直分量
+ * 低于 m*g 就必然掉高（历史 bug，见 tests/test_so3_tilt_limit.js）。
+ *
+ * 本项目坐标系 y 轴向上，故参考实现中的 e3/f(2) 在这里对应 e_y/fY。
+ *
+ * @param {number} FdX   期望力 x 分量 (N)
+ * @param {number} FdY   期望力 y 分量 (N)，y 为世界竖直向上
+ * @param {number} FdZ   期望力 z 分量 (N)
+ * @param {number} weightN 机体重力 m*g (N)
+ * @param {number} maxTiltDeg 最大倾角 (deg)
+ * @returns {{x: number, y: number, z: number}} 限幅后的期望力
+ */
+export function limitTiltPreservingGravity(FdX, FdY, FdZ, weightN, maxTiltDeg) {
+    const hover = { x: 0, y: weightN, z: 0 };
+    const Fnorm = Math.sqrt(FdX * FdX + FdY * FdY + FdZ * FdZ);
+    if (!Number.isFinite(Fnorm) || Fnorm <= 1e-6) return hover;
+
+    const c = Math.cos(Math.max(5, Math.min(80, maxTiltDeg)) * DEG2RAD);
+    if (FdY / Fnorm >= c) return { x: FdX, y: FdY, z: FdZ };  // 未超限，原样返回
+
+    const fX = FdX, fY = FdY - weightN, fZ = FdZ;
+    const nf2 = fX * fX + fY * fY + fZ * fZ;
+    const A = c * c * nf2 - fY * fY;
+    const B = 2 * (c * c - 1) * fY * weightN;
+    const C = (c * c - 1) * weightN * weightN;
+    const disc = B * B - 4 * A * C;
+    if (Math.abs(A) <= 1e-9 || disc < 0) return hover;
+
+    const s = (-B + Math.sqrt(disc)) / (2 * A);
+    if (!Number.isFinite(s) || s < 0) return hover;
+    return { x: s * fX, y: s * fY + weightN, z: s * fZ };
+}
+
 export class Drone {
     constructor() {
         // ---- Geometry ----
@@ -101,8 +145,8 @@ export class Drone {
         // transitions and re-anchor position / integrator state so the new
         // mode starts cleanly from the drone's current pose.
         this._prevFlightMode = this.flightMode;
-        this.mass        = 500;    // grams
-        this.maxThrust   = 1000;   // grams-force
+        this.mass        = 980;    // grams (YOPO Hummingbird: 0.98 kg)
+        this.maxThrust   = 2600;   // grams-force (YOPO: mass*g/hover_thrust = 0.98*9.81/0.38 ≈ 25.3N ≈ 2580gf)
         this.dragCd      = 1.0;    // drag coefficient (dimensionless)
         this.dragArea     = 0.0015; // frontal area (m²), tuned for high-speed quad flight
 
@@ -111,7 +155,7 @@ export class Drone {
         this.maxYawRate   = 120;
         this.droneMaxYawRate = 80;  // Drone mode yaw rate limit (deg/s)
 
-        this.droneMaxAngle   = 58;
+        this.droneMaxAngle   = 45;   // max tilt angle
         this.droneAngleRate  = 280;
         this.droneMaxVSpeed  = 8.0;
         this.droneMaxSpeed   = DRONE_MAX_SUPPORTED_SPEED;
@@ -151,7 +195,7 @@ export class Drone {
 
         this.angularDrag = 8.0;
 
-        this.collisionRadius = 0.3;
+        this.collisionRadius = 0.6;   // YOPO vehicle_radius_m = 0.60
         this.bounceDamping   = 0.3;
 
         // ---- Output state ----
@@ -183,6 +227,7 @@ export class Drone {
         this._idealGoal = null;      // {x,y,z,yaw} or null
         this._idealCruiseMps = 15;   // cruise speed (m/s)
         this._idealYawRate = 60;     // max yaw rate (deg/s)
+        this._arrivalDistanceM = ARRIVAL_DISTANCE_M;
 
         // ---- YOPO trajectory tracking ----
         this._yopoPolyX = null;      // Poly5Solver | null
@@ -191,6 +236,29 @@ export class Drone {
         this._yopoTrajTime = 0;      // trajectory duration (s)
         this._yopoTrackerTime = 0;   // current time along trajectory
         this._yopoGoalYaw = 0;       // locked yaw for this trajectory
+
+        // ---- Yaw lock (SO3 mode: fix initial yaw like YOPO lock_yaw=True) ----
+        this._so3FixedYaw = null;    // null = unlocked, number = fixed yaw degrees
+        this._yopoDecayRef = null;   // smooth decel after YOPO trajectory ends
+        this._yopoDecayTimer = 0;
+        this._so3StickYaw = null;    // accumulated yaw from A/D keys in SO3 stick mode
+        this._so3AltitudeRef = null; // fixed altitude reference for goal mode
+        this._yopoPlanTriggered = false; // YOPO 轨迹已下发后才允许到达判定
+
+        // ---- SO3 geometric controller gains (verified in YOPO_360_v15) ----
+        // YOPO uses: kx=(5.7,5.7,6.2), kv=(3.4,3.4,4.0), kR=(1.5,1.5,1.0), kOm=(0.13,0.13,0.1)
+        // Our rate-control scheme: omega_des = (KR/KOmega)*eR, match ratio kR/kOm≈11.5
+        this.so3Kx = 6.0;            // position error gain (YOPO: 5.7~6.2)
+        this.so3Kv = 3.5;            // velocity error gain (YOPO: 3.4~4.0)
+        this.so3KR = 70.0;           // attitude error gain (KR/KOmega ≈ 11.5 matches YOPO kR/kOm)
+        this.so3KOmega = 6.0;        // angular velocity damping
+        this.so3MaxBodyRate = 220;   // max body rate (deg/s)
+        this.so3YawRate = 120;       // max yaw rate (deg/s, YOPO allows faster yaw)
+        this.so3CruiseMps = 15;      // cruise speed (YOPO cruise_target_mps = 15)
+        // 推力矢量相对世界竖直方向的最大倾角。对应 NetworkControl.cpp 的
+        // max_tilt_deg_（默认 60°，且该文件拒绝 > 60 的取值）。
+        // 限倾角而非限力的模，才能保证重力补偿不被削弱。
+        this.so3MaxTiltDeg = 60;
     }
 
     // ---- Public API ----
@@ -198,21 +266,49 @@ export class Drone {
     /** Set ideal goal (point-to-point, no YOPO trajectory). */
     setIdealGoal(goal) {
         this._idealGoal = goal ? { x: goal.x, y: goal.y, z: goal.z, yaw: goal.yaw } : null;
+        this._so3AltitudeRef = goal ? goal.y : null;  // lock altitude
     }
 
     clearIdealGoal() { this._idealGoal = null; }
 
-    /** Load a YOPO trajectory endpoint → fit 5th-order polynomials. */
+    /** Cancel current waypoint — clear goal + YOPO trajectory + decay + stop */
+    cancelWaypoint() {
+        this._idealGoal = null;
+        this._so3AltitudeRef = null;
+        this._yopoPlanTriggered = false;
+        this._yopoPolyX = this._yopoPolyY = this._yopoPolyZ = null;
+        this._yopoDecayRef = null;
+        this._yopoDecayTimer = 0;
+        this._yopoTrackerTime = 0;
+        // Set current position as hold reference so drone stops immediately
+        this.vx = 0; this.vy = 0; this.vz = 0;
+    }
+
+    /** 载入 YOPO 轨迹末端状态 → 拟合五次多项式。 */
     setYopoTrajectory(endpoint, trajTime) {
-        // endpoint: [px,py,pz, vx,vy,vz, ax,ay,az] world-frame
+        // endpoint 采用**轴主序** [px,vx,ax, py,vy,ay, pz,vz,az]（sim 世界系）。
+        // 这与 yopo_bridge.py 的输出、以及参考实现 test_yopo_ros.py 的
+        // endstate_w[id, axis, order] 一致 —— 每个轴连续排布 位置/速度/加速度。
+        // 切勿改成量主序 [px,py,pz, vx,vy,vz, ...]：那会把高度值填进 X 轴的
+        // 终端速度、把加速度填进 Z 轴的终点位置，产生发散的参考轨迹。
+        // 契约由 tests/test_yopo_endstate_layout.js 锁定。
         const trajT = trajTime || 1.125;
-        this._yopoPolyX = new Poly5Solver(this.x, this.vx, 0, endpoint[0], endpoint[3], endpoint[6], trajT);
-        this._yopoPolyY = new Poly5Solver(this.y, this.vy, 0, endpoint[1], endpoint[4], endpoint[7], trajT);
-        this._yopoPolyZ = new Poly5Solver(this.z, this.vz, 0, endpoint[2], endpoint[5], endpoint[8], trajT);
+        // 轨迹交接：若旧轨迹仍活跃，取当前加速度做新轨迹初值，避免
+        // refAcc 跳变导致 _controlSO3 的姿态咯噔（"断断续续"的直接来源）。
+        const ax0 = this._yopoPolyX ? this._yopoPolyX.acceleration(Math.min(this._yopoTrackerTime, this._yopoTrajTime)) : 0;
+        const ay0 = this._yopoPolyY ? this._yopoPolyY.acceleration(Math.min(this._yopoTrackerTime, this._yopoTrajTime)) : 0;
+        const az0 = this._yopoPolyZ ? this._yopoPolyZ.acceleration(Math.min(this._yopoTrackerTime, this._yopoTrajTime)) : 0;
+
+        this._yopoPolyX = new Poly5Solver(this.x, this.vx, ax0, endpoint[0], endpoint[1], endpoint[2], trajT);
+        this._yopoPolyY = new Poly5Solver(this.y, this.vy, ay0, endpoint[3], endpoint[4], endpoint[5], trajT);
+        this._yopoPolyZ = new Poly5Solver(this.z, this.vz, az0, endpoint[6], endpoint[7], endpoint[8], trajT);
         this._yopoTrajTime = trajT;
         this._yopoTrackerTime = 0;
         this._yopoGoalYaw = this.yaw;
-        this._idealGoal = null;  // disable point-to-point goal mode
+        this._yopoDecayRef = null;  // clear decay from previous trajectory
+        this._yopoPlanTriggered = true;  // 标记已有轨迹到达，允许到达判定
+        // 不清除 _idealGoal —— 目标是持久导航参考，轨迹是对它的连续逼近。
+        // 到达判断在 decay 结束时根据实际距离决定，不是在轨迹开始时就丢弃目标。
     }
 
     setSpawnPoint(x, y, z) {
@@ -221,6 +317,18 @@ export class Drone {
     }
 
     reset() {
+        // 清除所有导航/轨迹状态 —— reset 可能发生在重选出生点后，
+        // 旧坐标系下的多项式、目标、高度参考在新坐标系里毫无意义。
+        this._idealGoal = null;
+        this._so3AltitudeRef = null;
+        this._yopoPolyX = this._yopoPolyY = this._yopoPolyZ = null;
+        this._yopoTrackerTime = 0;
+        this._yopoDecayRef = null;
+        this._yopoDecayTimer = 0;
+        this._yopoPlanTriggered = false;
+        this._so3FixedYaw = null;
+        this._so3StickYaw = null;
+
         this.x = this._spawnX; this.y = this._spawnY; this.z = this._spawnZ;
         this.vx = 0; this.vy = 0; this.vz = 0;
         this.orientation.set(0, 0, 0, 1); // identity
@@ -296,12 +404,50 @@ export class Drone {
         if (altKp !== null) this.droneAltKp = altKp;
         if (altKi !== null) this.droneAltKi = altKi;
         if (altKd !== null) this.droneAltKd = altKd;
+
+        // SO3 geometric controller gains
+        const so3KxVal = v('so3-kx');
+        const so3KvVal = v('so3-kv');
+        const so3KRVal  = v('so3-kr');
+        const so3KOmegaVal = v('so3-komega');
+        const so3MaxBodyRateVal = v('so3-max-body-rate');
+        const so3YawRateVal = v('so3-yaw-rate');
+        if (so3KxVal !== null) this.so3Kx = so3KxVal;
+        if (so3KvVal !== null) this.so3Kv = so3KvVal;
+        if (so3KRVal !== null) this.so3KR = so3KRVal;
+        if (so3KOmegaVal !== null) this.so3KOmega = so3KOmegaVal;
+        if (so3MaxBodyRateVal !== null) this.so3MaxBodyRate = so3MaxBodyRateVal;
+        if (so3YawRateVal !== null) this.so3YawRate = so3YawRateVal;
+    }
+
+    /** 到达目标后刹车：对齐参考 test_yopo_ros.py 的 TRAJECTORY_STATUS_EMPTY + 位置保持 */
+    _onArrival() {
+        this._yopoPolyX = this._yopoPolyY = this._yopoPolyZ = null;  // 停轨迹跟踪
+        this._yopoDecayRef = null; this._yopoDecayTimer = 0;
+        this._idealGoal = null;
+        this._so3AltitudeRef = null;
     }
 
     update(dt, input, collisionProvider) {
         dt = Math.min(dt, 0.05);
 
-        // 0. Handle flight-mode transitions (M key, RC channel, or dropdown).
+        // 0a. 到达判定——对齐参考 test_yopo_ros.py:309-316。
+        // YOPO 格点间距 ~2.3m（radio_range=9m, 12 水平角），单条轨迹无法
+        // 精确落在任意 goal 上。放宽到 radio_range=9m 容差，补偿格点离散误差。
+        // radio_range 不可修改（训练参数绑定在 checkpoint 中）。
+        if (this._idealGoal) {
+            const g = this._idealGoal;
+            const d = Math.sqrt(
+                (g.x - this.x) ** 2 +
+                ((g.y != null ? g.y : this.y) - this.y) ** 2 +
+                (g.z - this.z) ** 2
+            );
+            if (d < this._arrivalDistanceM) {
+                this._onArrival();
+            }
+        }
+
+        // 0b. Handle flight-mode transitions (M key, RC channel, or dropdown).
         // readSettings() has already copied the latest dropdown value into
         // this.flightMode for this frame, so comparing against the cached
         // previous value detects a change on the first frame it becomes
@@ -314,22 +460,14 @@ export class Drone {
         // 1. Control law → updates orientation quaternion and thrustOutput
         if (!input.armed) {
             this._updateDisarmed(dt);
-        } else if (this.flightMode === 'ideal') {
-            this._controlIdeal(dt, input, collisionProvider);
+        } else if (this.flightMode === 'stabilized') {
+            this._controlStabilized(dt, input, collisionProvider);
+        } else if (this.flightMode === 'so3') {
+            this._controlSO3(dt, input, collisionProvider);
         } else if (this.flightMode === 'drone') {
             this._controlDrone(dt, input);
         } else {
             this._controlFPV(dt, input);
-        }
-
-        // Ideal mode: position & orientation directly controlled, skip physics
-        if (this.flightMode === 'ideal') {
-            this._updateEulerFromQuat();
-            this.groundSpeed = Math.sqrt(this.vx * this.vx + this.vz * this.vz);
-            this.airSpeed = Math.sqrt(this.vx * this.vx + this.vy * this.vy + this.vz * this.vz);
-            this.speed = this.groundSpeed;
-            this.verticalSpeed = this.vy;
-            return;
         }
 
         // 2. Extract rotation matrix from orientation
@@ -439,6 +577,43 @@ export class Drone {
                 w: this.orientation.w
             }
         };
+    }
+
+    /** 水平校正的全景相机位姿。
+     *  从完整四元数中提取 body forward 在水平面(XZ)上的投影方向，
+     *  据此重建 yaw-only 四元数。不依赖 Euler 角度分解，对任意
+     *  pitch/roll 组合都能给出正确的水平朝向。
+     *  位置也基于 yaw-only 朝向计算，roll 时相机位置不左右摆动。 */
+    getLeveledPanoramaTransform() {
+        // 从完整四元数提取 body forward 在水平面上的投影
+        _mat4.setTRS(pc.Vec3.ZERO, this.orientation, pc.Vec3.ONE);
+        _mat4.getZ(_v3);  // body Z (backward) 在世界系中的方向
+        const bx = _v3.x, bz = _v3.z;  // backward 的水平分量
+        // leveled forward = -backward 的水平归一化方向
+        const hLen = Math.sqrt(bx * bx + bz * bz);
+        const fwdX = hLen > 1e-6 ? -bx / hLen : 0;
+        const fwdZ = hLen > 1e-6 ? -bz / hLen : -1;
+        // 从水平 forward 反算 yaw：forward=(sin(yaw), 0, cos(yaw)) at identity
+        const yawRad = Math.atan2(fwdX, fwdZ);
+        const halfYaw = yawRad * 0.5;
+        const noseOffset = this.droneSize * 0.5;
+
+        return {
+            position: {
+                x: this.x + fwdX * noseOffset,
+                y: this.y,
+                z: this.z + fwdZ * noseOffset
+            },
+            rotation: { x: 0, y: yawRad * RAD2DEG, z: 0 },
+            orientation: { x: 0, y: Math.sin(halfYaw), z: 0, w: Math.cos(halfYaw) }
+        };
+    }
+
+    /** Return fixed yaw if SO3 yaw-lock is active, else current yaw. */
+    getFixedYaw() {
+        const yawLockEl = document.getElementById('yaw-lock-toggle');
+        const lockEnabled = yawLockEl ? yawLockEl.checked : true;
+        return (lockEnabled && this._so3FixedYaw != null) ? this._so3FixedYaw : this.yaw;
     }
 
     getBodyTransform() {
@@ -557,6 +732,29 @@ export class Drone {
         this._filtVelDerrX = 0; this._filtVelDerrY = 0; this._filtVelDerrZ = 0;
         this._smoothTargetPitch = 0;
         this._smoothTargetRoll  = 0;
+
+        // Clear angular rates when entering so3 or stabilized (prevent FPV rate carryover)
+        if (newMode === 'so3' || newMode === 'stabilized') {
+            this.pitchRate = 0;
+            this.rollRate = 0;
+            this.yawRate = 0;
+        }
+        // 离开 SO3 模式时清除 YOPO 轨迹状态——旧轨迹在新位置/新模式下无意义，
+        // 切回 SO3 时会在下一规划周期（~100ms）自动获得新轨迹。
+        // 不清 _idealGoal：目标是持久的，恢复 SO3 后应继续朝它飞。
+        if (oldMode === 'so3' && newMode !== 'so3') {
+            this._yopoPolyX = this._yopoPolyY = this._yopoPolyZ = null;
+            this._yopoTrackerTime = 0;
+            this._yopoDecayRef = null;
+            this._yopoDecayTimer = 0;
+            this._yopoPlanTriggered = false;
+        }
+        // Lock yaw on entering SO3 mode (like YOPO lock_yaw=True)
+        if (newMode === 'so3') {
+            this._so3FixedYaw = this.yaw;
+        } else {
+            this._so3FixedYaw = null;
+        }
     }
 
     _updateDisarmed(dt) {
@@ -667,7 +865,7 @@ export class Drone {
         if (horizActive) {
             // Stick directly commands target velocity (body-frame → world-frame)
             const cmdFwd   = -input.pitch * maxSpd * rates.pitch;
-            const cmdRight =  input.roll  * maxSpd * rates.roll;
+            const cmdRight = -input.roll  * maxSpd * rates.roll;
             pilotCmdX = cmdFwd * fwdX + cmdRight * rightX;
             pilotCmdZ = cmdFwd * fwdZ + cmdRight * rightZ;
             const pilotCmdH = Math.sqrt(pilotCmdX * pilotCmdX + pilotCmdZ * pilotCmdZ);
@@ -833,123 +1031,435 @@ export class Drone {
             : 0;
     }
 
-    // ---- Ideal controller (direct position/orientation, no physics) ----
+    // ---- Stabilized controller (PX4 self-level: stick → angle, auto-level) ----
+    // Angle-command mode: roll/pitch sticks set target tilt angle, yaw = rate,
+    // throttle = thrust.  Goes through normal physics path (no early return).
+    // YOPO trajectory and goal clicking use SO3 mode instead.
 
-    _controlIdeal(dt, input, _collisionProvider) {
+    _controlStabilized(dt, input, _collisionProvider) {
         const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
-        const maxSpd = this._idealCruiseMps * (input.boost ? 2.0 : 1.0);
+        const boost = input.boost ? DRONE_BOOST_MULTIPLIER : 1.0;
         this.boostActive = !!input.boost;
-        this.effectiveMaxSpeed = maxSpd;
-        this.thrustOutput = this.maxThrust;
-        this.throttlePercent = 1.0;
+        this.boostMultiplier = boost;
 
-        // --- Body-frame basis (world velocity from body commands) ---
+        const rates = input.rates || { roll: 1, pitch: 1, yaw: 1 };
+        const maxTilt = 45; // max tilt angle in degrees (stick at edge)
+
+        // Decompose orientation to get current body tilt
+        const dec = this._decomposeOrientation();
+        const currentPitch = dec.bodyPitchDeg;
+        const currentRoll  = dec.bodyRollDeg;
+
+        // Stick → target tilt angle (centered → 0° = auto-level)
+        const targetPitch =  input.pitch * maxTilt * rates.pitch;  // ArrowUp=-1 → neg pitch = nose-down = forward
+        const targetRoll  =  input.roll  * maxTilt * rates.roll;   // ArrowLeft=-1 → neg roll = left tilt
+
+        // Angle error P-control → target body rate
+        const angleP = 8.0;  // P gain: deg/s per degree of angle error
+        const pitchErr = targetPitch - currentPitch;
+        const rollErr  = targetRoll  - currentRoll;
+
+        const maxRate = 220; // deg/s
+        const pitchRateDes = clamp(pitchErr * angleP, -maxRate, maxRate) * boost;
+        const rollRateDes  = clamp(rollErr  * angleP, -maxRate, maxRate) * boost;
+
+        // Yaw: rate control (stick = rate, centered = stop)
+        const yawActive = Math.abs(input.yaw) > 0.05;
+        const yawRateDes = input.yaw * this._idealYawRate * rates.yaw * boost;
+
+        // Smooth rate tracking
+        const rateSmooth = 1 - Math.exp(-15 * dt);
+        this.pitchRate += (pitchRateDes - this.pitchRate) * rateSmooth;
+        this.rollRate  += (rollRateDes  - this.rollRate)  * rateSmooth;
+        this.yawRate   += (yawRateDes   - this.yawRate)   * rateSmooth;
+
+        // Damp when sticks centered and error small
+        if (Math.abs(input.pitch) < 0.05 && Math.abs(pitchErr) < 1.0) this.pitchRate *= Math.exp(-this.angularDrag * dt);
+        if (Math.abs(input.roll)  < 0.05 && Math.abs(rollErr)  < 1.0) this.rollRate  *= Math.exp(-this.angularDrag * dt);
+        if (!yawActive) this.yawRate *= Math.exp(-this.angularDrag * dt);
+
+        // Apply body-frame rotations
+        this._applyBodyRotation(1, 0, 0, this.pitchRate * dt);  // pitch around body X
+        this._applyBodyRotation(0, 0, 1, this.rollRate * dt);   // roll  around body Z
+        this._applyBodyRotation(0, 1, 0, this.yawRate * dt);    // yaw   around body Y
+
+        // 油门映射：摇杆中位=悬停推力，上推=爬升，下拉=下降。
+        // 旧公式 ((throttle+1)*0.5)*maxThrust 在 throttle=0 时给出 50% 最大推力
+        // (1300gf)，远超 980g 自重 → 无输入时自动上升，被用户误判为"油门自动增大"。
+        const hoverGf = this.mass;   // 悬停推力 = 自重（理想推重比 1:1）
+        const thrustRange = Math.max(this.maxThrust * boost - hoverGf, 0);
+        this.thrustOutput = Math.max(0, hoverGf + input.throttle * thrustRange);
+        this.throttlePercent = this.maxThrust > 0
+            ? Math.max(0, Math.min(1, this.thrustOutput / (this.maxThrust * boost)))
+            : 0;
+
+        this.commandedGroundSpeed = 0;
+        this.targetGroundSpeed = 0;
+        this.pilotGroundSpeedCommand = 0;
+        this.effectiveMaxSpeed = null;
+    }
+
+    // ---- SO3 geometric controller ----
+    // Based on Lee et al. (2010) "Geometric Tracking Control of a Quadrotor UAV on SE(3)"
+    // Outputs thrust + body angular rates; physics integrator handles the rest.
+
+    /**
+     * Get YOPO reference state at time t along the current trajectory.
+     * Returns null if no YOPO trajectory is active.
+     */
+    /** 从 YOPO 多项式返回当前时刻的参考状态（位置/速度/加速度，sim 世界系）。 */
+    _getYopoReference(t) {
+        if (!this._yopoPolyX) return null;
+        // Y 通道直接取多项式值，不做硬覆盖。参考实现 test_yopo_ros.py
+        // 跟踪的是完整三轴多项式，没有对任一轴做硬覆盖。
+        // 此前的实现把 y/vy/ay 钉在 _so3AltitudeRef/0/0，会导致异面目标
+        // 的高度过渡靠位置误差（限幅 ±3m）驱动，爬升缓慢（~0.07 m/s）
+        // 且到达后因缺速度参考而过冲。
+        // _so3AltitudeRef 的语义现为"多项式不可用时的 fallback 高度"，
+        // 仅在 _controlSO3 的 _idealGoal/stickInput 分支中用于 refY。
+        return {
+            x:  this._yopoPolyX.position(t),
+            y:  this._yopoPolyY.position(t),
+            z:  this._yopoPolyZ.position(t),
+            vx: this._yopoPolyX.velocity(t),
+            vy: this._yopoPolyY.velocity(t),
+            vz: this._yopoPolyZ.velocity(t),
+            ax: this._yopoPolyX.acceleration(t),
+            ay: this._yopoPolyY.acceleration(t),
+            az: this._yopoPolyZ.acceleration(t),
+        };
+    }
+
+    /**
+     * Build a desired-attitude quaternion from a world-frame force direction and desired yaw.
+     *
+     * Body-frame convention (matching the existing physics in update()):
+     *   body X = right,  body Y = up / thrust axis,  body Z = backward (-forward)
+     *   At identity: b1=(1,0,0)=east, b2=(0,1,0)=up, b3=(0,0,1)=north
+     *   Forward = -body Z = south at identity (yaw=0 faces -Z)
+     *
+     * R_d columns: b1d=right, b2d=thrust=forceDir, b3d=backward
+     * Forward direction in world: c1 = (-sin yaw, 0, -cos yaw)
+     */
+    _so3DesiredAttitude(forceX, forceY, forceZ, yawDesRad) {
+        const lenF = Math.sqrt(forceX * forceX + forceY * forceY + forceZ * forceZ);
+        if (lenF < 1e-6) {
+            // force too small — return level attitude at current yaw
+            const hy = yawDesRad * 0.5;
+            _quat.set(0, Math.sin(hy), 0, Math.cos(hy));
+            return _quat.clone();
+        }
+
+        // b2d = F_d / ||F_d||  (thrust axis = body Y)
+        // Tilt already clamped in _controlSO3 before calling this function
+        const b2x = forceX / lenF;
+        const b2y = forceY / lenF;
+        const b2z = forceZ / lenF;
+
+        // Forward direction in world (sim convention: yaw=0 → forward = (0,0,-1) = south)
+        const c1x = -Math.sin(yawDesRad);
+        const c1y = 0;   // forward stays in XZ plane
+        const c1z = -Math.cos(yawDesRad);
+
+        // b3d = body Z = backward = -forward_projected_to_b2d_orthogonal_plane
+        // Project c1 onto b2d: c1_parallel = (c1·b2d) * b2d
+        // c1_perp = c1 - c1_parallel → backward = -normalize(c1_perp)
+        const dotC = c1x * b2x + c1y * b2y + c1z * b2z;
+        let b3x = -(c1x - dotC * b2x);
+        let b3y = -(c1y - dotC * b2y);
+        let b3z = -(c1z - dotC * b2z);
+        const lenB3 = Math.sqrt(b3x * b3x + b3y * b3y + b3z * b3z);
+        if (lenB3 < 1e-6) {
+            // c1 is parallel to b2d (pure vertical thrust) — fall back to a perpendicular
+            const absY = Math.abs(b2y);
+            if (absY < 0.99) {
+                // cross(b2d, [0,1,0]) gives horizontal perpendicular, use as body Z
+                b3x = b2z; b3y = 0; b3z = -b2x;
+            } else {
+                // b2d is mostly vertical — cross with world forward gives body X, then body Z
+                b3x = 0; b3y = b2x; b3z = 0;
+            }
+            const altLen = Math.sqrt(b3x * b3x + b3y * b3y + b3z * b3z);
+            if (altLen < 1e-6) { b3x = 0; b3y = 0; b3z = 1; }
+            else { b3x /= altLen; b3y /= altLen; b3z /= altLen; }
+        } else {
+            b3x /= lenB3; b3y /= lenB3; b3z /= lenB3;
+        }
+
+        // b1d = b2d × b3d (right-hand rule: right = up × backward)
+        const b1x = b2y * b3z - b2z * b3y;
+        const b1y = b2z * b3x - b2x * b3z;
+        const b1z = b2x * b3y - b2y * b3x;
+
+        // Rotation matrix R_d = [b1d | b2d | b3d] → quaternion
+        // PlayCanvas Mat4 is COLUMN-MAJOR: data[0..3]=col0, data[4..7]=col1, data[8..11]=col2
+        // Columns: col 0 = b1d (right), col 1 = b2d (up), col 2 = b3d (backward)
+        _mat4.data.set([
+            b1x, b1y, b1z, 0,    // column 0: body X (right)
+            b2x, b2y, b2z, 0,    // column 1: body Y (up / thrust)
+            b3x, b3y, b3z, 0,    // column 2: body Z (backward)
+            0,   0,   0,   1,    // column 3: translation
+        ]);
+        _quat.setFromMat4(_mat4);
+        return _quat.clone();
+    }
+
+    /**
+     * Compute SO(3) attitude error: e_R = vee(R_d^T R - R^T R_d) / 2
+     * In quaternion form: e_R = 2 * sgn(q_d·q) * (q_d.w * q.xyz - q.w * q_d.xyz - q_d.xyz × q.xyz)
+     * Returns {x, y, z} in the body frame.
+     */
+    _so3AttitudeError(qDesired) {
+        const qd = qDesired;
+        const q = this.orientation;
+        // Dot product for shortest-path sign
+        const dot = qd.x * q.x + qd.y * q.y + qd.z * q.z + qd.w * q.w;
+        const sign = dot >= 0 ? 1 : -1;
+
+        const ex = sign * (qd.w * q.x - q.w * qd.x - (qd.y * q.z - qd.z * q.y));
+        const ey = sign * (qd.w * q.y - q.w * qd.y - (qd.z * q.x - qd.x * q.z));
+        const ez = sign * (qd.w * q.z - q.w * qd.z - (qd.x * q.y - qd.y * q.x));
+
+        return { x: ex, y: ey, z: ez };
+    }
+
+    /**
+     * SO3 geometric control law.
+     * Tracks YOPO trajectory with feedback, or holds position / follows stick input.
+     */
+    _controlSO3(dt, input, _collisionProvider) {
+        const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+        const maxSpd = this.so3CruiseMps * (input.boost ? 2.0 : 1.0);
+        this.boostActive = !!input.boost;
+        this.boostMultiplier = input.boost ? 2.0 : 1.0;
+        this.effectiveMaxSpeed = maxSpd;
+
+        // ---- Body-frame basis for stick-to-world conversion and thrust projection ----
         _mat4.setTRS(pc.Vec3.ZERO, this.orientation, pc.Vec3.ONE);
+        _mat4.getY(_v3);
+        const bodyUpX = _v3.x, bodyUpY = _v3.y, bodyUpZ = _v3.z;
         _mat4.getZ(_v3);
-        let fwdX = -_v3.x, fwdZ = -_v3.z;  // forward = -body_Z
+        let fwdX = -_v3.x, fwdZ = -_v3.z;
         _mat4.getX(_v3);
-        let rightX = _v3.x, rightZ = _v3.z; // right = +body_X
+        let rightX = _v3.x, rightZ = _v3.z;
         const fwdLen = Math.sqrt(fwdX * fwdX + fwdZ * fwdZ);
         if (fwdLen > 1e-4) { fwdX /= fwdLen; fwdZ /= fwdLen; }
         const rightLen = Math.sqrt(rightX * rightX + rightZ * rightZ);
         if (rightLen > 1e-4) { rightX /= rightLen; rightZ /= rightLen; }
 
+        // ---- Determine reference trajectory ----
+        let refX, refY, refZ, refVX, refVY, refVZ, refAX, refAY, refAZ;
+        // Yaw lock: use fixed initial yaw if enabled (like YOPO lock_yaw=True)
+        const fixedYaw = this.getFixedYaw();
+        let yawDes = fixedYaw * DEG2RAD;       // default: fixed or current yaw
+        let refActive = false;
 
-        // --- YOPO trajectory mode ---
         if (this._yopoPolyX) {
+            // YOPO trajectory mode
             this._yopoTrackerTime += dt;
             const t = Math.min(this._yopoTrackerTime, this._yopoTrajTime);
             if (t >= this._yopoTrajTime - 0.001) {
-                this.x = this._yopoPolyX.position(this._yopoTrajTime);
-                // YOPO is fixed-height planner — ignore altitude, maintain current
-                this.z = this._yopoPolyZ.position(this._yopoTrajTime);
-                this.vx = 0; this.vy = 0; this.vz = 0;
+                // End of trajectory — save final state for smooth deceleration
+                const ref = this._getYopoReference(this._yopoTrajTime);
+                this._yopoDecayRef = { x: ref.x, z: ref.z, vx: ref.vx, vz: ref.vz };
+                this._yopoDecayTimer = 0;
                 this._yopoPolyX = this._yopoPolyY = this._yopoPolyZ = null;
             } else {
-                this.x = this._yopoPolyX.position(t);
-                this.z = this._yopoPolyZ.position(t);
-                this.vx = this._yopoPolyX.velocity(t);
-                this.vy = 0;  // YOPO fixed-height: ignore vertical velocity
-                this.vz = this._yopoPolyZ.velocity(t);
-                if (Math.abs(this.vx) > 0.2 || Math.abs(this.vz) > 0.2) {
-                    const velYaw = Math.atan2(-this.vx, -this.vz);
-                    const yawStep = clamp((velYaw - this.yaw * DEG2RAD) * RAD2DEG * 5 * dt, -this._idealYawRate * dt, this._idealYawRate * dt);
-                    this._applyBodyRotation(0, 1, 0, yawStep);
+                const ref = this._getYopoReference(t);
+                refX = ref.x; refY = ref.y; refZ = ref.z;
+                refVX = ref.vx; refVY = ref.vy; refVZ = ref.vz;
+                refAX = ref.ax; refAY = ref.ay; refAZ = ref.az;
+                refActive = true;
+                // Yaw toward velocity direction (only when not locked)
+                if (this._so3FixedYaw == null && (Math.abs(refVX) > 0.2 || Math.abs(refVZ) > 0.2)) {
+                    yawDes = Math.atan2(-refVX, -refVZ);  // sim convention: 0=south
                 }
             }
-            this.commandedGroundSpeed = Math.sqrt(this.vx * this.vx + this.vz * this.vz);
-            this.targetGroundSpeed = this._idealCruiseMps;
-            this.pilotGroundSpeedCommand = 0;
-            return;
         }
 
-        // --- Handle goal or direct input ---
-        const goal = this._idealGoal;
-        let desVxW = 0, desVyW = 0, desVzW = 0, desYawRate = 0;
-
-        if (goal) {
-            const dx = goal.x - this.x;
-            const dy = goal.y - this.y;
-            const dz = goal.z - this.z;
-            const distH = Math.sqrt(dx * dx + dz * dz);
-            const dist3D = Math.sqrt(dx * dx + dy * dy + dz * dz);
-
-            if (dist3D < 1.0) {
-                // Arrived — stop and hold
-                this._idealGoal = null;
-                this.vx = 0; this.vy = 0; this.vz = 0;
-            } else {
-                // Softer speed: gain 0.5, cap at maxSpd, decelerate near goal
-                const decelDist = 20; // start decelerating within 20m
-                const speedCap = Math.min(maxSpd, distH * (distH < decelDist ? 0.5 + 0.5 * distH / decelDist : 1.0));
-                const speedH = clamp(distH * 0.5, 0, speedCap);
-                const nx = distH > 0.1 ? dx / distH : 0;
-                const nz = distH > 0.1 ? dz / distH : 0;
-                desVxW = nx * speedH;
-                desVzW = nz * speedH;
-                desVyW = clamp(dy * 1.5, -this.droneMaxVSpeed, this.droneMaxVSpeed);
-                // Prevent going below ground
-                const minY = 2; // minimum altitude above local origin
-                if (this.y + desVyW * dt < minY) desVyW = (minY - this.y) / Math.max(dt, 0.001);
+        // Smooth deceleration after YOPO trajectory ends (P3 fix)
+        if (!refActive && this._yopoDecayRef) {
+            this._yopoDecayTimer += dt;
+            const decayDuration = 0.5;  // seconds — 缩短以缩小轨迹段间减速间隙
+            const t = Math.min(this._yopoDecayTimer / decayDuration, 1.0);
+            const r = this._yopoDecayRef;
+            refX = r.x; refZ = r.z;
+            refY = (this._so3AltitudeRef != null ? this._so3AltitudeRef : this.y);
+            refVX = r.vx * (1 - t);
+            refVZ = r.vz * (1 - t);
+            refVY = 0;
+            refAX = 0; refAY = 0; refAZ = 0;
+            refActive = true;
+            if (t >= 1.0) {
+                this._yopoDecayRef = null;
+                this._yopoDecayTimer = 0;
+                // YOPO 轨迹+衰减完成，判断是否真正到达目标
+                if (this._idealGoal) {
+                    const g = this._idealGoal;
+                    const d = Math.sqrt(
+                        (g.x - this.x) ** 2 +
+                        ((g.y != null ? g.y : this.y) - this.y) ** 2 +
+                        (g.z - this.z) ** 2
+                    );
+                    if (d < this._arrivalDistanceM) {
+                        this._idealGoal = null;
+                        this._so3AltitudeRef = null;
+                    }
+                }
             }
-        } else {
-            // Direct stick → body-frame velocity → convert to world
+        }
+
+        if (!refActive && this._idealGoal) {
+            // 有目标但无 YOPO 轨迹 → 原地悬停，等待首条轨迹到达。
+            // 参考实现 NetworkControl.cpp 无轨迹时走 hover 保持。
+            // 目标只在 YOPO 轨迹+衰减完成后由 decay 分支的到达检查清除；
+            // 本分支不主动清除目标，也不盲追目标位置。
+            const goal = this._idealGoal;
+
+            // 悬停：参考位置 = 当前位置。有任何手动输入时绕过高度锁定
+            const manualInput = Math.abs(input.throttle) > 0.05 ||
+                                Math.abs(input.pitch) > 0.05 ||
+                                Math.abs(input.roll) > 0.05;
+            refX = this.x;
+            refY = (manualInput ? this.y :
+                    (this._so3AltitudeRef != null ? this._so3AltitudeRef : this.y));
+            refZ = this.z;
+            refVX = 0; refVY = 0; refVZ = 0;
+            refAX = 0; refAY = 0; refAZ = 0;
+            refActive = true;
+            if (this._so3FixedYaw == null) {
+                const dx = goal.x - this.x;
+                const dz = goal.z - this.z;
+                if (Math.hypot(dx, dz) > 0.1) {
+                    yawDes = Math.atan2(-dx, -dz);
+                }
+            }
+        }
+
+        if (!refActive) {
+            // Stick input mode — body-frame velocity command
             const rates = input.rates || { roll: 1, pitch: 1, yaw: 1 };
             const cmdFwd   = -input.pitch * maxSpd * rates.pitch;
-            const cmdRight =  input.roll  * maxSpd * rates.roll;
-            desVxW = cmdFwd * fwdX + cmdRight * rightX;
-            desVzW = cmdFwd * fwdZ + cmdRight * rightZ;
-            desVyW = input.throttle * this.droneMaxVSpeed;
-            desYawRate = input.yaw * this._idealYawRate * rates.yaw;
+            const cmdRight = -input.roll  * maxSpd * rates.roll;
+            const horizActive = Math.abs(input.pitch) > 0.05 || Math.abs(input.roll) > 0.05;
+            const vertActive  = Math.abs(input.throttle) > 0.05;
+
+            if (horizActive) {
+                refVX = cmdFwd * fwdX + cmdRight * rightX;
+                refVZ = cmdFwd * fwdZ + cmdRight * rightZ;
+            } else {
+                refVX = 0; refVZ = 0;
+            }
+            refVY = vertActive ? input.throttle * this.droneMaxVSpeed : 0;
+            // Position hold at current location, locked altitude
+            refX = this.x; refY = (this._so3AltitudeRef != null ? this._so3AltitudeRef : this.y); refZ = this.z;
+            refAX = 0; refAY = 0; refAZ = 0;
+            refActive = true;
+            // Yaw rate from A/D keys (P6 fix)
+            const yawActive = Math.abs(input.yaw) > 0.05;
+            if (yawActive && this._so3FixedYaw == null) {
+                if (this._so3StickYaw == null) this._so3StickYaw = this.yaw;
+                this._so3StickYaw += input.yaw * this.so3YawRate * rates.yaw * dt;
+                yawDes = this._so3StickYaw * DEG2RAD;
+            } else {
+                this._so3StickYaw = null;
+            }
         }
 
-        // --- Smooth velocity toward desired ---
-        const alpha = 1 - Math.exp(-8 * dt);
-        this.vx += (desVxW - this.vx) * alpha;
-        this.vy += (desVyW - this.vy) * alpha;
-        this.vz += (desVzW - this.vz) * alpha;
+        // ---- Compute desired force F_d (world frame, Newtons) ----
+        const massKg = Math.max(this.mass, 1) / 1000;
+        // Cap position error: avoid massive F_d from far-away goals destroying control
+        const posErrMax = 3.0;  // meters — above 3m the drone tilts too much to hover
+        const ePosX = clamp(this.x - refX, -posErrMax, posErrMax);
+        const ePosY = clamp(this.y - refY, -posErrMax, posErrMax);
+        const ePosZ = clamp(this.z - refZ, -posErrMax, posErrMax);
+        const eVelX = this.vx - refVX;
+        const eVelY = this.vy - refVY;
+        const eVelZ = this.vz - refVZ;
 
-        // --- Position integration ---
-        this.x += this.vx * dt;
-        this.y += this.vy * dt;
-        this.z += this.vz * dt;
+        // F_d = -K_x e_x - K_v e_v + m*g*e_3 + m*a_d
+        // Our coordinate: Y = up, so gravity compensation is +y
+        let FdX = -this.so3Kx * ePosX - this.so3Kv * eVelX + refAX * massKg;
+        let FdY = -this.so3Kx * ePosY - this.so3Kv * eVelY + (G + refAY) * massKg;
+        let FdZ = -this.so3Kx * ePosZ - this.so3Kv * eVelZ + refAZ * massKg;
 
-        // Floor: don't go below 2m above local ground origin
-        if (this.y < 2) { this.y = 2; if (this.vy < 0) this.vy = 0; }
+        // --- 倾角限幅，取代此前的力模等比缩放 ---
+        // 可行倾角上限：满推力下垂直分量仍须撑得住自重，否则倾到该角度就是掉高。
+        // 参考实现固定 60°（NetworkControl）/45°（SO3Control）；这里额外用推重比兜底，
+        // 因为设置面板允许用户任意修改 mass / maxThrust。
+        const weightN = massKg * G;
+        const Fmax = this.maxThrust * this.boostMultiplier * G / 1000 * 0.95;  // N
+        let tiltDeg = this.so3MaxTiltDeg;
+        if (Fmax > weightN) {
+            const feasibleDeg = Math.acos(weightN / Fmax) * RAD2DEG * 0.9;  // 留 10% 裕度
+            tiltDeg = Math.min(tiltDeg, feasibleDeg);
+        }
+        const Flim = limitTiltPreservingGravity(FdX, FdY, FdZ, weightN, tiltDeg);
+        FdX = Flim.x; FdY = Flim.y; FdZ = Flim.z;
 
-        // --- Orientation: yaw from velocity direction + stick yaw ---
-        if (Math.abs(this.vx) > 0.1 || Math.abs(this.vz) > 0.1) {
-            const velYaw = Math.atan2(-this.vx, -this.vz);
-            const targetYaw = velYaw + desYawRate * dt * DEG2RAD;
-            const yawErr = targetYaw - this.yaw * DEG2RAD;
-            const yawStep = clamp(yawErr * RAD2DEG * 5.0 * dt, -this._idealYawRate * dt, this._idealYawRate * dt);
-            this._applyBodyRotation(0, 1, 0, yawStep);
+        // ---- Attitude control ----
+        // b2d = F_d/|F_d| naturally. Let the attitude controller handle tilt;
+        // the Fmax cap and position error cap already bound the control authority.
+        const qDesired = this._so3DesiredAttitude(FdX, FdY, FdZ, yawDes);
+        const eR = this._so3AttitudeError(qDesired);
+
+        // Control torque in body frame: M = -K_R e_R - K_Ω Ω
+        // Body angular velocity: Ω = (pitchRate, yawRate, rollRate) in deg/s
+        // e_R x→body X→pitch, e_R y→body Y→yaw, e_R z→body Z→roll
+        const omegaX = this.pitchRate * DEG2RAD;  // rad/s around body X
+        const omegaY = this.yawRate * DEG2RAD;    // rad/s around body Y
+        const omegaZ = this.rollRate * DEG2RAD;   // rad/s around body Z
+        const torqueX = -this.so3KR * eR.x - this.so3KOmega * omegaX;
+        const torqueY = -this.so3KR * eR.y - this.so3KOmega * omegaY;
+        const torqueZ = -this.so3KR * eR.z - this.so3KOmega * omegaZ;
+
+        // Simplified rate-control: torque → desired angular rate
+        // body X torque → pitchRate, body Y torque → yawRate, body Z torque → rollRate
+        const kOmegaInv = 1.0 / Math.max(this.so3KOmega, 0.01);
+        const pitchDes  = clamp(torqueX * kOmegaInv * RAD2DEG, -this.so3MaxBodyRate, this.so3MaxBodyRate);
+        const yawRateDes = clamp(torqueY * kOmegaInv * RAD2DEG, -this.so3YawRate, this.so3YawRate);
+        const rollDes   = clamp(torqueZ * kOmegaInv * RAD2DEG, -this.so3MaxBodyRate, this.so3MaxBodyRate);
+
+        // Smooth rate tracking (same pattern as _controlFPV)
+        const rateSmooth = 1 - Math.exp(-15 * dt);
+        this.rollRate  += (rollDes   - this.rollRate)  * rateSmooth;
+        this.pitchRate += (pitchDes  - this.pitchRate) * rateSmooth;
+        this.yawRate   += (yawRateDes - this.yawRate)  * rateSmooth;
+
+        // Apply body-frame rotations
+        this._applyBodyRotation(1, 0, 0, this.pitchRate * dt);  // pitch around body X
+        this._applyBodyRotation(0, 0, 1, this.rollRate * dt);   // roll  around body Z
+        this._applyBodyRotation(0, 1, 0, this.yawRate * dt);    // yaw   around body Y
+
+        // Damp angular rates when errors are small
+        const eRmag = Math.sqrt(eR.x * eR.x + eR.y * eR.y + eR.z * eR.z);
+        if (eRmag < 0.02) {
+            const ad = Math.exp(-this.angularDrag * dt * 0.5);
+            this.rollRate *= ad;
+            this.pitchRate *= ad;
+            this.yawRate *= ad;
         }
 
-        // Derive speed
-        this.commandedGroundSpeed = Math.sqrt(desVxW * desVxW + desVzW * desVzW);
+        // ---- Thrust: 将 F_d 投影到实际 body Y 方向（非取模） ----
+        // 取模法 `thrust = |F_d|` 在稳态时正确（body Y ≈ F_d 方向），
+        // 但在瞬态（按下/松开方向键，姿态未跟踪到位）时：
+        // body Y 比 F_d 更垂直 → |F_d| 通过不够倾斜的 body Y 产生
+        // 过量垂直分量 → 无人机在倾斜/回正瞬间升高。
+        // 投影法：推力 = F_d · bodyY，自动补偿姿态瞬态，输出恒等于
+        // F_d 通过当前 body Y 产生的净力。
+        const thrustN = FdX * bodyUpX + FdY * bodyUpY + FdZ * bodyUpZ;
+        const cmdGf = Math.max(0, thrustN / G * 1000);
+        this.thrustOutput = clamp(cmdGf, 0, this.maxThrust * this.boostMultiplier);
+        this.throttlePercent = this.maxThrust > 0
+            ? Math.max(0, Math.min(1, this.thrustOutput / (this.maxThrust * this.boostMultiplier)))
+            : 0;
+
+        // ---- Display outputs ----
+        this.commandedGroundSpeed = Math.sqrt(refVX * refVX + refVZ * refVZ);
         this.targetGroundSpeed = maxSpd;
-        this.pilotGroundSpeedCommand = Math.sqrt(input.pitch * input.pitch + input.roll * input.roll) * maxSpd;
+        this.pilotGroundSpeedCommand = Math.sqrt(
+            (input.pitch || 0) * (input.pitch || 0) + (input.roll || 0) * (input.roll || 0)
+        ) * maxSpd;
     }
 
     // ---- Collision ----
