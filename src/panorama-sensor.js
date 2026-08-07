@@ -133,6 +133,8 @@ export class PanoramaSensor {
         this._depthGate = false;       // RuntimeRateGate: 防止深度请求堆积
         this._depthFpsTimer = 0;       // 深度帧率打点
         this._depthFpsCount = 0;
+        this._depthCycleSum = 0;         // 限速诊断：累计周期间隔
+        this._depthReqStart = 0;         // 当前请求发起时间
         this._yopoGeneration = 0;    // 取消/到达时递增，丢弃过期响应
         this._yopoPending = false;
         this._yopoGoal = null;
@@ -485,6 +487,7 @@ export class PanoramaSensor {
     async _requestDepth(canvas) {
         if (this._depthGate) return;
         if (!canvas) return;
+        this._depthReqStart = performance.now();
         this._depthGate = true;
         this.depthPending = true;
         this._setStatus('ready', 'inferring');
@@ -543,13 +546,15 @@ export class PanoramaSensor {
                 }
             }
 
-            // 帧率打点
+            // 帧率打点 + 限速诊断
             const now = performance.now();
             this._depthFpsCount++;
+            this._depthCycleSum += now - this._depthReqStart;
             if (now - this._depthFpsTimer > 2000) {
                 const fps = this._depthFpsCount / ((now - this._depthFpsTimer) / 1000);
-                console.log(`[depth] ${fps.toFixed(1)} Hz  plan_full=${usePlanFull}  latency=${Math.round(payload.latency_ms||0)}ms`);
-                this._depthFpsTimer = now; this._depthFpsCount = 0;
+                const avgCycle = this._depthCycleSum / Math.max(1, this._depthFpsCount);
+                console.log(`[depth] ${fps.toFixed(1)}Hz plan_full=${usePlanFull} srvLat=${Math.round(payload.latency_ms||0)}ms avgCycle=${avgCycle.toFixed(0)}ms`);
+                this._depthFpsTimer = now; this._depthFpsCount = 0; this._depthCycleSum = 0;
             }
             this.lastDepthTime = performance.now();
             if (this.onDepthResult) this.onDepthResult(payload.latency_ms);
