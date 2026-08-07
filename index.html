@@ -19,6 +19,9 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+    <meta http-equiv="Pragma" content="no-cache">
+    <meta http-equiv="Expires" content="0">
 	    <title>Google 3D Tiles Flight</title>
 	    <link id="cesium-widgets-css" href="/ThirdParty/Cesium/Widgets/widgets.css" rel="stylesheet"
 	          onerror="this.onerror=null;this.href='https://cesium.com/downloads/cesiumjs/releases/1.121/Build/Cesium/Widgets/widgets.css';">
@@ -739,6 +742,7 @@
                 <span class="panorama-status" id="panorama-depth-status">offline</span>
             </div>
             <canvas id="panorama-depth-canvas" width="384" height="192"></canvas>
+            <img id="panorama-depth-image" alt="DA360 panoramic depth" style="display:none">
         </div>
         <div class="depth-legend" aria-label="DA360 relative distance legend">
             <div class="depth-legend-row">
@@ -1085,6 +1089,6 @@
             });
         }());
     </script>
-    <script type="module" src="src/main.js?v=20260703-panorama-tile-idle"></script>
+    <script type="module" src="src/main.js?v=20260807-planfull"></script>
 </body>
 </html>

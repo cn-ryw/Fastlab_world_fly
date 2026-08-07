@@ -935,14 +935,15 @@ function updateFlight(dt) {
         console.log(`[pano] leveled=${useLeveled} method=${useLeveled && drone.getLeveledPanoramaTransform ? 'getLeveledPanoramaTransform' : 'getPanoramaTransform'}`);
         updateFlight._loggedPanoMode = true;
     }
-    panoramaSensor?.update(world, panoramaTransform, now);
-    // Update YOPO pose for planning (use fixed yaw if SO3 lock is active)
+    // 位姿必须在 panorama update 之前设置——_requestDepth 在 update 内触发
+    // plan_full 需要 _yopoGoal && _yopoPose 同时非空才走一次调用
     if (panoramaSensor && drone) {
         panoramaSensor.setYopoPose(
             { x: drone.x, y: drone.y, z: drone.z, vx: drone.vx, vy: drone.vy, vz: drone.vz },
             drone.getFixedYaw ? drone.getFixedYaw() : drone.yaw
         );
     }
+    panoramaSensor?.update(world, panoramaTransform, now);
 
     // Flight log recording
     if (flightLogger?.recording) {

@@ -111,6 +111,7 @@ export class PanoramaSensor {
             this.depthCanvas.width = PANORAMA_WIDTH;
             this.depthCanvas.height = PANORAMA_HEIGHT;
         }
+        this.depthImg = document.getElementById('panorama-depth-image');  // plan_full JPEG 显示
         this.rgbStatusEl = document.getElementById('panorama-rgb-status');
         this.depthStatusEl = document.getElementById('panorama-depth-status');
         this.depthNearLabelEl = document.getElementById('panorama-depth-near-label');
@@ -479,122 +480,87 @@ export class PanoramaSensor {
         });
     }
 
+    /** 统一请求入口：有 YOPO 目标时走 /yopo/plan_full（一次 JPEG → DA360+YOPO+深度），
+     *  无目标时走 /depth（仅 DA360+深度显示）。消除两段式双 HTTP 往返。 */
     async _requestDepth(canvas) {
-        // RuntimeRateGate：上一次深度请求未返回时跳过本轮
-        if (this._depthGate) { console.log('[depth-gate] skipped'); return; }
-        if (!canvas) { console.log('[depth] no canvas'); return; }
+        if (this._depthGate) return;
+        if (!canvas) return;
         this._depthGate = true;
         this.depthPending = true;
         this._setStatus('ready', 'inferring');
-        const controller = new AbortController();
-        const timeout = window.setTimeout(() => controller.abort(), DA360_TIMEOUT_MS);
+        const usePlanFull = !!(this._yopoGoal && this._yopoPose);
         const started = performance.now();
 
+        const uploadCanvas = this._depthUploadCanvas(canvas);
+        const blob = await this._canvasToJpegBlob(uploadCanvas);
+        if (!blob) { this._depthGate = false; this.depthPending = false; return; }
+
+        const controller = new AbortController();
+        const timeout = window.setTimeout(() => controller.abort(), DA360_TIMEOUT_MS);
+
         try {
-            const uploadCanvas = this._depthUploadCanvas(canvas);
-            const blob = await this._canvasToJpegBlob(uploadCanvas);
-            const headers = {};
-            let body;
-            if (blob) {
-                headers['Content-Type'] = blob.type || 'image/jpeg';
+            let url, body, headers;
+            if (usePlanFull) {
+                // 一次调用：DA360 → YOPO → 返回 endstate + depth_image
+                const pose = this._yopoPose, goal = this._yopoGoal, yaw = this._yopoYaw;
+                const qs = [`px=${pose.x}`,`py=${pose.y}`,`pz=${pose.z}`,
+                           `gx=${goal.x}`,`gy=${goal.y}`,`gz=${goal.z}`,
+                           `vx=${pose.vx||0}`,`vy=${pose.vy||0}`,`vz=${pose.vz||0}`,
+                           `yaw=${yaw}`].join('&');
+                url = `${getYopoEndpoint()}?${qs}`;  // /yopo/plan_full
+                headers = { 'Content-Type': 'image/jpeg' };
                 body = blob;
             } else {
-                headers['Content-Type'] = 'application/json';
-                body = JSON.stringify({ image: uploadCanvas.toDataURL('image/jpeg', PANORAMA_JPEG_QUALITY) });
+                url = this.endpoint;  // /depth
+                headers = { 'Content-Type': blob.type || 'image/jpeg' };
+                body = blob;
             }
-            const response = await fetch(this.endpoint, {
-                method: 'POST',
-                headers,
-                body,
-                signal: controller.signal,
-            });
-            if (!response.ok) {
-                throw new Error(`DA360 HTTP ${response.status}`);
-            }
+
+            const response = await fetch(url, { method: 'POST', headers, body, signal: controller.signal });
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
             const payload = await response.json();
-            if (!payload || !payload.depth_array) {
-                throw new Error('DA360 response missing depth_array');
+
+            if (usePlanFull) {
+                // plan_full 响应：endstate + depth_image JPEG（~6KB，原项目做法）
+                if (payload.depth_image && this.depthImg) {
+                    this.depthImg.src = payload.depth_image;
+                    this.hasDepth = true;
+                    this._updateDepthDisplay();
+                }
+                if (payload.endstate && this.onYopoResult) {
+                    this.onYopoResult(payload.endstate, payload.traj_time);
+                    if (this.onYopoLatency) this.onYopoLatency(payload.latency_ms);
+                }
+            } else {
+                // /depth 响应：depth_array → Canvas 直绘
+                if (payload.depth_array) {
+                    this._lastDepthArray = payload.depth_array;
+                    this._renderDepthToCanvas(payload.depth_array);
+                    this.hasDepth = true;
+                    this._updateDepthDisplay();
+                }
             }
-            // 缓存深度数组，后续 _requestYopoPlan 直通 /yopo/plan，不重新跑 DA360
-            // 深度显示：Canvas 直绘（不走 JPEG 编解码）
-            if (payload.depth_array) {
-                this._lastDepthArray = payload.depth_array;
-                this._renderDepthToCanvas(payload.depth_array);
-                this.hasDepth = true;
-                this._updateDepthDisplay();
-            }
-            // YOPO 规划：有目标时每帧深度触发一次，与显示解耦
-            this._requestYopoPlan();
-            // 帧率打点：每 2 秒打印一次
+
+            // 帧率打点
             const now = performance.now();
             this._depthFpsCount++;
             if (now - this._depthFpsTimer > 2000) {
                 const fps = this._depthFpsCount / ((now - this._depthFpsTimer) / 1000);
-                console.log(`[depth] ${fps.toFixed(1)} Hz  latency=${Math.round(payload.latency_ms || 0)}ms  gate=${this._depthGate}`);
-                this._depthFpsTimer = now;
-                this._depthFpsCount = 0;
+                console.log(`[depth] ${fps.toFixed(1)} Hz  plan_full=${usePlanFull}  latency=${Math.round(payload.latency_ms||0)}ms`);
+                this._depthFpsTimer = now; this._depthFpsCount = 0;
             }
-
-            this._setDepthLegend(payload.depth_scale);
             this.lastDepthTime = performance.now();
-            this._depthLatency = Number.isFinite(payload.latency_ms)
-                ? `${Math.round(payload.latency_ms)}ms`
-                : `${Math.round(this.lastDepthTime - started)}ms`;
             if (this.onDepthResult) this.onDepthResult(payload.latency_ms);
         } catch (error) {
-            reportUserError('DA360 depth request failed', error, {
-                key: 'da360-depth-request',
-                intervalMs: 3000,
+            reportUserError('DA360/YOPO request failed', error, {
+                key: 'da360-depth-request', intervalMs: 3000,
             });
             this.lastDepthTime = performance.now();
             this._setStatus('ready', shortError(error));
         } finally {
             window.clearTimeout(timeout);
             this.depthPending = false;
-            this._depthGate = false;  // 释放漏桶，允许下一帧发起请求
-        }
-    }
-
-    /** 将 /depth 返回的 depth_array 直通 /yopo/plan，避免二次 DA360 推理。 */
-    async _requestYopoPlan() {
-        if (this._yopoPending || !this._yopoGoal || !this._yopoPose || !this._lastDepthArray) return;
-        this._yopoPending = true;
-        const gen = this._yopoGeneration;  // 快照，用于检测请求发出后目标是否被重置
-        const goal = this._yopoGoal;
-        const pose = this._yopoPose;
-        const yaw = this._yopoYaw;
-
-        try {
-            const controller = new AbortController();
-            const timeout = setTimeout(() => controller.abort(), 15000);
-            // 不发送 depth_array —— 服务端从 /depth 缓存中取，省 ~1.4MB JSON 序列化
-            const resp = await fetch(getYopoPlanEndpoint(), {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    pose: { x: pose.x, y: pose.y, z: pose.z },
-                    goal: { x: goal.x, y: goal.y, z: goal.z },
-                    vel:  { vx: pose.vx || 0, vy: pose.vy || 0, vz: pose.vz || 0 },
-                    yaw:  yaw,
-                }),
-                signal: controller.signal,
-            });
-            clearTimeout(timeout);
-            if (!resp.ok) throw new Error(`YOPO HTTP ${resp.status}`);
-            const payload = await resp.json();
-            // 守卫：若请求在途期间目标被重置（取消/到达/设新目标），丢弃过期响应
-            if (gen !== this._yopoGeneration) return;
-            if (payload.endstate && this.onYopoResult) {
-                this.onYopoResult(payload.endstate, payload.traj_time);
-                if (this.onYopoLatency) this.onYopoLatency(payload.latency_ms);
-            }
-        } catch (error) {
-            reportUserError('YOPO planning failed', error, {
-                key: 'yopo-plan',
-                intervalMs: 5000,
-            });
-        } finally {
-            this._yopoPending = false;
+            this._depthGate = false;
         }
     }
 

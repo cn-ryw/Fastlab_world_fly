@@ -172,19 +172,21 @@ def yopo_plan_full():
         started = time.time()
 
         # 1. Decode JPEG → DA360 depth
+        t0 = time.time()
         if request.content_type and "image/jpeg" in request.content_type:
             image = Image.open(io.BytesIO(request.get_data())).convert("RGB")
         else:
             image = decode_request_image(request)
 
-        # 标定接入点：当你拿到有效的 (a,b) 后，把下面这行从 da360_runner.infer(image)
-        # 改为 da360_runner.infer_metric(image)。infer_metric 会先走 infer_raw()
-        # 拿原始 pred_disp，再查 DA360_DEPTH_CALIB_PATH 指向的 JSON 文件取 (a,b)，
-        # 做 1/z = a·pred_disp + b 得到米制深度。（文件不存在时自动回退到 infer 行为。）
-        # 验证方式：同一条街谷的同一个目标，标定前后的到达时间 / 轨迹平滑度对比。
         pred_depth = da360_runner.infer(image)
+        t1 = time.time()
 
-        # 2. Extract pose + goal from headers/query params
+        # 生成小 JPEG 深度图供前端显示（原项目做法，~6KB，不塞 1.3MB depth_array）
+        from da360_server import depth_to_color, encode_image, env_int
+        colored, _ds = depth_to_color(pred_depth)
+        depth_jpeg = encode_image(colored, "jpeg", env_int("DA360_JPEG_QUALITY", 72))
+
+        # 2. Extract pose + goal from query params
         pose_x = float(request.args.get("px", request.headers.get("X-Pose-X", 0)))
         pose_y = float(request.args.get("py", request.headers.get("X-Pose-Y", 2)))
         pose_z = float(request.args.get("pz", request.headers.get("X-Pose-Z", 0)))
@@ -196,7 +198,7 @@ def yopo_plan_full():
         vel_vz = float(request.args.get("vz", request.headers.get("X-Vel-Z", 0)))
         drone_yaw = float(request.args.get("yaw", request.headers.get("X-Yaw", 0)))
 
-        # 3. YOPO inference (serialized by yopo lock for thread safety)
+        # 3. YOPO inference
         with yopo_runner.lock:
             endstate, score, traj_time = yopo_runner.infer(
                 depth_arr=pred_depth,
@@ -206,13 +208,17 @@ def yopo_plan_full():
                 goal=np.array([goal_x, goal_y, goal_z], dtype=np.float32),
                 yaw=drone_yaw,
             )
-        total_ms = (time.time() - started) * 1000.0
-        return jsonify({
+        t2 = time.time()
+        resp = jsonify({
             "endstate": endstate.tolist(),
             "score": float(score),
             "traj_time": traj_time,
-            "latency_ms": total_ms,
+            "depth_image": depth_jpeg,
+            "latency_ms": (time.time() - started) * 1000.0,
         })
+        t3 = time.time()
+        print(f"[plan_full] da360={1000*(t1-t0):.0f}ms color+jpeg={1000*(t2-t1):.0f}ms yopo+json={1000*(t3-t2):.0f}ms total={1000*(t3-started):.0f}ms", flush=True)
+        return resp
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500
 
@@ -251,11 +257,11 @@ def main():
     global _depth_cache_lock
     _depth_cache_lock = _thr.Lock()
     print(f"[combined] YOPO ready on {yopo_runner.device}")
-    print(f"[combined] DA360 ready: {da360_runner.model_name} on {da360_runner.device}")
-    print(f"[combined] YOPO ready on {yopo_runner.device}")
 
-    print(f"[combined] Starting on 0.0.0.0:{args.port}")
-    app.run(host=args.host, port=args.port, debug=args.debug, threaded=True)
+    print(f"[combined] Starting on 0.0.0.0:{args.port} (single-threaded)")
+    # threaded=False：跨线程 CUDA 首次推理慢 8 倍（~25ms→~220ms）。
+    # 前端 gate 已保证请求串行，多线程无性能收益。
+    app.run(host=args.host, port=args.port, debug=args.debug, threaded=False)
 
 
 if __name__ == "__main__":

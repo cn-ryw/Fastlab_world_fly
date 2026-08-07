@@ -12,6 +12,7 @@ unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY
 export __NV_PRIME_RENDER_OFFLOAD=1
 export __GLX_VENDOR_LIBRARY_NAME=nvidia
 export MOZ_X11_EGL=0
+export LIBGL_ALWAYS_SOFTWARE=0
 
-echo "Launching Firefox (NVIDIA GPU) → ${URL}"
-firefox "${URL}" &
+echo "Launching Firefox (NVIDIA GPU + 隐私窗口, 无模块缓存) → ${URL}"
+firefox --private-window "${URL}" &
