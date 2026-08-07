@@ -24,10 +24,9 @@ const DA360_UPLOAD_WIDTH = Math.round(urlNumber('da360UploadWidth', 0, 0, 5760))
 const DA360_UPLOAD_HEIGHT = Math.round(urlNumber('da360UploadHeight', 0, 0, 2880));
 const PANORAMA_WIDTH = evenNumber(urlNumber('panoWidth', 384, 280, 5760));
 const PANORAMA_HEIGHT = evenNumber(urlNumber('panoHeight', Math.round(PANORAMA_WIDTH / 2), 140, 2880));
-// 每面渲染分辨率：ERP 384px / 360° × 130°(每面FOV) ≈ 139 px。
-// 144 刚好匹配输出（1.04×），256 是 1.84× 冗余——对 DA360+YOPO 无感知增益，
-// 但会浪费 68% 的每面 GPU 填充率。
-const PANORAMA_FACE_SIZE = Math.round(urlNumber('panoFace', 144, 96, 2048));
+// 每面渲染分辨率：96 匹配 384px ERP 输出需求（384/360×130≈139），
+// 优先释放主线程以提升深度帧率，DA360 对此分辨率差异不敏感。
+const PANORAMA_FACE_SIZE = Math.round(urlNumber('panoFace', 96, 64, 2048));
 const PANORAMA_VERTICAL_FOV = urlNumber('panoVfov', 180, 30, 180);
 const PANORAMA_JPEG_QUALITY = urlNumber('panoJpeg', 0.74, 0.35, 0.95);
 const PANORAMA_FACE_FOV = urlNumber('panoFaceFov', 130, 90, 170);
