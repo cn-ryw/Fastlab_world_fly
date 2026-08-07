@@ -479,8 +479,9 @@ export class CesiumWorld {
             shouldAnimate: true,
             globe: false,
             skyAtmosphere: new Cesium.SkyAtmosphere(),
-            requestRenderMode: false,
-            targetFrameRate: 60,
+            requestRenderMode: true,    // 手动控制渲染，释放 CPU 主线程
+            // GPU仅7%，瓶颈在CPU主线程。targetFrameRate 限制 Cesium 渲染频率以释放主线程
+            targetFrameRate: 20,
             useBrowserRecommendedResolution: true,
             orderIndependentTranslucency: false,
             contextOptions: {
