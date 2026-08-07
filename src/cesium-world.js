@@ -418,10 +418,10 @@ export class CesiumWorld {
             2048
         ));
         this.panoramaTileSSE = clampNumber(
-            urlNumber('panoramaTileSse', options.panoramaTileSSE ?? 96),
+            urlNumber('panoramaTileSse', options.panoramaTileSSE ?? 512),
             4,
-            128,
-            32
+            1024,
+            512
         );
         this.Cesium = null;
         this.viewer = null;
