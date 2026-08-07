@@ -222,25 +222,22 @@ export class PanoramaSensor {
         this._applyVisibility();
         if (!this._shouldRun()) return;
 
-        // B6 fix: stuck capture watchdog — force-reset if captureAnyway is on
+        // 深度请求与全景采集解耦——用自己的定时器，不依赖采集状态。
+        // 每帧检查，服务器 35ms 下理论可达 ~28Hz，gate 防止堆积。
+        if (this.hasRgb && !this.depthPending && now - this.lastDepthTime >= DEPTH_INTERVAL_MS) {
+            this._requestDepth(this.rgbCanvas);
+        }
+
+        // 全景采集：catch stuck captures, skip if busy
         if (this.capturing) {
             const stuckMs = PANORAMA_FACE_TILE_TIMEOUT_MS * 6 + 500;
             if (PANORAMA_CAPTURE_ANYWAY && now - this.lastCaptureStartTime > stuckMs) {
                 this.capturing = false;
             } else {
-                // B7: depth still triggers independently even while capture is stuck
-                if (this.hasRgb && !this.depthPending && now - this.lastDepthTime >= DEPTH_INTERVAL_MS) {
-                    this._requestDepth(this.rgbCanvas);
-                }
                 return;
             }
         }
-        if (this.capturing || now - this.lastCaptureStartTime < CAPTURE_INTERVAL_MS) return;
-
-        // B7: also trigger depth at normal update rate when no capture is active
-        if (this.hasRgb && !this.depthPending && now - this.lastDepthTime >= DEPTH_INTERVAL_MS) {
-            this._requestDepth(this.rgbCanvas);
-        }
+        if (now - this.lastCaptureStartTime < CAPTURE_INTERVAL_MS) return;
         this._capture(world, transform);
     }
 
