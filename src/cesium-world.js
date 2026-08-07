@@ -479,9 +479,11 @@ export class CesiumWorld {
             shouldAnimate: true,
             globe: false,
             skyAtmosphere: new Cesium.SkyAtmosphere(),
-            requestRenderMode: true,    // 手动控制渲染，释放 CPU 主线程
-            // GPU仅7%，瓶颈在CPU主线程。targetFrameRate 限制 Cesium 渲染频率以释放主线程
+            requestRenderMode: true,    // Cesium 社区 #1 CPU 优化：空闲时 0% CPU
+            // GPU仅7%，瓶颈在主线程 Cesium 场景遍历。降目标帧率 + 降分辨率双重释压
             targetFrameRate: 20,
+            // resolutionScale 降低渲染像素数，同时减少 CPU draw-call 准备开销
+            resolutionScale: 0.7,
             useBrowserRecommendedResolution: true,
             orderIndependentTranslucency: false,
             contextOptions: {
@@ -642,6 +644,9 @@ export class CesiumWorld {
         setIfPresent('foveatedScreenSpaceError', true);
         setIfPresent('foveatedConeSize', flightMode ? 0.2 : 0.28);
         setIfPresent('foveatedMinimumScreenSpaceErrorRelaxation', flightMode ? 4 : 2);
+        setIfPresent('dynamicScreenSpaceError', true);               // 远处自动降 LOD
+        setIfPresent('dynamicScreenSpaceErrorDensity', 0.2);
+        setIfPresent('dynamicScreenSpaceErrorFactor', 4.0);
         setIfPresent('foveatedTimeDelay', flightMode ? 0.08 : 0.15);
         setIfPresent('dynamicScreenSpaceError', true);
         setIfPresent('dynamicScreenSpaceErrorDensity', flightMode ? 0.0035 : 0.0025);
