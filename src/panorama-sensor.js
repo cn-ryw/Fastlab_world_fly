@@ -535,10 +535,9 @@ export class PanoramaSensor {
                     if (this.onYopoLatency) this.onYopoLatency(payload.latency_ms);
                 }
             } else {
-                // /depth 响应：depth_array → Canvas 直绘
-                if (payload.depth_array) {
-                    this._lastDepthArray = payload.depth_array;
-                    this._renderDepthToCanvas(payload.depth_array);
+                // /depth 响应：depth_image JPEG → <img> 显示（与 plan_full 统一格式）
+                if (payload.depth_image && this.depthImg) {
+                    this.depthImg.src = payload.depth_image;
                     this.hasDepth = true;
                     this._updateDepthDisplay();
                 }

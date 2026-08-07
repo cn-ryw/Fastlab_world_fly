@@ -86,15 +86,12 @@ def da360_depth():
             with _depth_cache_lock:
                 _depth_cache["data"] = pred_depth
                 _depth_cache["ts"] = time.time()
-        if latency_ms > 100:
-            print(f"[depth] {latency_ms:.0f}ms  model={da360_runner.width}x{da360_runner.height}", flush=True)
+        # 生成小 JPEG（~6KB）替代 1.3MB depth_array JSON，对齐 plan_full 响应格式
+        colored, _ds = depth_to_color(pred_depth)
+        depth_jpeg = encode_image(colored, "jpeg", env_int("DA360_JPEG_QUALITY", 72))
         return jsonify({
-            "depth_array": pred_depth.tolist(),
+            "depth_image": depth_jpeg,
             "latency_ms": latency_ms,
-            "model": da360_runner.model_name,
-            "device": str(da360_runner.device),
-            "width": da360_runner.width,
-            "height": da360_runner.height,
         })
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
