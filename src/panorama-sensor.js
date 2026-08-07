@@ -13,8 +13,8 @@ function evenNumber(value) {
     return n % 2 === 0 ? n : n + 1;
 }
 
-// 全景采集间隔：每面 6 次同步 GPU 渲染，RTX 5070 Ti 上 30 Hz 可平稳完成
-const CAPTURE_INTERVAL_MS = urlNumber('panoMs', 33, 16, 10000);
+// 全景采集间隔：plan_full 已降至 ~35ms，采集对齐即可达 20+ Hz
+const CAPTURE_INTERVAL_MS = urlNumber('panoMs', 20, 16, 10000);
 // 深度请求间隔：50Hz 名义，由 _depthGate 非阻塞漏桶调节实际吞吐
 const DEPTH_INTERVAL_MS = urlNumber('depthMs', 20, 16, 10000);
 // DA360 超时：含冷启动首次推理裕度
@@ -488,7 +488,9 @@ export class PanoramaSensor {
         this._depthGate = true;
         this.depthPending = true;
         this._setStatus('ready', 'inferring');
-        const usePlanFull = !!(this._yopoGoal && this._yopoPose);
+        // snapshot 必须在 await 之前——await 期间 _yopoGoal/_yopoPose 可能被 resetYopoGoal 清掉
+        const yopoGoal = this._yopoGoal, yopoPose = this._yopoPose, yopoYaw = this._yopoYaw;
+        const usePlanFull = !!(yopoGoal && yopoPose);
         const started = performance.now();
 
         const uploadCanvas = this._depthUploadCanvas(canvas);
@@ -502,7 +504,7 @@ export class PanoramaSensor {
             let url, body, headers;
             if (usePlanFull) {
                 // 一次调用：DA360 → YOPO → 返回 endstate + depth_image
-                const pose = this._yopoPose, goal = this._yopoGoal, yaw = this._yopoYaw;
+                const pose = yopoPose, goal = yopoGoal, yaw = yopoYaw;
                 const qs = [`px=${pose.x}`,`py=${pose.y}`,`pz=${pose.z}`,
                            `gx=${goal.x}`,`gy=${goal.y}`,`gz=${goal.z}`,
                            `vx=${pose.vx||0}`,`vy=${pose.vy||0}`,`vz=${pose.vz||0}`,
