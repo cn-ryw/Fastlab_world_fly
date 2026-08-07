@@ -493,8 +493,10 @@ export class PanoramaSensor {
         const usePlanFull = !!(yopoGoal && yopoPose);
         const started = performance.now();
 
+        const tA = performance.now();
         const uploadCanvas = this._depthUploadCanvas(canvas);
         const blob = await this._canvasToJpegBlob(uploadCanvas);
+        const tB = performance.now();
         if (!blob) { this._depthGate = false; this.depthPending = false; return; }
 
         const controller = new AbortController();
@@ -550,7 +552,7 @@ export class PanoramaSensor {
             if (now - this._depthFpsTimer > 2000) {
                 const fps = this._depthFpsCount / ((now - this._depthFpsTimer) / 1000);
                 const avgCycle = this._depthCycleSum / Math.max(1, this._depthFpsCount);
-                console.log(`[depth] ${fps.toFixed(1)}Hz plan_full=${usePlanFull} srvLat=${Math.round(payload.latency_ms||0)}ms avgCycle=${avgCycle.toFixed(0)}ms`);
+                console.log(`[depth] ${fps.toFixed(1)}Hz plan_full=${usePlanFull} srvLat=${Math.round(payload.latency_ms||0)}ms avgCycle=${avgCycle.toFixed(0)}ms prepare=${Math.round(tB-tA)}ms`);
                 this._depthFpsTimer = now; this._depthFpsCount = 0; this._depthCycleSum = 0;
             }
             this.lastDepthTime = performance.now();
