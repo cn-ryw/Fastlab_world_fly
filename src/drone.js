@@ -43,7 +43,16 @@ const DRONE_BOOST_MULTIPLIER = 2.0;
 const FPV_BOOST_MULTIPLIER = 1.7;
 const DRONE_MAX_SUPPORTED_SPEED = 300 / 3.6; // 300 km/h in m/s
 const DRONE_MAX_SUPPORTED_VSPEED = 25;
-const ARRIVAL_DISTANCE_M = 9.0;  // YOPO radio_range，格点离散误差下限
+// Navigation completion is a product-level tolerance, not the YOPO lattice
+// radio_range. The external YOPO reference uses 4 m; using radio_range (9 m)
+// here caused a vehicle travelling at 5 m/s to be declared arrived at 8.94 m.
+export const ARRIVAL_DISTANCE_M = 4.0;
+const YOPO_DEFAULT_TRAJ_TIME_S = 1.125;
+const YOPO_MIN_TRAJ_TIME_S = 0.05;
+const YOPO_MAX_TRAJ_TIME_S = 5.0;
+const YOPO_MAX_ENDPOINT_DISTANCE_M = 120.0;
+const YOPO_MAX_ENDPOINT_SPEED_MPS = 50.0;
+const YOPO_MAX_ENDPOINT_ACCEL_MPS2 = 80.0;
 
 // Reusable PlayCanvas math objects (avoid per-frame allocation)
 const _quat  = new pc.Quat();
@@ -115,6 +124,59 @@ export function limitTiltPreservingGravity(FdX, FdY, FdZ, weightN, maxTiltDeg) {
     const s = (-B + Math.sqrt(disc)) / (2 * A);
     if (!Number.isFinite(s) || s < 0) return hover;
     return { x: s * fX, y: s * fY + weightN, z: s * fZ };
+}
+
+/**
+ * Convert the horizontal projection of body +Z (backward) to this simulator's
+ * yaw convention: yaw=0 faces local -Z and positive yaw turns toward -X.
+ */
+export function leveledYawFromBackward(bx, bz) {
+    const hLen = Math.hypot(bx, bz);
+    const fwdX = hLen > 1e-6 ? -bx / hLen : 0;
+    const fwdZ = hLen > 1e-6 ? -bz / hLen : -1;
+    return {
+        fwdX,
+        fwdZ,
+        yawRad: Math.atan2(-fwdX, -fwdZ),
+    };
+}
+
+/** Validate the public axis-major YOPO trajectory contract before mutation. */
+export function validateYopoTrajectory(endpoint, trajTime, currentPosition = { x: 0, y: 0, z: 0 }) {
+    if (!Array.isArray(endpoint) && !ArrayBuffer.isView(endpoint)) {
+        return { valid: false, reason: 'endstate must be an array' };
+    }
+    if (endpoint.length !== 9) {
+        return { valid: false, reason: `endstate must contain 9 values, got ${endpoint.length}` };
+    }
+    const values = Array.from(endpoint, Number);
+    if (!values.every(Number.isFinite)) {
+        return { valid: false, reason: 'endstate contains a non-finite value' };
+    }
+
+    const duration = trajTime == null ? YOPO_DEFAULT_TRAJ_TIME_S : Number(trajTime);
+    if (!Number.isFinite(duration) || duration < YOPO_MIN_TRAJ_TIME_S || duration > YOPO_MAX_TRAJ_TIME_S) {
+        return { valid: false, reason: `trajTime ${trajTime} is outside ${YOPO_MIN_TRAJ_TIME_S}-${YOPO_MAX_TRAJ_TIME_S}s` };
+    }
+
+    const positions = [values[0], values[3], values[6]];
+    const velocities = [values[1], values[4], values[7]];
+    const accelerations = [values[2], values[5], values[8]];
+    const displacement = Math.hypot(
+        positions[0] - Number(currentPosition.x || 0),
+        positions[1] - Number(currentPosition.y || 0),
+        positions[2] - Number(currentPosition.z || 0),
+    );
+    if (displacement > YOPO_MAX_ENDPOINT_DISTANCE_M) {
+        return { valid: false, reason: `endpoint displacement ${displacement.toFixed(2)}m exceeds ${YOPO_MAX_ENDPOINT_DISTANCE_M}m` };
+    }
+    if (Math.hypot(...velocities) > YOPO_MAX_ENDPOINT_SPEED_MPS) {
+        return { valid: false, reason: `endpoint speed exceeds ${YOPO_MAX_ENDPOINT_SPEED_MPS}m/s` };
+    }
+    if (Math.hypot(...accelerations) > YOPO_MAX_ENDPOINT_ACCEL_MPS2) {
+        return { valid: false, reason: `endpoint acceleration exceeds ${YOPO_MAX_ENDPOINT_ACCEL_MPS2}m/s²` };
+    }
+    return { valid: true, values, trajTime: duration };
 }
 
 export class Drone {
@@ -244,6 +306,8 @@ export class Drone {
         this._so3StickYaw = null;    // accumulated yaw from A/D keys in SO3 stick mode
         this._so3AltitudeRef = null; // fixed altitude reference for goal mode
         this._yopoPlanTriggered = false; // YOPO 轨迹已下发后才允许到达判定
+        this._navigationState = 'idle';
+        this._navigationTransitionReason = null;
 
         // ---- SO3 geometric controller gains (verified in YOPO_360_v15) ----
         // YOPO uses: kx=(5.7,5.7,6.2), kv=(3.4,3.4,4.0), kR=(1.5,1.5,1.0), kOm=(0.13,0.13,0.1)
@@ -267,6 +331,8 @@ export class Drone {
     setIdealGoal(goal) {
         this._idealGoal = goal ? { x: goal.x, y: goal.y, z: goal.z, yaw: goal.yaw } : null;
         this._so3AltitudeRef = goal ? goal.y : null;  // lock altitude
+        this._navigationState = goal ? 'active' : 'idle';
+        this._navigationTransitionReason = goal ? 'goal-set' : 'goal-cleared';
     }
 
     clearIdealGoal() { this._idealGoal = null; }
@@ -280,6 +346,8 @@ export class Drone {
         this._yopoDecayRef = null;
         this._yopoDecayTimer = 0;
         this._yopoTrackerTime = 0;
+        this._navigationState = 'cancelled';
+        this._navigationTransitionReason = 'cancelled';
         // Set current position as hold reference so drone stops immediately
         this.vx = 0; this.vy = 0; this.vz = 0;
     }
@@ -292,7 +360,22 @@ export class Drone {
         // 切勿改成量主序 [px,py,pz, vx,vy,vz, ...]：那会把高度值填进 X 轴的
         // 终端速度、把加速度填进 Z 轴的终点位置，产生发散的参考轨迹。
         // 契约由 tests/test_yopo_endstate_layout.js 锁定。
-        const trajT = trajTime || 1.125;
+        const checked = validateYopoTrajectory(endpoint, trajTime, {
+            x: this.x,
+            y: this.y,
+            z: this.z,
+        });
+        if (!checked.valid) {
+            const now = globalThis.performance?.now?.() ?? Date.now();
+            if (this._lastYopoRejectReason !== checked.reason || now - (this._lastYopoRejectAt || 0) > 1000) {
+                console.warn(`[YOPO] rejected trajectory: ${checked.reason}`);
+                this._lastYopoRejectReason = checked.reason;
+                this._lastYopoRejectAt = now;
+            }
+            return false;
+        }
+        endpoint = checked.values;
+        const trajT = checked.trajTime;
         // 轨迹交接：若旧轨迹仍活跃，取当前加速度做新轨迹初值，避免
         // refAcc 跳变导致 _controlSO3 的姿态咯噔（"断断续续"的直接来源）。
         const ax0 = this._yopoPolyX ? this._yopoPolyX.acceleration(Math.min(this._yopoTrackerTime, this._yopoTrajTime)) : 0;
@@ -307,8 +390,10 @@ export class Drone {
         this._yopoGoalYaw = this.yaw;
         this._yopoDecayRef = null;  // clear decay from previous trajectory
         this._yopoPlanTriggered = true;  // 标记已有轨迹到达，允许到达判定
+        this._navigationState = 'active';
         // 不清除 _idealGoal —— 目标是持久导航参考，轨迹是对它的连续逼近。
         // 到达判断在 decay 结束时根据实际距离决定，不是在轨迹开始时就丢弃目标。
+        return true;
     }
 
     setSpawnPoint(x, y, z) {
@@ -326,6 +411,8 @@ export class Drone {
         this._yopoDecayRef = null;
         this._yopoDecayTimer = 0;
         this._yopoPlanTriggered = false;
+        this._navigationState = 'idle';
+        this._navigationTransitionReason = 'reset';
         this._so3FixedYaw = null;
         this._so3StickYaw = null;
 
@@ -426,15 +513,15 @@ export class Drone {
         this._yopoDecayRef = null; this._yopoDecayTimer = 0;
         this._idealGoal = null;
         this._so3AltitudeRef = null;
+        this._navigationState = 'arrived';
+        this._navigationTransitionReason = 'arrival-distance';
     }
 
     update(dt, input, collisionProvider) {
         dt = Math.min(dt, 0.05);
 
-        // 0a. 到达判定——对齐参考 test_yopo_ros.py:309-316。
-        // YOPO 格点间距 ~2.3m（radio_range=9m, 12 水平角），单条轨迹无法
-        // 精确落在任意 goal 上。放宽到 radio_range=9m 容差，补偿格点离散误差。
-        // radio_range 不可修改（训练参数绑定在 checkpoint 中）。
+        // 0a. 到达判定。radio_range=9m 是网络格点范围，不是到达容差。
+        // 到达半径与外部 YOPO 参考实现统一为 4m。
         if (this._idealGoal) {
             const g = this._idealGoal;
             const d = Math.sqrt(
@@ -590,11 +677,7 @@ export class Drone {
         _mat4.getZ(_v3);  // body Z (backward) 在世界系中的方向
         const bx = _v3.x, bz = _v3.z;  // backward 的水平分量
         // leveled forward = -backward 的水平归一化方向
-        const hLen = Math.sqrt(bx * bx + bz * bz);
-        const fwdX = hLen > 1e-6 ? -bx / hLen : 0;
-        const fwdZ = hLen > 1e-6 ? -bz / hLen : -1;
-        // 从水平 forward 反算 yaw：forward=(sin(yaw), 0, cos(yaw)) at identity
-        const yawRad = Math.atan2(fwdX, fwdZ);
+        const { fwdX, fwdZ, yawRad } = leveledYawFromBackward(bx, bz);
         const halfYaw = yawRad * 0.5;
         const noseOffset = this.droneSize * 0.5;
 
@@ -627,6 +710,45 @@ export class Drone {
                 w: this.orientation.w
             }
         };
+    }
+
+    /**
+     * Immutable state snapshot for one YOPO observation. The observation
+     * origin follows the active polynomial reference while Poly5 construction
+     * continues to start from the actual vehicle position and velocity.
+     */
+    getYopoPlanningState() {
+        const actualState = {
+            position: Object.freeze({ x: this.x, y: this.y, z: this.z }),
+            velocity: Object.freeze({ x: this.vx, y: this.vy, z: this.vz }),
+        };
+        const activeRef = this._yopoPolyX
+            ? this._getYopoReference(Math.min(this._yopoTrackerTime, this._yopoTrajTime))
+            : null;
+        const referenceState = {
+            position: Object.freeze(activeRef
+                ? { x: activeRef.x, y: activeRef.y, z: activeRef.z }
+                : { x: this.x, y: this.y, z: this.z }),
+            velocity: Object.freeze(activeRef
+                ? { x: activeRef.vx, y: activeRef.vy, z: activeRef.vz }
+                : { x: this.vx, y: this.vy, z: this.vz }),
+            acceleration: Object.freeze(activeRef
+                ? { x: activeRef.ax, y: activeRef.ay, z: activeRef.az }
+                : { x: 0, y: 0, z: 0 }),
+        };
+        return Object.freeze({
+            actualState: Object.freeze(actualState),
+            referenceState: Object.freeze(referenceState),
+            yaw: this.getFixedYaw(),
+        });
+    }
+
+    consumeNavigationTransition() {
+        const transition = this._navigationTransitionReason
+            ? { state: this._navigationState, reason: this._navigationTransitionReason }
+            : null;
+        this._navigationTransitionReason = null;
+        return transition;
     }
 
     adjustCameraTilt(delta) {
@@ -739,15 +861,11 @@ export class Drone {
             this.rollRate = 0;
             this.yawRate = 0;
         }
-        // 离开 SO3 模式时清除 YOPO 轨迹状态——旧轨迹在新位置/新模式下无意义，
-        // 切回 SO3 时会在下一规划周期（~100ms）自动获得新轨迹。
-        // 不清 _idealGoal：目标是持久的，恢复 SO3 后应继续朝它飞。
+        // 离开 SO3 模式即结束本次导航会话。旧目标、轨迹与高度覆盖不能
+        // 在之后切回 SO3 时悄悄恢复；main.js 会消费 mode-exit 并同步清 UI。
         if (oldMode === 'so3' && newMode !== 'so3') {
-            this._yopoPolyX = this._yopoPolyY = this._yopoPolyZ = null;
-            this._yopoTrackerTime = 0;
-            this._yopoDecayRef = null;
-            this._yopoDecayTimer = 0;
-            this._yopoPlanTriggered = false;
+            this.cancelWaypoint();
+            this._navigationTransitionReason = 'mode-exit';
         }
         // Lock yaw on entering SO3 mode (like YOPO lock_yaw=True)
         if (newMode === 'so3') {
@@ -1302,8 +1420,7 @@ export class Drone {
                         (g.z - this.z) ** 2
                     );
                     if (d < this._arrivalDistanceM) {
-                        this._idealGoal = null;
-                        this._so3AltitudeRef = null;
+                        this._onArrival();
                     }
                 }
             }

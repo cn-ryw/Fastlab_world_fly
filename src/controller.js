@@ -42,7 +42,7 @@ const SETTINGS_IDS = [
     'pano-level-toggle', 'yaw-lock-toggle',
 ];
 
-const CONFIG_VERSION = 4;
+const CONFIG_VERSION = 5;
 const DEFAULT_EASY_MAX_SPEED = '83.333';
 const DEFAULT_EASY_MAX_VSPEED = '8';
 const DEFAULT_DRAG_AREA = '0.0015';
@@ -2132,6 +2132,15 @@ export class Controller {
             const savedThrust = Number(settings['phys-thrust']);
             if (!Number.isFinite(savedThrust) || savedThrust <= 1010) {
                 settings['phys-thrust'] = '2600';
+            }
+        }
+        // v5: restore the YOPO training vehicle radius. Only migrate the old
+        // shipped default (0.15 m); preserve an explicit user-tuned value.
+        if (version < 5 && config.settings && typeof config.settings === 'object') {
+            const settings = config.settings;
+            const savedRadius = Number(settings['phys-collision-radius']);
+            if (!Number.isFinite(savedRadius) || Math.abs(savedRadius - 0.15) < 1e-9) {
+                settings['phys-collision-radius'] = '0.6';
             }
         }
         config.configVersion = CONFIG_VERSION;

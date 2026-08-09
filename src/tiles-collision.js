@@ -84,17 +84,17 @@ export class TilesCollisionProvider {
             ? Math.hypot(velocity.x || 0, velocity.y || 0, velocity.z || 0)
             : 0;
 
-        if (this._canReuseNoHit(center, r, speed, now)) {
-            this.lastDebug = { colliding: false, skipped: true };
-            return null;
+        const reuseStaticNoHit = this._canReuseNoHit(center, r, speed, now);
+        // Never cache away continuous collision detection: a segment can cross
+        // a thin wall even when both endpoints are inside a cached no-hit area.
+        this._querySweptMotion(center, r, state, hits);
+        if (!reuseStaticNoHit) {
+            this._queryHeight(center, r, hits);
+            this._queryNeighborhood(center, r, hits, state);
         }
 
-        this._queryHeight(center, r, hits);
-        this._querySweptMotion(center, r, state, hits);
-        this._queryNeighborhood(center, r, hits, state);
-
         if (!hits.length) {
-            this.lastDebug = { colliding: false };
+            this.lastDebug = { colliding: false, skippedStatic: reuseStaticNoHit };
             this._lastNoHit = { x, y, z, radius: r, speed, time: now };
             return null;
         }

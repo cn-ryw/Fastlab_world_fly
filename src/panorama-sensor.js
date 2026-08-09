@@ -1,4 +1,5 @@
 import { reportUserError } from './error-report.js';
+import { PerceptionFrame, normalizePlanningState } from './perception-frame.js';
 
 function urlNumber(name, fallback, min, max) {
     const value = new URLSearchParams(window.location.search).get(name);
@@ -11,6 +12,30 @@ function urlNumber(name, fallback, min, max) {
 function evenNumber(value) {
     const n = Math.max(2, Math.round(value));
     return n % 2 === 0 ? n : n + 1;
+}
+
+function cloneCaptureTransform(transform, fallbackPosition = { x: 0, y: 0, z: 0 }) {
+    const source = transform || {};
+    const position = source.position || fallbackPosition;
+    const clone = {
+        position: { x: Number(position.x || 0), y: Number(position.y || 0), z: Number(position.z || 0) },
+    };
+    if (source.rotation) {
+        clone.rotation = {
+            x: Number(source.rotation.x || 0),
+            y: Number(source.rotation.y || 0),
+            z: Number(source.rotation.z || 0),
+        };
+    }
+    if (source.orientation) {
+        clone.orientation = {
+            x: Number(source.orientation.x || 0),
+            y: Number(source.orientation.y || 0),
+            z: Number(source.orientation.z || 0),
+            w: Number(source.orientation.w ?? 1),
+        };
+    }
+    return clone;
 }
 
 // 全景采集间隔：plan_full 已降至 ~35ms，采集对齐即可达 20+ Hz
@@ -93,6 +118,63 @@ function isDrawableImageSource(value) {
     return false;
 }
 
+function dataUrlToBlob(source, scope = globalThis) {
+    if (typeof source !== 'string' || !source.startsWith('data:')) return null;
+    const comma = source.indexOf(',');
+    if (comma < 0) throw new Error('invalid depth image data URL');
+    const metadata = source.slice(5, comma);
+    const encoded = source.slice(comma + 1);
+    const mimeType = metadata.split(';')[0] || 'image/jpeg';
+    let bytes;
+    if (metadata.split(';').includes('base64')) {
+        if (typeof scope.atob !== 'function') throw new Error('base64 decoder unavailable');
+        const binary = scope.atob(encoded);
+        bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    } else {
+        bytes = new TextEncoder().encode(decodeURIComponent(encoded));
+    }
+    const BlobCtor = scope.Blob || globalThis.Blob;
+    if (typeof BlobCtor !== 'function') throw new Error('Blob unavailable');
+    return new BlobCtor([bytes], { type: mimeType });
+}
+
+/** Decode a server-returned JPEG without relying on a hidden DOM image element. */
+export async function decodeDepthImageSource(source, scope = globalThis) {
+    if (typeof source !== 'string' || !source) throw new Error('depth image is empty');
+
+    if (typeof scope.createImageBitmap === 'function') {
+        const blob = dataUrlToBlob(source, scope);
+        if (blob) return scope.createImageBitmap(blob);
+    }
+
+    const ImageCtor = scope.Image;
+    if (typeof ImageCtor !== 'function') throw new Error('no image decoder available');
+    return new Promise((resolve, reject) => {
+        const image = new ImageCtor();
+        let settled = false;
+        const finish = (callback, value) => {
+            if (settled) return;
+            settled = true;
+            image.onload = null;
+            image.onerror = null;
+            callback(value);
+        };
+        image.onload = () => {
+            const width = Number(image.naturalWidth || image.width || 0);
+            const height = Number(image.naturalHeight || image.height || 0);
+            if (width <= 0 || height <= 0) {
+                finish(reject, new Error('decoded depth image has no pixels'));
+                return;
+            }
+            finish(resolve, image);
+        };
+        image.onerror = () => finish(reject, new Error('depth JPEG decode failed'));
+        image.decoding = 'async';
+        image.src = source;
+    });
+}
+
 function captureProgressStatus(result, hasRgb) {
     const faceIndex = result && Number.isFinite(result.faceIndex) ? result.faceIndex : 0;
     const faceCount = result && Number.isFinite(result.faces) ? result.faces : 6;
@@ -110,7 +192,6 @@ export class PanoramaSensor {
             this.depthCanvas.width = PANORAMA_WIDTH;
             this.depthCanvas.height = PANORAMA_HEIGHT;
         }
-        this.depthImg = document.getElementById('panorama-depth-image');  // plan_full JPEG 显示
         this.rgbStatusEl = document.getElementById('panorama-rgb-status');
         this.depthStatusEl = document.getElementById('panorama-depth-status');
         this.depthNearLabelEl = document.getElementById('panorama-depth-near-label');
@@ -134,11 +215,28 @@ export class PanoramaSensor {
         this._depthFpsCount = 0;
         this._depthCycleSum = 0;         // 限速诊断：累计周期间隔
         this._depthReqStart = 0;         // 当前请求发起时间
-        this._yopoGeneration = 0;    // 取消/到达时递增，丢弃过期响应
+        this._depthState = 'offline';
+        this._depthOutcome = 'idle';
+        this._depthAbortController = null;
+        this._activeDepthRequest = null;
+        this._depthRequestSequence = 0;
+        this._lastRenderedRequestId = 0;
+        this._rgbFrameId = 0;
+        this._lastRequestedFrameId = -1;
+        this._minimumRequestFrameId = 0;
+        this._forceNextDepthRequest = false;
+        this._yopoGeneration = 0;    // 目标会话变化时递增，丢弃过期响应
+        this._goalSequence = 0;
+        this._goalId = null;
+        this._navigationMode = 'idle';
+        this._navigationTransitionReason = 'initialized';
         this._yopoPending = false;
         this._yopoGoal = null;
         this._yopoPose = null;
         this._yopoYaw = 0;
+        this._nextPlanningState = null;
+        this._rgbFrameContext = null;
+        this._perceptionFrame = null;
         this.onYopoResult = null;    // main.js: YOPO endstate → drone trajectory
         this.onDepthResult = null;   // main.js: depth latency → flight logger perf
         this.onYopoLatency = null;   // main.js: YOPO latency → flight logger perf
@@ -149,7 +247,8 @@ export class PanoramaSensor {
             this._drawPlaceholder(this.rgbCanvas, 'RGB PANORAMA');
         }
         this._drawDepthPlaceholder('DA360 offline');
-        this._setStatus('idle', 'offline');
+        this._setRgbStatus('idle');
+        this._setDepthState('offline', 'not-connected');
     }
 
     setActive(active) {
@@ -158,22 +257,36 @@ export class PanoramaSensor {
     }
 
     reset() {
+        const retainedDepth = this.hasDepth;
+        this._abortActiveDepthRequest('sensor-reset');
         this.capturing = false;
-        this.depthPending = false;
         this.lastCaptureStartTime = 0;
         this.lastCaptureTime = 0;
         this.lastDepthTime = 0;
         this.hasRgb = false;
-        this.hasDepth = false;
         this._lastDepthArray = null;
         this._yopoGeneration++;   // 取消/到达时递增，使在途响应过期
+        this._goalId = null;
+        this._navigationMode = 'idle';
+        this._navigationTransitionReason = 'sensor-reset';
         this._yopoGoal = null;
         this._yopoPose = null;
+        this._nextPlanningState = null;
+        this._rgbFrameContext = null;
+        this._perceptionFrame = null;
         this._yopoPending = false;
+        this._rgbFrameId = 0;
+        this._lastRequestedFrameId = -1;
+        this._minimumRequestFrameId = 1;
+        this._forceNextDepthRequest = true;
         if (this.rgbCanvas) this._drawPlaceholder(this.rgbCanvas, 'RGB PANORAMA');
-        this._drawDepthPlaceholder('DA360 offline');
-        this._setStatus('idle', 'offline');
-        this._setDepthLegend(null);
+        if (!retainedDepth) {
+            this.hasDepth = false;
+            this._drawDepthPlaceholder('DA360 offline');
+            this._setDepthLegend(null);
+        }
+        this._setRgbStatus('idle');
+        this._setDepthState(retainedDepth ? 'preview' : 'offline', 'sensor-reset');
     }
 
     hasRgbFrame() {
@@ -198,7 +311,66 @@ export class PanoramaSensor {
         };
     }
 
-    primeFromCaptureResult(result, captureMs = 0) {
+    _projectionConfig() {
+        return {
+            width: PANORAMA_WIDTH,
+            height: PANORAMA_HEIGHT,
+            faceSize: PANORAMA_FACE_SIZE,
+            verticalFovDeg: PANORAMA_VERTICAL_FOV,
+            faceFovDeg: PANORAMA_FACE_FOV,
+            topPoleGuardDeg: PANORAMA_TOP_POLE_GUARD,
+            bottomPoleGuardDeg: PANORAMA_BOTTOM_POLE_GUARD,
+        };
+    }
+
+    _snapshotRgbBlob(canvas) {
+        const upload = this._depthUploadCanvas(canvas);
+        const snapshot = document.createElement('canvas');
+        snapshot.width = upload.width;
+        snapshot.height = upload.height;
+        const ctx = snapshot.getContext('2d', { alpha: false });
+        ctx.drawImage(upload, 0, 0, snapshot.width, snapshot.height);
+        return this._canvasToJpegBlob(snapshot);
+    }
+
+    _makeRgbFrameContext(frameId, capturedAt, transform, planningState, canvas) {
+        const fallbackPosition = planningState?.actualState?.position || { x: 0, y: 0, z: 0 };
+        const fallbackState = planningState || normalizePlanningState({
+            x: fallbackPosition.x,
+            y: fallbackPosition.y,
+            z: fallbackPosition.z,
+            vx: 0,
+            vy: 0,
+            vz: 0,
+        }, 0);
+        return Object.freeze({
+            frameId,
+            capturedAt,
+            transform: cloneCaptureTransform(transform, fallbackPosition),
+            planningState: fallbackState,
+            projectionConfig: Object.freeze(this._projectionConfig()),
+            rgbPromise: this._snapshotRgbBlob(canvas),
+        });
+    }
+
+    async _materializePerceptionFrame(context) {
+        if (!context) throw new Error('RGB frame context unavailable');
+        const rgb = await context.rgbPromise;
+        if (!rgb) throw new Error('RGB JPEG encoding failed');
+        const planningState = context.planningState;
+        return new PerceptionFrame({
+            frameId: context.frameId,
+            capturedAt: context.capturedAt,
+            transform: context.transform,
+            rgb,
+            actualState: planningState.actualState,
+            referenceState: planningState.referenceState,
+            yaw: planningState.yaw,
+            projectionConfig: context.projectionConfig,
+        });
+    }
+
+    primeFromCaptureResult(result, captureMs = 0, context = {}) {
         if (!this.rgbCanvas) return false;
         const structuredResult = result && typeof result === 'object' && 'complete' in result;
         const panoCanvas = structuredResult ? result.canvas : result;
@@ -211,8 +383,17 @@ export class PanoramaSensor {
         const now = performance.now();
         this.lastCaptureStartTime = now;
         this.lastCaptureTime = now;
+        this._rgbFrameId++;
+        const planningState = context.planningState || this._nextPlanningState;
+        this._rgbFrameContext = this._makeRgbFrameContext(
+            this._rgbFrameId,
+            Number(context.capturedAt ?? now),
+            context.transform,
+            planningState,
+            this.rgbCanvas,
+        );
         this.hasRgb = true;
-        this._setStatus(`preloaded ${Math.round(captureMs)}ms`, this.hasDepth ? 'ready' : 'offline');
+        this._setRgbStatus(`preloaded ${Math.round(captureMs)}ms`);
         return true;
     }
 
@@ -223,7 +404,7 @@ export class PanoramaSensor {
 
         // 深度请求与全景采集解耦——用自己的定时器，不依赖采集状态。
         // 每帧检查，服务器 35ms 下理论可达 ~28Hz，gate 防止堆积。
-        if (this.hasRgb && !this.depthPending && now - this.lastDepthTime >= DEPTH_INTERVAL_MS) {
+        if (this._shouldRequestDepth(now)) {
             this._requestDepth(this.rgbCanvas);
         }
 
@@ -353,13 +534,108 @@ export class PanoramaSensor {
         ctx.putImageData(imgData, 0, 0);
     }
 
-    _setStatus(rgbStatus, depthStatus) {
-        if (this.rgbStatusEl) this.rgbStatusEl.textContent = rgbStatus;
-        if (this.depthStatusEl) this.depthStatusEl.textContent = depthStatus;
+    _setRgbStatus(status) {
+        if (this.rgbStatusEl) this.rgbStatusEl.textContent = status;
     }
 
-    _updateDepthDisplay() {
-        this._setStatus(this.hasRgb ? 'ready' : 'idle', this._depthLatency || 'ready');
+    _setDepthState(state, reason = '', options = {}) {
+        const allowed = new Set(['offline', 'preview', 'planning', 'error']);
+        const normalized = allowed.has(state) ? state : 'error';
+        const outcome = options.outcome || (normalized === 'error' ? 'error' : 'ok');
+        const latencyMs = Number(options.latencyMs);
+        this._depthState = normalized;
+        this._depthOutcome = outcome;
+
+        let label = normalized;
+        if (outcome === 'stale') label = `${normalized} · stale`;
+        else if (normalized === 'error' && reason) label = `error · ${shortError(reason)}`;
+        else if (Number.isFinite(latencyMs)) label = `${normalized} ${Math.round(latencyMs)}ms`;
+
+        if (this.depthStatusEl) {
+            this.depthStatusEl.textContent = label;
+            this.depthStatusEl.dataset.state = normalized;
+            this.depthStatusEl.dataset.outcome = outcome;
+            this.depthStatusEl.title = reason || normalized;
+        }
+
+        const statusKey = `${normalized}|${outcome}|${reason}`;
+        if (statusKey !== this._lastDepthStatusKey) {
+            console.log(
+                `[depth-state] mode=${normalized} goalId=${this._goalId || '-'} ` +
+                `frameId=${this._rgbFrameId} generation=${this._yopoGeneration} reason=${reason || outcome}`
+            );
+            this._lastDepthStatusKey = statusKey;
+        }
+    }
+
+    getDepthState() {
+        return Object.freeze({
+            mode: this._depthState,
+            outcome: this._depthOutcome,
+            reason: this.depthStatusEl?.title || '',
+            goalId: this._goalId,
+            frameId: this._rgbFrameId,
+            generation: this._yopoGeneration,
+            hasDepth: this.hasDepth,
+        });
+    }
+
+    _desiredDepthMode() {
+        return this._yopoGoal ? 'planning' : 'preview';
+    }
+
+    _shouldRequestDepth(now = performance.now()) {
+        if (!this.hasRgb || this._depthGate || this.depthPending) return false;
+        if (this._rgbFrameId <= this._lastRequestedFrameId) return false;
+        if (this._rgbFrameId < this._minimumRequestFrameId) return false;
+        if (this._yopoGoal && !this._yopoPose) {
+            this._setDepthState('planning', 'awaiting-pose');
+            return false;
+        }
+        return this._forceNextDepthRequest || now - this.lastDepthTime >= DEPTH_INTERVAL_MS;
+    }
+
+    _isRequestSessionCurrent(request) {
+        if (!request) return false;
+        if (request.generation !== this._yopoGeneration) return false;
+        if (request.goalId !== this._goalId) return false;
+        if (request.mode !== this._desiredDepthMode()) return false;
+        if (request.frameId !== this._rgbFrameId) return false;
+        return request.requestId >= this._lastRenderedRequestId;
+    }
+
+    _planningResponseMatchesRequest(payload, request) {
+        if (request.mode !== 'planning') return true;
+        return String(payload?.frame_id ?? '') === String(request.frameId)
+            && String(payload?.goal_id ?? '') === String(request.goalId)
+            && String(payload?.generation ?? '') === String(request.generation);
+    }
+
+    _abortActiveDepthRequest(reason) {
+        const request = this._activeDepthRequest;
+        if (!request) return;
+        request.abortReason = reason;
+        const controller = request.controller || this._depthAbortController;
+        if (controller && !controller.signal.aborted) controller.abort(reason);
+    }
+
+    _markStale(request, reason) {
+        const desiredMode = this._desiredDepthMode();
+        this._setDepthState(desiredMode, `stale:${reason}`, { outcome: 'stale' });
+        console.log(
+            `[depth] mode=${request?.mode || desiredMode} goalId=${request?.goalId || '-'} ` +
+            `frameId=${request?.frameId ?? this._rgbFrameId} generation=${request?.generation ?? this._yopoGeneration} ` +
+            `reason=stale:${reason}`
+        );
+    }
+
+    _queueLatestDepthRequest() {
+        if (this._depthCatchupQueued || !this._shouldRequestDepth()) return;
+        this._depthCatchupQueued = true;
+        queueMicrotask(() => {
+            this._depthCatchupQueued = false;
+            if (this._shouldRequestDepth()) this._requestDepth(this.rgbCanvas);
+        });
     }
 
     _formatRelativeDepth(value) {
@@ -388,7 +664,13 @@ export class PanoramaSensor {
     async _capture(world, transform) {
         this.capturing = true;
         this.lastCaptureStartTime = performance.now();
-        this._setStatus('capturing', this.depthPending ? 'inferring' : (this.hasRgb ? 'ready' : 'offline'));
+        const capturedAt = this.lastCaptureStartTime;
+        const capturePlanningState = this._nextPlanningState;
+        const captureTransform = cloneCaptureTransform(
+            transform,
+            capturePlanningState?.actualState?.position,
+        );
+        this._setRgbStatus('capturing');
 
         try {
             const capture = typeof world.capturePanoramaIncrementalAsync === 'function'
@@ -403,14 +685,14 @@ export class PanoramaSensor {
             if (!isDrawableImageSource(panoCanvas)) {
                 if (!complete || structuredResult) {
                     const rgbStatus = captureProgressStatus(result, this.hasRgb);
-                    this._setStatus(rgbStatus, this.depthPending ? 'inferring' : (this.hasDepth ? 'ready' : 'offline'));
+                    this._setRgbStatus(rgbStatus);
                     return;
                 }
                 throw new Error('panorama capture returned non-drawable frame');
             }
             if (!complete) {
                 const rgbStatus = captureProgressStatus(result, this.hasRgb);
-                this._setStatus(rgbStatus, this.depthPending ? 'inferring' : (this.hasDepth ? 'ready' : 'offline'));
+                this._setRgbStatus(rgbStatus);
                 return;
             }
 
@@ -419,11 +701,19 @@ export class PanoramaSensor {
             ctx.drawImage(panoCanvas, 0, 0, this.rgbCanvas.width, this.rgbCanvas.height);
             this.lastCaptureTime = performance.now();
             const captureMs = this.lastCaptureTime - this.lastCaptureStartTime;
+            this._rgbFrameId++;
+            this._rgbFrameContext = this._makeRgbFrameContext(
+                this._rgbFrameId,
+                capturedAt,
+                captureTransform,
+                capturePlanningState,
+                this.rgbCanvas,
+            );
             this.hasRgb = true;
             const rgbStatus = `${Math.round(captureMs)}ms`;
-            this._setStatus(rgbStatus, this.depthPending ? 'inferring' : (this.hasDepth ? 'ready' : 'offline'));
+            this._setRgbStatus(rgbStatus);
 
-            if (!this.depthPending && this.lastCaptureTime - this.lastDepthTime >= DEPTH_INTERVAL_MS) {
+            if (this._shouldRequestDepth(this.lastCaptureTime)) {
                 this._requestDepth(this.rgbCanvas);
             }
         } catch (error) {
@@ -431,7 +721,7 @@ export class PanoramaSensor {
                 key: 'panorama-capture',
                 intervalMs: 3000,
             });
-            this._setStatus(shortError(error), this.depthPending ? 'inferring' : 'offline');
+            this._setRgbStatus(shortError(error));
         } finally {
             this.capturing = false;
         }
@@ -478,38 +768,101 @@ export class PanoramaSensor {
         });
     }
 
+    async _decodeAndCommitDepthImage(source, request) {
+        const decoded = await decodeDepthImageSource(source, globalThis);
+        try {
+            if (!this._isRequestSessionCurrent(request)) {
+                this._markStale(request, 'image-decoded-after-session-change');
+                return false;
+            }
+            if (!this.depthCanvas) throw new Error('depth canvas unavailable');
+            const ctx = this.depthCanvas.getContext('2d', { alpha: false });
+            if (!ctx || typeof ctx.drawImage !== 'function') throw new Error('depth canvas context unavailable');
+            ctx.drawImage(decoded, 0, 0, this.depthCanvas.width, this.depthCanvas.height);
+            this._lastRenderedRequestId = request.requestId;
+            this.hasDepth = true;
+            return true;
+        } finally {
+            if (decoded && typeof decoded.close === 'function') decoded.close();
+        }
+    }
+
     /** 统一请求入口：有 YOPO 目标时走 /yopo/plan_full（一次 JPEG → DA360+YOPO+深度），
      *  无目标时走 /depth（仅 DA360+深度显示）。消除两段式双 HTTP 往返。 */
     async _requestDepth(canvas) {
         if (this._depthGate) return;
         if (!canvas) return;
+        const mode = this._desiredDepthMode();
+        if (mode === 'planning' && !this._yopoPose) {
+            this._setDepthState('planning', 'awaiting-pose');
+            return;
+        }
+
+        const frameContext = this._rgbFrameContext;
+        if (!frameContext) {
+            this._setDepthState(mode, 'awaiting-complete-rgb-frame');
+            return false;
+        }
+        const request = {
+            requestId: ++this._depthRequestSequence,
+            frameId: frameContext.frameId,
+            generation: this._yopoGeneration,
+            goalId: this._goalId,
+            mode,
+            goal: this._yopoGoal ? { ...this._yopoGoal } : null,
+            frameContext,
+            perceptionFrame: null,
+            controller: null,
+            abortReason: null,
+        };
         this._depthReqStart = performance.now();
+        this._lastRequestedFrameId = request.frameId;
+        this._forceNextDepthRequest = false;
         this._depthGate = true;
         this.depthPending = true;
-        this._setStatus('ready', 'inferring');
-        // snapshot 必须在 await 之前——await 期间 _yopoGoal/_yopoPose 可能被 resetYopoGoal 清掉
-        const yopoGoal = this._yopoGoal, yopoPose = this._yopoPose, yopoYaw = this._yopoYaw;
-        const usePlanFull = !!(yopoGoal && yopoPose);
-        const started = performance.now();
+        this._activeDepthRequest = request;
+        this._setDepthState(mode, 'request-started');
 
-        const tA = performance.now();
-        const uploadCanvas = this._depthUploadCanvas(canvas);
-        const blob = await this._canvasToJpegBlob(uploadCanvas);
-        const tB = performance.now();
-        if (!blob) { this._depthGate = false; this.depthPending = false; return; }
-
-        const controller = new AbortController();
-        const timeout = window.setTimeout(() => controller.abort(), DA360_TIMEOUT_MS);
+        let timeout = null;
+        let tA = performance.now();
+        let tB = tA;
 
         try {
+            const frame = await this._materializePerceptionFrame(frameContext);
+            request.perceptionFrame = frame;
+            this._perceptionFrame = frame;
+            const blob = frame.rgb;
+            tB = performance.now();
+            if (!this._isRequestSessionCurrent(request)) {
+                this._markStale(request, 'session-changed-before-fetch');
+                return false;
+            }
+
+            const controller = new AbortController();
+            request.controller = controller;
+            this._depthAbortController = controller;
+            timeout = window.setTimeout(() => {
+                request.abortReason = 'timeout';
+                controller.abort('timeout');
+            }, DA360_TIMEOUT_MS);
+
             let url, body, headers;
-            if (usePlanFull) {
+            if (request.mode === 'planning') {
                 // 一次调用：DA360 → YOPO → 返回 endstate + depth_image
-                const pose = yopoPose, goal = yopoGoal, yaw = yopoYaw;
-                const qs = [`px=${pose.x}`,`py=${pose.y}`,`pz=${pose.z}`,
-                           `gx=${goal.x}`,`gy=${goal.y}`,`gz=${goal.z}`,
-                           `vx=${pose.vx||0}`,`vy=${pose.vy||0}`,`vz=${pose.vz||0}`,
-                           `yaw=${yaw}`].join('&');
+                const observation = frame.planningObservation(request.goal);
+                const pose = observation.position;
+                const velocity = observation.velocity;
+                const acceleration = observation.acceleration;
+                const qs = new URLSearchParams({
+                    px: String(pose.x), py: String(pose.y), pz: String(pose.z),
+                    gx: String(observation.goal.x), gy: String(observation.goal.y), gz: String(observation.goal.z),
+                    vx: String(velocity.x), vy: String(velocity.y), vz: String(velocity.z),
+                    ax: String(acceleration.x), ay: String(acceleration.y), az: String(acceleration.z),
+                    yaw: String(observation.yaw),
+                    frame_id: String(request.frameId),
+                    goal_id: String(request.goalId),
+                    generation: String(request.generation),
+                }).toString();
                 url = `${getYopoEndpoint()}?${qs}`;  // /yopo/plan_full
                 headers = { 'Content-Type': 'image/jpeg' };
                 body = blob;
@@ -522,24 +875,36 @@ export class PanoramaSensor {
             const response = await fetch(url, { method: 'POST', headers, body, signal: controller.signal });
             if (!response.ok) throw new Error(`HTTP ${response.status}`);
             const payload = await response.json();
+            if (!this._isRequestSessionCurrent(request)) {
+                this._markStale(request, 'response-after-session-change');
+                return false;
+            }
+            if (!this._planningResponseMatchesRequest(payload, request)) {
+                this._markStale(request, 'response-identity-mismatch');
+                return false;
+            }
+            if (!payload.depth_image) throw new Error('response missing depth_image');
+            if (!await this._decodeAndCommitDepthImage(payload.depth_image, request)) return false;
 
-            if (usePlanFull) {
-                // plan_full 响应：endstate + depth_image JPEG（~6KB，原项目做法）
-                if (payload.depth_image && this.depthImg) {
-                    this.depthImg.src = payload.depth_image;
-                    this.hasDepth = true;
-                    this._updateDepthDisplay();
-                }
+            this._depthLatency = Number.isFinite(Number(payload.latency_ms))
+                ? `${Math.round(Number(payload.latency_ms))}ms`
+                : '';
+            this._setDepthState(request.mode, 'depth-ready', { latencyMs: Number(payload.latency_ms) });
+
+            if (request.mode === 'planning') {
                 if (payload.endstate && this.onYopoResult) {
-                    this.onYopoResult(payload.endstate, payload.traj_time);
+                    const context = Object.freeze({
+                        mode: request.mode,
+                        goalId: request.goalId,
+                        frameId: request.frameId,
+                        generation: request.generation,
+                        requestId: request.requestId,
+                        depthMode: payload.depth_mode || null,
+                        calibrationId: payload.calibration_id || null,
+                        timings: payload.timings_ms || null,
+                    });
+                    this.onYopoResult(payload.endstate, payload.traj_time, context);
                     if (this.onYopoLatency) this.onYopoLatency(payload.latency_ms);
-                }
-            } else {
-                // /depth 响应：depth_image JPEG → <img> 显示（与 plan_full 统一格式）
-                if (payload.depth_image && this.depthImg) {
-                    this.depthImg.src = payload.depth_image;
-                    this.hasDepth = true;
-                    this._updateDepthDisplay();
                 }
             }
 
@@ -550,25 +915,98 @@ export class PanoramaSensor {
             if (now - this._depthFpsTimer > 2000) {
                 const fps = this._depthFpsCount / ((now - this._depthFpsTimer) / 1000);
                 const avgCycle = this._depthCycleSum / Math.max(1, this._depthFpsCount);
-                console.log(`[depth] ${fps.toFixed(1)}Hz plan_full=${usePlanFull} srvLat=${Math.round(payload.latency_ms||0)}ms avgCycle=${avgCycle.toFixed(0)}ms prepare=${Math.round(tB-tA)}ms`);
+                console.log(
+                    `[depth] ${fps.toFixed(1)}Hz mode=${request.mode} goalId=${request.goalId || '-'} ` +
+                    `frameId=${request.frameId} generation=${request.generation} reason=ok ` +
+                    `srvLat=${Math.round(payload.latency_ms || 0)}ms avgCycle=${avgCycle.toFixed(0)}ms ` +
+                    `prepare=${Math.round(tB - tA)}ms`
+                );
                 this._depthFpsTimer = now; this._depthFpsCount = 0; this._depthCycleSum = 0;
             }
             this.lastDepthTime = performance.now();
             if (this.onDepthResult) this.onDepthResult(payload.latency_ms);
+            return true;
         } catch (error) {
+            const sessionChanged = !this._isRequestSessionCurrent(request);
+            const transitionAbort = request.abortReason && request.abortReason !== 'timeout';
+            if (sessionChanged || transitionAbort) {
+                this._markStale(request, request.abortReason || 'session-changed');
+                return false;
+            }
             reportUserError('DA360/YOPO request failed', error, {
                 key: 'da360-depth-request', intervalMs: 3000,
             });
             this.lastDepthTime = performance.now();
-            this._setStatus('ready', shortError(error));
+            const offline = request.abortReason === 'timeout' || error?.name === 'TypeError';
+            this._setDepthState(offline ? 'offline' : 'error', shortError(error));
+            return false;
         } finally {
-            window.clearTimeout(timeout);
-            this.depthPending = false;
-            this._depthGate = false;
+            if (timeout !== null) window.clearTimeout(timeout);
+            if (this._activeDepthRequest === request) {
+                this._activeDepthRequest = null;
+                this._depthAbortController = null;
+                this.depthPending = false;
+                this._depthGate = false;
+                this._queueLatestDepthRequest();
+            }
         }
     }
 
-    setYopoGoal(goal) { this._yopoGoal = goal; }
-    resetYopoGoal() { this._yopoGeneration++; this._yopoGoal = null; this._yopoPending = false; }
-    setYopoPose(pose, yaw) { this._yopoPose = pose; this._yopoYaw = yaw; }
+    setYopoGoal(goal) {
+        if (!goal) {
+            this.resetYopoGoal('empty-goal');
+            return null;
+        }
+        this._abortActiveDepthRequest('goal-changed');
+        this._yopoGeneration++;
+        this._goalId = `goal-${++this._goalSequence}`;
+        this._yopoGoal = Object.freeze({ ...goal });
+        this._navigationMode = 'active';
+        this._navigationTransitionReason = 'goal-set';
+        this._minimumRequestFrameId = this._rgbFrameId + 1;
+        this._forceNextDepthRequest = true;
+        this._setDepthState('planning', 'awaiting-new-rgb-frame');
+        return this._goalId;
+    }
+
+    resetYopoGoal(reason = 'goal-reset') {
+        this._abortActiveDepthRequest(reason);
+        this._yopoGeneration++;
+        this._goalId = null;
+        this._yopoGoal = null;
+        this._navigationMode = reason.includes('arriv') ? 'arrived'
+            : reason.includes('cancel') || reason.includes('mode') || reason.includes('reset') ? 'cancelled'
+            : 'idle';
+        this._navigationTransitionReason = reason;
+        this._yopoPending = false;
+        this._minimumRequestFrameId = this._rgbFrameId + 1;
+        this._forceNextDepthRequest = true;
+        // Keep the last successfully decoded canvas frame while returning to preview.
+        this._setDepthState('preview', reason);
+    }
+
+    setYopoPose(pose, yaw) {
+        if (!pose) {
+            this._yopoPose = null;
+            this._nextPlanningState = null;
+            return;
+        }
+        const planningState = normalizePlanningState(pose, yaw);
+        this._nextPlanningState = planningState;
+        this._yopoPose = planningState.actualState;
+        this._yopoYaw = planningState.yaw;
+    }
+
+    getLatestPerceptionFrame() {
+        return this._perceptionFrame;
+    }
+
+    getNavigationSession() {
+        return Object.freeze({
+            mode: this._navigationMode,
+            goalId: this._goalId,
+            generation: this._yopoGeneration,
+            transitionReason: this._navigationTransitionReason,
+        });
+    }
 }

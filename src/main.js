@@ -320,7 +320,11 @@ async function preloadPanoramaBeforeFlight() {
             options.timeoutMs,
             '360 panorama preload'
         );
-        const ready = panoramaSensor.primeFromCaptureResult(result, performance.now() - started);
+        const ready = panoramaSensor.primeFromCaptureResult(result, performance.now() - started, {
+            capturedAt: started,
+            transform,
+            planningState: drone.getYopoPlanningState ? drone.getYopoPlanningState() : null,
+        });
         if (!ready && (PANORAMA_PRELOAD_REQUIRED || FLIGHT_PRELOAD_STRICT)) {
             throw new Error('360 panorama preload did not produce a complete frame.');
         }
@@ -710,8 +714,21 @@ function startFlight(viewMode = 'first') {
 
     // Wire YOPO: depth → YOPO plan → drone trajectory
     if (panoramaSensor) {
-        panoramaSensor.onYopoResult = (endstate, trajTime) => {
-            drone?.setYopoTrajectory(endstate, trajTime);
+        panoramaSensor.onYopoResult = (endstate, trajTime, context = null) => {
+            const session = panoramaSensor.getNavigationSession?.();
+            if (
+                context && session &&
+                (context.goalId !== session.goalId || context.generation !== session.generation)
+            ) {
+                console.warn(
+                    `[YOPO] stale apply rejected goalId=${context.goalId} frameId=${context.frameId} ` +
+                    `generation=${context.generation}`
+                );
+                return;
+            }
+            if (!drone?.setYopoTrajectory(endstate, trajTime)) {
+                console.warn(`[YOPO] invalid response rejected frameId=${context?.frameId ?? '-'}`);
+            }
         };
         panoramaSensor.onDepthResult = (latencyMs) => { flightLogger?.recordDepth(latencyMs); };
         panoramaSensor.onYopoLatency = (latencyMs) => { flightLogger?.recordYopo(latencyMs); };
@@ -891,6 +908,7 @@ function updateFlight(dt) {
         lastSettingsReadTime = now;
     }
     if (input.resetTriggered) {
+        finishNavigationSession('reset', { cancelDrone: true, arrived: false });
         drone.reset();
         controller.armed = true;
     }
@@ -935,13 +953,14 @@ function updateFlight(dt) {
         console.log(`[pano] leveled=${useLeveled} method=${useLeveled && drone.getLeveledPanoramaTransform ? 'getLeveledPanoramaTransform' : 'getPanoramaTransform'}`);
         updateFlight._loggedPanoMode = true;
     }
-    // 位姿必须在 panorama update 之前设置——_requestDepth 在 update 内触发
-    // plan_full 需要 _yopoGoal && _yopoPose 同时非空才走一次调用
+    // Capture starts only after this immutable planning snapshot is installed.
+    // PanoramaSensor binds it to that capture's transform/RGB/frame ID, so a
+    // slow six-face render cannot be paired with a newer moving pose.
     if (panoramaSensor && drone) {
-        panoramaSensor.setYopoPose(
-            { x: drone.x, y: drone.y, z: drone.z, vx: drone.vx, vy: drone.vy, vz: drone.vz },
-            drone.getFixedYaw ? drone.getFixedYaw() : drone.yaw
-        );
+        panoramaSensor.setYopoPose(drone.getYopoPlanningState
+            ? drone.getYopoPlanningState()
+            : { x: drone.x, y: drone.y, z: drone.z, vx: drone.vx, vy: drone.vy, vz: drone.vz },
+        drone.getFixedYaw ? drone.getFixedYaw() : drone.yaw);
     }
     panoramaSensor?.update(world, panoramaTransform, now);
 
@@ -953,12 +972,11 @@ function updateFlight(dt) {
             : (drone._idealGoal ? drone._idealGoal : { x: drone.x, y: drone.y, z: drone.z });
         flightLogger.record(drone, ref?.x ?? drone.x, ref?.y ?? drone.y, ref?.z ?? drone.z);
     }
-    // 到达判定：仅当 YOPO 轨迹曾被启动、目标已被清除、且无活跃轨迹/衰减时触发。
-    // _yopoPlanTriggered 门控防止"设目标即 4m 内"的假到达。
-    if (drone._yopoPlanTriggered && !drone._idealGoal && !drone._yopoPolyX && !drone._yopoDecayRef) {
-        panoramaSensor?.resetYopoGoal();  // 先停 YOPO，后续深度帧只显示不再规划
-        drone._yopoPlanTriggered = false;
-        flightLogger?.stop(true);
+    const navigationTransition = drone.consumeNavigationTransition?.();
+    if (navigationTransition?.state === 'arrived') {
+        finishNavigationSession('arrived', { cancelDrone: false, arrived: true });
+    } else if (navigationTransition?.reason === 'mode-exit') {
+        finishNavigationSession('mode-exit', { cancelDrone: false, arrived: false });
     }
 
     // Radar minimap
@@ -1228,14 +1246,18 @@ function setupThirdPersonPointerControls() {
     }, { passive: false });
 }
 
-function cancelWaypoint() {
-    flightLogger?.stop(false);
-    if (!drone) return;
-    drone.cancelWaypoint();
-    panoramaSensor?.resetYopoGoal();
+function finishNavigationSession(reason, { cancelDrone = false, arrived = false } = {}) {
+    flightLogger?.stop(arrived);
+    if (cancelDrone) drone?.cancelWaypoint();
+    panoramaSensor?.resetYopoGoal(reason);
     goalAltitudeOverride = null;   // 复位高度覆盖，下次设点重新沿用当前高度
     if (world && typeof world.clearGoalMarker === 'function') world.clearGoalMarker();
-    console.log('[waypoint] cancelled');
+    console.log(`[navigation] ${reason}`);
+}
+
+function cancelWaypoint() {
+    if (!drone) return;
+    finishNavigationSession('cancelled', { cancelDrone: true, arrived: false });
 }
 
 function setupKeyboard() {

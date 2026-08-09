@@ -24,7 +24,7 @@
     <meta http-equiv="Expires" content="0">
 	    <title>Google 3D Tiles Flight</title>
 	    <link id="cesium-widgets-css" href="/ThirdParty/Cesium/Widgets/widgets.css" rel="stylesheet"
-	          onerror="this.onerror=null;this.href='https://cesium.com/downloads/cesiumjs/releases/1.121/Build/Cesium/Widgets/widgets.css';">
+	          onerror="this.onerror=null;this.href='https://cesium.com/downloads/cesiumjs/releases/1.117/Build/Cesium/Widgets/widgets.css';">
 	    <script>
 	        window.CESIUM_BASE_URL = '/ThirdParty/Cesium/';
             window.googleTilesCesiumReady = new Promise(function (resolve, reject) {
@@ -37,7 +37,7 @@
                 }
             };
             window.googleTilesLoadCesiumFallback = function (failedScript) {
-                var base = 'https://cesium.com/downloads/cesiumjs/releases/1.121/Build/Cesium/';
+                var base = 'https://cesium.com/downloads/cesiumjs/releases/1.117/Build/Cesium/';
                 window.CESIUM_BASE_URL = base;
                 var script = document.createElement('script');
                 script.src = base + 'Cesium.js';
@@ -215,8 +215,7 @@
             border: 1px solid rgba(125, 211, 252, 0.42);
             border-radius: 6px;
         }
-        .panorama-pane canvas,
-        .panorama-pane img {
+        .panorama-pane canvas {
             width: 100%;
             height: 100%;
             display: block;
@@ -243,6 +242,16 @@
             font-size: 10px;
             font-weight: 600;
             letter-spacing: 0;
+        }
+        .panorama-status[data-state="offline"],
+        .panorama-status[data-state="error"] {
+            color: #fca5a5;
+        }
+        .panorama-status[data-state="planning"] {
+            color: #86efac;
+        }
+        .panorama-status[data-outcome="stale"] {
+            color: #fcd34d;
         }
         .depth-legend {
             padding: 7px 9px 8px;
@@ -742,7 +751,6 @@
                 <span class="panorama-status" id="panorama-depth-status">offline</span>
             </div>
             <canvas id="panorama-depth-canvas" width="384" height="192"></canvas>
-            <img id="panorama-depth-image" alt="DA360 panoramic depth" style="display:none">
         </div>
         <div class="depth-legend" aria-label="DA360 relative distance legend">
             <div class="depth-legend-row">
@@ -1026,8 +1034,8 @@
         <div class="setting-row">
             <label>Collision Radius (m)</label>
             <div class="controls">
-                <input type="range" id="phys-collision-radius" min="0.05" max="2.0" value="0.15" step="0.05">
-                <input type="number" id="phys-collision-radius-num" min="0.05" max="2.0" step="0.05" value="0.15" style="width:60px;background:#223;color:#ddd;border:1px solid #446;border-radius:3px;padding:2px 4px;font-size:12px;">
+                <input type="range" id="phys-collision-radius" min="0.05" max="2.0" value="0.6" step="0.05">
+                <input type="number" id="phys-collision-radius-num" min="0.05" max="2.0" step="0.05" value="0.6" style="width:60px;background:#223;color:#ddd;border:1px solid #446;border-radius:3px;padding:2px 4px;font-size:12px;">
             </div>
         </div>
 
