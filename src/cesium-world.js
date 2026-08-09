@@ -29,6 +29,7 @@
  */
 
 import { reportUserError } from './error-report.js';
+import { erpDirectionToComponent, sampleAnchorDirections } from './erp-geometry.js';
 
 const DEFAULT_ION_TOKEN = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJqdGkiOiJlMTg2MGFhOS02YTdhLTQ1NWMtYjkzMi05YjQ2ODRlZjI5YTgiLCJpZCI6MjUxNzM1LCJpYXQiOjE3MzAyODI0ODN9.prWAxx4RB8teelutQQbVqdxhgRZpZ4zjw8wzM-8k1Ug';
 const DEFAULT_ASSET_ID = 2275207;
@@ -360,6 +361,14 @@ function getTransformBasisLocal(transform) {
         back,
         forward: negate3(back),
     };
+}
+
+function componentDirectionToLocal(basis, component) {
+    return normalize3({
+        x: basis.right.x * component.x + basis.up.x * component.y + basis.back.x * component.z,
+        y: basis.right.y * component.x + basis.up.y * component.y + basis.back.y * component.z,
+        z: basis.right.z * component.x + basis.up.z * component.y + basis.back.z * component.z,
+    });
 }
 
 function clampNumber(value, min, max, fallback) {
@@ -1811,8 +1820,9 @@ export class CesiumWorld {
      * Sample sparse metric-depth anchors via Cesium ray-casting against
      * the currently-loaded 3D Tiles (Google Photorealistic).
      *
-     * Each anchor is an ERP grid cell centre projected into a body-frame
-     * direction, then ray-cast through `pickLocalRay`.  The returned object
+     * Each anchor is an ERP grid cell centre projected through the exact same
+     * sensor-NWU → cubemap-component → capture-transform path as the RGB
+     * panorama, then ray-cast through `pickLocalRay`.  The returned object
      * contains both successful hits and per-anchor failure reasons so the
      * downstream metric-fitting stage can decide how to handle missing data.
      *
@@ -1826,6 +1836,9 @@ export class CesiumWorld {
      * @param {number} [options.imageWidth=384]     – ERP width for geometry
      * @param {number} [options.imageHeight=192]    – ERP height for geometry
      * @param {number} [options.verticalFovDeg=180]
+     * @param {string} [options.locationId]         – stable physical-site ID for held-out validation
+     * @param {string} [options.captureId]          – ID shared by RGB/raw/anchor artifacts
+     * @param {string} [options.frameId]            – perception frame that supplied the RGB
      * @returns {{ anchors: Array, failures: Array, metadata: object }}
      */
     sampleMetricDepthAnchors(transform, options = {}) {
@@ -1839,77 +1852,70 @@ export class CesiumWorld {
         const opts = { ...defaults, ...options };
         const vfovRad = opts.verticalFovDeg / 180 * Math.PI;
 
+        if (!transform || !transform.position || !transform.orientation) {
+            throw new TypeError('sampleMetricDepthAnchors requires a panorama capture transform');
+        }
+
         const anchors = [];
         const failures = [];
+        const basis = getTransformBasisLocal(transform);
+        const samples = sampleAnchorDirections(
+            opts.gridCols,
+            opts.gridRows,
+            opts.imageWidth,
+            opts.imageHeight,
+            vfovRad
+        );
 
-        // Pre-compute camera-to-body rotation (if any pitch offset)
-        const Rx = (typeof this._rotationBc === 'function')
-            ? this._rotationBc() : null;
+        for (const sample of samples) {
+            const { col, row, u, v, yaw, pitch: pitchRad } = sample;
+            const pitchDeg = pitchRad * 180 / Math.PI;
 
-        for (let row = 0; row < opts.gridRows; row++) {
-            for (let col = 0; col < opts.gridCols; col++) {
-                const u = (col + 0.5) / opts.gridCols * opts.imageWidth;
-                const v = (row + 0.5) / opts.gridRows * opts.imageHeight;
-
-                // ERP pixel → body-frame direction
-                const yaw = Math.PI - (u + 0.5) / opts.imageWidth * 2.0 * Math.PI;
-                const pitchRad = vfovRad / 2.0 - (v + 0.5) / opts.imageHeight * vfovRad;
-                const pitchDeg = pitchRad * 180 / Math.PI;
-
-                // Pole exclusion
-                if (pitchDeg > (90 - opts.excludeTopDeg) || pitchDeg < (-90 + opts.excludeBottomDeg)) {
-                    failures.push({ col, row, u, v, reason: 'pole_excluded', pitchDeg });
-                    continue;
-                }
-
-                const cosP = Math.cos(pitchRad);
-                let dx = cosP * Math.cos(yaw);
-                let dy = cosP * Math.sin(yaw);
-                let dz = Math.sin(pitchRad);
-
-                // Apply camera-to-body rotation if present
-                if (Rx) {
-                    const rdx = Rx[0] * dx + Rx[1] * dy + Rx[2] * dz;
-                    const rdy = Rx[3] * dx + Rx[4] * dy + Rx[5] * dz;
-                    const rdz = Rx[6] * dx + Rx[7] * dy + Rx[8] * dz;
-                    dx = rdx; dy = rdy; dz = rdz;
-                }
-
-                // Normalise
-                const len = Math.hypot(dx, dy, dz);
-                if (len < 1e-9) {
-                    failures.push({ col, row, u, v, reason: 'zero_direction' });
-                    continue;
-                }
-                const dir = { x: dx / len, y: dy / len, z: dz / len };
-
-                // Ray cast
-                const origin = transform.position;
-                const hit = this.pickLocalRay(origin, dir, opts.maxRangeM);
-
-                if (!hit) {
-                    // Distinguish failure modes
-                    const reason = this._tilesReady()
-                        ? 'no_hit' : 'tile_not_ready';
-                    failures.push({ col, row, u, v, reason });
-                    continue;
-                }
-
-                if (!Number.isFinite(hit.distance) || hit.distance > opts.maxRangeM) {
-                    failures.push({ col, row, u, v, reason: 'out_of_range', distance: hit.distance });
-                    continue;
-                }
-
-                anchors.push({
-                    col, row,
-                    u, v,
-                    yawDeg: yaw * 180 / Math.PI,
-                    pitchDeg,
-                    direction: dir,
-                    distance: hit.distance,
-                    position: hit.position,
-                });
+            // Pole exclusion
+            if (pitchDeg > (90 - opts.excludeTopDeg) || pitchDeg < (-90 + opts.excludeBottomDeg)) {
+                failures.push({ col, row, u, v, reason: 'pole_excluded', pitchDeg });
+                continue;
             }
+
+            // The RGB projector first maps canonical sensor NWU into its
+            // cubemap component axes, then rotates those axes by exactly
+            // this capture transform.  Metric rays must follow the same
+            // path or anchors and pixels describe different directions.
+            const componentDirection = erpDirectionToComponent(sample);
+            const dir = componentDirectionToLocal(basis, componentDirection);
+            if (Math.hypot(dir.x, dir.y, dir.z) < 1e-9) {
+                failures.push({ col, row, u, v, reason: 'zero_direction' });
+                continue;
+            }
+
+            // Ray cast
+            const origin = transform.position;
+            const hit = this.pickLocalRay(origin, dir, opts.maxRangeM);
+
+            if (!hit) {
+                // Distinguish failure modes
+                const reason = this._tilesReady()
+                    ? 'no_hit' : 'tile_not_ready';
+                failures.push({ col, row, u, v, reason });
+                continue;
+            }
+
+            if (!Number.isFinite(hit.distance) || hit.distance > opts.maxRangeM) {
+                failures.push({ col, row, u, v, reason: 'out_of_range', distance: hit.distance });
+                continue;
+            }
+
+            anchors.push({
+                col, row,
+                u, v,
+                yawDeg: yaw * 180 / Math.PI,
+                pitchDeg,
+                sensorDirection: { x: sample.dx, y: sample.dy, z: sample.dz },
+                componentDirection,
+                direction: dir,
+                distance: hit.distance,
+                position: hit.position,
+            });
         }
 
         return {
@@ -1924,6 +1930,13 @@ export class CesiumWorld {
                 imageWidth: opts.imageWidth,
                 imageHeight: opts.imageHeight,
                 verticalFovDeg: opts.verticalFovDeg,
+                pixelCoordinateConvention: 'integer-pixel-centres',
+                sensorFrame: 'NWU(+x forward,+y left,+z up)',
+                componentFrame: '(+x right,+y up,+z back)',
+                transform: JSON.parse(JSON.stringify(transform)),
+                locationId: opts.locationId == null ? null : String(opts.locationId),
+                captureId: opts.captureId == null ? null : String(opts.captureId),
+                frameId: opts.frameId == null ? null : String(opts.frameId),
                 totalCells: opts.gridCols * opts.gridRows,
                 validAnchors: anchors.length,
                 failureCount: failures.length,

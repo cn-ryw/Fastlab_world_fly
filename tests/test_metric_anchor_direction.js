@@ -6,7 +6,7 @@
  * Run: node tests/test_metric_anchor_direction.js
  */
 
-import { erpPixelToDirection } from '../src/erp-geometry.js';
+import { sampleAnchorDirections } from '../src/erp-geometry.js';
 
 const EPS = 1e-10;
 let passed = 0, failed = 0;
@@ -19,41 +19,33 @@ const cols = 16, rows = 8;
 const vfovRad = Math.PI;
 const topExclude = 15, bottomExclude = 5;
 
-for (let row = 0; row < rows; row++) {
-    for (let col = 0; col < cols; col++) {
-        const u = (col + 0.5) / cols * W;
-        const v = (row + 0.5) / rows * H;
-        const pitchRad = vfovRad / 2.0 - (v + 0.5) / H * vfovRad;
-        const pitchDeg = pitchRad * 180 / Math.PI;
+const samples = sampleAnchorDirections(cols, rows, W, H, vfovRad);
+for (const d of samples) {
+    const { col, row, pitch: pitchRad } = d;
+    const pitchDeg = pitchRad * 180 / Math.PI;
 
-        // Pole exclusion check
-        const excluded = pitchDeg > (90 - topExclude) || pitchDeg < (-90 + bottomExclude);
+    // Pole exclusion check
+    const excluded = pitchDeg > (90 - topExclude) || pitchDeg < (-90 + bottomExclude);
 
-        const d = erpPixelToDirection(u, v, W, H, vfovRad);
-        const len = Math.hypot(d.dx, d.dy, d.dz);
+    const len = Math.hypot(d.dx, d.dy, d.dz);
 
-        // All anchors should be unit vectors regardless of exclusion
-        assertClose(len, 1.0, `anchor (${col},${row}) unit-length`);
+    // All anchors should be unit vectors regardless of exclusion
+    assertClose(len, 1.0, `anchor (${col},${row}) unit-length`);
 
-        // Top row should be excluded due to top pole guard (pitch > 90-15=75°)
-        if (row === 0) {
-            assert(excluded, `top row anchor (${col},0) should be pole-excluded (pitch ${pitchDeg.toFixed(1)}°)`);
-        }
-        // Bottom row with 8 rows spans ~84.4°–61.9°, all above -85° exclusion
-        // so bottom exclusion only triggers with more rows or larger guard
+    // Top row should be excluded due to top pole guard (pitch > 90-15=75°)
+    if (row === 0) {
+        assert(excluded, `top row anchor (${col},0) should be pole-excluded (pitch ${pitchDeg.toFixed(1)}°)`);
     }
+    // Bottom cell centre is -78.75°, above the -85° exclusion boundary,
+    // so the bottom guard triggers only with more rows or a larger guard.
 }
 
 // Count total excluded anchors (pole guard coverage)
 let excludedCount = 0;
-for (let row = 0; row < rows; row++) {
-    for (let col = 0; col < cols; col++) {
-        const v = (row + 0.5) / rows * H;
-        const pitchRad = vfovRad / 2.0 - (v + 0.5) / H * vfovRad;
-        const pitchDeg = pitchRad * 180 / Math.PI;
-        if (pitchDeg > (90 - topExclude) || pitchDeg < (-90 + bottomExclude))
-            excludedCount++;
-    }
+for (const sample of samples) {
+    const pitchDeg = sample.pitch * 180 / Math.PI;
+    if (pitchDeg > (90 - topExclude) || pitchDeg < (-90 + bottomExclude))
+        excludedCount++;
 }
 // With 8 rows (22.5°/row), only top row exceeds top 15° guard; bottom guard (5°) doesn't catch any row
 const expectedExcluded = cols * 1; // only top row
@@ -63,8 +55,7 @@ assert(excludedCount === expectedExcluded,
 // Verify regular (non-excluded) anchors have valid pitch ranges
 let minPitch = Infinity, maxPitch = -Infinity;
 for (let row = 1; row < rows - 1; row++) {
-    const v = (row + 0.5) / rows * H;
-    const pitchDeg = (vfovRad / 2.0 - (v + 0.5) / H * vfovRad) * 180 / Math.PI;
+    const pitchDeg = samples.find(sample => sample.row === row).pitch * 180 / Math.PI;
     minPitch = Math.min(minPitch, pitchDeg);
     maxPitch = Math.max(maxPitch, pitchDeg);
 }

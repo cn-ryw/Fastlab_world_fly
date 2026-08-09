@@ -3,7 +3,15 @@
  * Run: node tests/test_erp_geometry.js
  */
 
-import { erpPixelToDirection, erpDirectionToPixel, sampleAnchorDirections, normalize3 } from '../src/erp-geometry.js';
+import {
+    erpDirectionToComponent,
+    erpDirectionToPixel,
+    erpGridCellCenter,
+    erpPixelToComponentDirection,
+    erpPixelToDirection,
+    normalize3,
+    sampleAnchorDirections,
+} from '../src/erp-geometry.js';
 
 const EPS = 1e-10;
 let passed = 0, failed = 0;
@@ -84,6 +92,9 @@ const anchors = sampleAnchorDirections(16, 8, 384, 192);
 assert(anchors.length === 128, `anchor count: expected 128, got ${anchors.length}`);
 assert(anchors[0].col === 0 && anchors[0].row === 0, `first anchor should be (0,0)`);
 assert(anchors[127].col === 15 && anchors[127].row === 7, `last anchor should be (15,7)`);
+assertClose(anchors[0].u, 11.5, 'first anchor u uses integer-pixel-centre convention');
+assertClose(anchors[0].v, 11.5, 'first anchor v uses integer-pixel-centre convention');
+assertClose(erpGridCellCenter(15, 16, 384), 371.5, 'last anchor u pixel centre');
 for (const a of anchors) {
     const len = Math.hypot(a.dx, a.dy, a.dz);
     assertClose(len, 1.0, `anchor (${a.col},${a.row}) unit`);
@@ -98,6 +109,44 @@ assert(dLeftEdge.dx < -0.99 && dRightEdge.dx < -0.99, 'seam continuity: both edg
 // ── vfov parameter ──
 const d90 = erpPixelToDirection(191.5, 95.5, 384, 192, Math.PI / 2); // 90° vfov
 assertClose(d90.dz, 0, 'center row at 90° vfov should have dz=0');
+
+// ── canonical sensor NWU → panorama shader component axes ──
+const sensorForward = erpPixelToDirection(191.5, 95.5, 384, 192, Math.PI);
+const componentForward = erpDirectionToComponent(sensorForward);
+assertClose(componentForward.x, sensorForward.dy, 'shader component x = sensor dy');
+assertClose(componentForward.y, sensorForward.dz, 'shader component y = sensor dz');
+assertClose(componentForward.z, -sensorForward.dx, 'shader component z = -sensor dx');
+
+const componentTop = erpPixelToComponentDirection(191.5, -0.5, 384, 192, Math.PI);
+assertClose(componentTop.x, 0, 'ERP top component x');
+assertClose(componentTop.y, 1, 'ERP top component y');
+assertClose(componentTop.z, 0, 'ERP top component z');
+
+// Explicit numerical parity with PanoramaEquirectProjector's GLSL
+// directionFromPitchYaw() across seams, poles and a cropped vertical FOV.
+for (const [u, v, vfov] of [
+    [0, 0, Math.PI],
+    [383, 191, Math.PI],
+    [95.5, 47.5, Math.PI],
+    [287.5, 143.5, Math.PI / 2],
+]) {
+    const yaw = Math.PI - (u + 0.5) / 384 * 2 * Math.PI;
+    const pitch = vfov / 2 - (v + 0.5) / 192 * vfov;
+    const cosPitch = Math.cos(pitch);
+    const expected = {
+        x: -cosPitch * Math.sin(yaw),
+        y: Math.sin(pitch),
+        z: -cosPitch * Math.cos(yaw),
+    };
+    const actual = erpPixelToComponentDirection(u, v, 384, 192, vfov);
+    assertClose(actual.x, expected.x, `GLSL parity x at (${u},${v})`);
+    assertClose(actual.y, expected.y, `GLSL parity y at (${u},${v})`);
+    assertClose(actual.z, expected.z, `GLSL parity z at (${u},${v})`);
+}
+
+const anchors90 = sampleAnchorDirections(1, 2, 384, 192, Math.PI / 2);
+assertClose(anchors90[0].pitch, Math.PI / 8, '90° FOV upper cell-centre pitch');
+assertClose(anchors90[1].pitch, -Math.PI / 8, '90° FOV lower cell-centre pitch');
 
 console.log(`\nERP geometry tests: ${passed} passed, ${failed} failed`);
 process.exit(failed > 0 ? 1 : 0);
