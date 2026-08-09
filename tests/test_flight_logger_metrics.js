@@ -16,7 +16,7 @@ logger.start({ x: 10, y: 20, z: 30 }, 20);
 logger.recordPerception({
     frameId: 1, mode: 'planning', outcome: 'applied', captureMs: 20,
     renderMs: 10, projectMs: 2, jpegMs: 3, networkMs: 30,
-    da360Ms: 18, yopoMs: 4, applyMs: 1, captureToApplyMs: 60,
+    serverMs: 25, da360Ms: 18, yopoMs: 4, applyMs: 1, captureToApplyMs: 60,
     frameAgeMs: 60, calibrationId: 'cal-1',
 });
 logger.recordPerception({ frameId: 1, mode: 'planning', outcome: 'applied', frameAgeMs: 62 });

@@ -161,6 +161,7 @@ export class FlightLogger {
                 projectP95Ms: percentile(metricValues('projectMs'), 0.95),
                 jpegP95Ms: percentile(metricValues('jpegMs'), 0.95),
                 networkP95Ms: percentile(metricValues('networkMs'), 0.95),
+                serverP95Ms: percentile(metricValues('serverMs'), 0.95),
                 da360P95Ms: percentile(metricValues('da360Ms'), 0.95),
                 yopoP95Ms: percentile(metricValues('yopoMs'), 0.95),
                 applyP95Ms: percentile(metricValues('applyMs'), 0.95),

@@ -1020,6 +1020,7 @@ export class PanoramaSensor {
                 schedulerYieldMs: Number(frameContext.captureTimings?.scheduler_yield || 0),
                 jpegMs: Number(materialized.jpegMs || 0),
                 networkMs: responseAt - fetchStartedAt,
+                serverMs: Number(payload.latency_ms || 0),
                 da360Ms: Number(payload.timings_ms?.da360_ms ?? payload.timings_ms?.infer_ms ?? 0),
                 yopoMs: Number(payload.timings_ms?.yopo_ms || 0),
                 applyMs: appliedAt - applyStartedAt,
