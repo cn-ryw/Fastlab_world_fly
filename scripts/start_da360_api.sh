@@ -105,10 +105,35 @@ fi
 
 MODEL_PATH="$(readlink -f "$MODEL_PATH")"
 MODEL_BASENAME="$(basename "$MODEL_PATH")"
+MODEL_SHA256="${DA360_MODEL_SHA256:-$(sha256sum "$MODEL_PATH" | awk '{print $1}')}"
+CALIBRATION_PATH="${DA360_DEPTH_CALIB_PATH_HOST:-${DA360_DEPTH_CALIB_PATH:-}}"
+if [[ -n "$CALIBRATION_PATH" ]]; then
+    [[ -s "$CALIBRATION_PATH" ]] || {
+        echo "DA360 calibration does not exist: $CALIBRATION_PATH" >&2
+        exit 1
+    }
+    CALIBRATION_PATH="$(readlink -f "$CALIBRATION_PATH")"
+fi
+case "${DA360_DEPTH_MODE:-da360-relative}" in
+    metric|da360-metric)
+        [[ -n "$CALIBRATION_PATH" ]] || {
+            echo "DA360 metric mode requires DA360_DEPTH_CALIB_PATH_HOST" >&2
+            exit 1
+        }
+        ;;
+    relative|da360-relative) ;;
+    *)
+        echo "DA360_DEPTH_MODE must be da360-relative or da360-metric" >&2
+        exit 1
+        ;;
+esac
 
 if [[ "$MODE" == "local" ]]; then
     PYTHON_BIN="${DA360_PYTHON:-python3}"
-    DA360_RESAMPLE="$RESAMPLE" exec "$PYTHON_BIN" "$SCRIPT_DIR/da360_server.py" --model-path "$MODEL_PATH" --port "$PORT"
+    DA360_RESAMPLE="$RESAMPLE" \
+    DA360_MODEL_SHA256="$MODEL_SHA256" \
+    DA360_DEPTH_CALIB_PATH="$CALIBRATION_PATH" \
+    exec "$PYTHON_BIN" "$SCRIPT_DIR/da360_server.py" --model-path "$MODEL_PATH" --port "$PORT"
 fi
 
 command -v docker >/dev/null 2>&1 || {
@@ -188,19 +213,30 @@ fi
 run_args=(
     --rm
     --name "$NAME"
-    -p "$PORT:5688"
+    -p "127.0.0.1:$PORT:5688"
     -e "DA360_NO_WARMUP=${DA360_NO_WARMUP:-0}"
-    -e "DA360_INPUT_SCALE=${DA360_INPUT_SCALE:-0.65}"
+    -e "DA360_INPUT_SCALE=${DA360_INPUT_SCALE:-0.46}"
     -e "DA360_INPUT_WIDTH=${DA360_INPUT_WIDTH:-0}"
     -e "DA360_INPUT_HEIGHT=${DA360_INPUT_HEIGHT:-0}"
     -e "DA360_RESAMPLE=$RESAMPLE"
     -e "DA360_OUTPUT_FORMAT=${DA360_OUTPUT_FORMAT:-jpeg}"
     -e "DA360_JPEG_QUALITY=${DA360_JPEG_QUALITY:-72}"
     -e "DA360_AMP=${DA360_AMP:-1}"
-    -e "DA360_CHANNELS_LAST=${DA360_CHANNELS_LAST:-1}"
+    -e "DA360_CHANNELS_LAST=${DA360_CHANNELS_LAST:-0}"
+    -e "DA360_ALLOWED_ORIGINS=${DA360_ALLOWED_ORIGINS:-http://127.0.0.1:8080,http://localhost:8080}"
+    -e "DA360_MAX_CONTENT_LENGTH=${DA360_MAX_CONTENT_LENGTH:-8388608}"
+    -e "DA360_DEPTH_MODE=${DA360_DEPTH_MODE:-da360-relative}"
+    -e "DA360_MODEL_SHA256=$MODEL_SHA256"
     -e "DA360_TORCH_COMPILE=${DA360_TORCH_COMPILE:-0}"
     -v "$MODEL_PATH:/models/$MODEL_BASENAME:ro"
 )
+
+if [[ -n "$CALIBRATION_PATH" ]]; then
+    run_args+=(
+        -v "$CALIBRATION_PATH:/opt/calibration/depth_calibration.json:ro"
+        -e "DA360_DEPTH_CALIB_PATH=/opt/calibration/depth_calibration.json"
+    )
+fi
 
 if [[ "$MOUNT_SERVER" == "1" ]]; then
     run_args+=(-v "$SCRIPT_DIR/da360_server.py:/opt/mindcloud-da360/scripts/da360_server.py:ro")

@@ -3,8 +3,10 @@
 
 import argparse
 import base64
+import hashlib
 import io
 import json
+import math
 import os
 import sys
 import threading
@@ -18,23 +20,22 @@ try:
 except ImportError as exc:
     raise SystemExit(
         "Missing DA360 API dependencies. Install at least: "
-        "pip install numpy pillow flask flask-cors torch torchvision opencv-python timm"
+        "pip install numpy pillow flask torch torchvision opencv-python timm"
     ) from exc
 
 try:
     from flask import Flask, jsonify, request
 except ImportError as exc:
-    raise SystemExit("Missing Flask. Install with: pip install flask flask-cors") from exc
-
-try:
-    from flask_cors import CORS
-except ImportError:
-    CORS = None
+    raise SystemExit("Missing Flask. Install with: pip install flask") from exc
+from werkzeug.exceptions import HTTPException
 
 try:
     import torch
-except ImportError as exc:
-    raise SystemExit("Missing PyTorch. Install DA360 dependencies before starting this server.") from exc
+except ImportError:
+    # Flask contract and security tests use fake runners and intentionally do
+    # not install the multi-gigabyte CUDA stack.  Real runner construction
+    # below still fails fast with an actionable error.
+    torch = None
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -45,7 +46,13 @@ DEFAULT_MODEL = Path(os.environ.get(
     DA360_ROOT / "checkpoints" / f"DA360_{DEFAULT_MODEL_NAME}.pth",
 ))
 PATCH_SIZE = 14
-DEFAULT_INPUT_SCALE = 0.65
+DEFAULT_INPUT_SCALE = 0.46
+API_VERSION = 2
+DEFAULT_MAX_CONTENT_LENGTH = 8 * 1024 * 1024
+DEFAULT_ALLOWED_ORIGINS = (
+    "http://127.0.0.1:8080",
+    "http://localhost:8080",
+)
 
 
 def env_bool(name, default=False):
@@ -69,11 +76,73 @@ def env_int(name, default):
         return default
 
 
+def _file_sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _allowed_origins():
+    configured = os.environ.get("DA360_ALLOWED_ORIGINS", "")
+    if configured.strip():
+        return {item.strip().rstrip("/") for item in configured.split(",") if item.strip()}
+    return set(DEFAULT_ALLOWED_ORIGINS)
+
+
+def configure_api_security(app):
+    """Apply the same request-size and local-origin policy to every API app."""
+    app.config["MAX_CONTENT_LENGTH"] = env_int(
+        "DA360_MAX_CONTENT_LENGTH", DEFAULT_MAX_CONTENT_LENGTH
+    )
+    allowed = _allowed_origins()
+
+    @app.before_request
+    def reject_untrusted_origin():
+        origin = request.headers.get("Origin", "").rstrip("/")
+        if origin and origin not in allowed:
+            return jsonify({"error": "origin not allowed"}), 403
+        return None
+
+    @app.after_request
+    def add_api_headers(response):
+        origin = request.headers.get("Origin", "").rstrip("/")
+        if origin and origin in allowed:
+            response.headers["Access-Control-Allow-Origin"] = origin
+            response.headers.add("Vary", "Origin")
+            response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+            response.headers["Access-Control-Allow-Headers"] = (
+                "Content-Type, X-Frame-ID, X-Goal-ID, X-Generation"
+            )
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
+    return app
+
+
 def load_torch_checkpoint(path, device):
+    """Load tensor-only checkpoints unless unsafe pickle is explicitly enabled."""
     try:
+        return torch.load(path, map_location=device, weights_only=True)
+    except TypeError as exc:
+        if not env_bool("DA360_ALLOW_UNSAFE_CHECKPOINT", False):
+            raise RuntimeError(
+                "this PyTorch version does not support safe weights_only loading; "
+                "upgrade PyTorch or explicitly set DA360_ALLOW_UNSAFE_CHECKPOINT=1 "
+                "for a verified local checkpoint"
+            ) from exc
+        print("[DA360] WARNING: unsafe checkpoint pickle loading explicitly enabled", file=sys.stderr)
         return torch.load(path, map_location=device, weights_only=False)
-    except TypeError:
-        return torch.load(path, map_location=device)
+    except Exception as exc:
+        if not env_bool("DA360_ALLOW_UNSAFE_CHECKPOINT", False):
+            raise RuntimeError(
+                "DA360 checkpoint was rejected by the safe tensor-only loader; "
+                "set DA360_ALLOW_UNSAFE_CHECKPOINT=1 only for a verified local file"
+            ) from exc
+        print("[DA360] WARNING: unsafe checkpoint pickle loading explicitly enabled", file=sys.stderr)
+        return torch.load(path, map_location=device, weights_only=False)
 
 
 def decode_data_url(data_url):
@@ -81,22 +150,51 @@ def decode_data_url(data_url):
         raise ValueError("empty image")
     if "," in data_url:
         data_url = data_url.split(",", 1)[1]
-    raw = base64.b64decode(data_url)
-    image = Image.open(io.BytesIO(raw))
-    image = ImageOps.exif_transpose(image).convert("RGB")
-    return image
+    try:
+        raw = base64.b64decode(data_url, validate=True)
+        image = Image.open(io.BytesIO(raw))
+        return _validate_input_image(image)
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise ValueError(f"invalid image: {exc}") from exc
+
+
+def _validate_input_image(image):
+    width, height = image.size
+    maximum_pixels = env_int("DA360_MAX_IMAGE_PIXELS", 16 * 1024 * 1024)
+    if width <= 0 or height <= 0:
+        raise ValueError("image dimensions must be positive")
+    if width * height > maximum_pixels:
+        raise ValueError(
+            f"decoded image is too large: {width}x{height} > {maximum_pixels} pixels"
+        )
+    try:
+        return ImageOps.exif_transpose(image).convert("RGB")
+    except Exception as exc:
+        raise ValueError(f"invalid image: {exc}") from exc
 
 
 def decode_request_image(req):
     if req.files:
         first_file = next(iter(req.files.values()))
-        image = Image.open(first_file.stream)
-        return ImageOps.exif_transpose(image).convert("RGB")
+        try:
+            image = Image.open(first_file.stream)
+            return _validate_input_image(image)
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise ValueError(f"invalid image: {exc}") from exc
 
     content_type = (req.content_type or "").split(";", 1)[0].strip().lower()
     if content_type.startswith("image/") or content_type == "application/octet-stream":
-        image = Image.open(io.BytesIO(req.get_data()))
-        return ImageOps.exif_transpose(image).convert("RGB")
+        try:
+            image = Image.open(io.BytesIO(req.get_data()))
+            return _validate_input_image(image)
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise ValueError(f"invalid image: {exc}") from exc
 
     is_json = content_type == "application/json" or content_type.endswith("+json")
     if not is_json:
@@ -211,6 +309,8 @@ def resolve_input_size(base_width, base_height, input_scale=None, input_width=No
 
 class DA360Runner:
     def __init__(self, model_path, input_scale=DEFAULT_INPUT_SCALE, input_width=None, input_height=None):
+        if torch is None:
+            raise RuntimeError("Missing PyTorch. Install DA360 dependencies before starting inference.")
         if not DA360_ROOT.is_dir():
             raise FileNotFoundError(f"DA360 repo is missing: {DA360_ROOT}")
         if not Path(model_path).is_file():
@@ -258,9 +358,29 @@ class DA360Runner:
                 continue
             if tuple(value.shape) == tuple(model_state[key].shape):
                 compatible_state[key] = value
-        self.model.load_state_dict(compatible_state, strict=False)
+        total_numel = sum(value.numel() for value in model_state.values())
+        loaded_numel = sum(model_state[key].numel() for key in compatible_state)
+        self.checkpoint_coverage = loaded_numel / max(1, total_numel)
+        minimum_coverage = env_float("DA360_MIN_CHECKPOINT_COVERAGE", 0.95)
+        if self.checkpoint_coverage < minimum_coverage:
+            raise RuntimeError(
+                "DA360 checkpoint coverage is too low: "
+                f"{self.checkpoint_coverage:.2%} < {minimum_coverage:.2%} "
+                f"({len(compatible_state)}/{len(model_state)} state entries matched)"
+            )
+        incompatible = self.model.load_state_dict(compatible_state, strict=False)
+        self.checkpoint_missing_keys = len(incompatible.missing_keys)
+        self.checkpoint_unexpected_keys = len(incompatible.unexpected_keys)
         self.model.eval()
         self.model_name = Path(model_path).stem
+        actual_checkpoint_sha256 = _file_sha256(model_path)
+        expected_checkpoint_sha256 = os.environ.get("DA360_MODEL_SHA256", "").strip().lower()
+        if expected_checkpoint_sha256 and actual_checkpoint_sha256 != expected_checkpoint_sha256:
+            raise RuntimeError(
+                "DA360 checkpoint fingerprint mismatch: "
+                f"{actual_checkpoint_sha256} != {expected_checkpoint_sha256}"
+            )
+        self.checkpoint_sha256 = actual_checkpoint_sha256
         self.use_amp = self.device.type == "cuda" and env_bool("DA360_AMP", True)
         # channels_last 在 RTX 5070 Ti + PyTorch 2.8 + Flask 主进程中会导致
         # model forward 从 ~25ms 退化到 ~5.5s（200x 减速）。docker exec 子进程不受影响。
@@ -310,9 +430,28 @@ class DA360Runner:
             self.infer_raw = _infer_raw_with_compile_swap
         self.mean = torch.tensor([0.485, 0.456, 0.406], device=self.device).view(1, 3, 1, 1)
         self.std = torch.tensor([0.229, 0.224, 0.225], device=self.device).view(1, 3, 1, 1)
-        resample_name = os.environ.get("DA360_RESAMPLE", "bilinear").strip().lower()
+        resample_name = os.environ.get("DA360_RESAMPLE", "bicubic").strip().lower()
         self.resample_name = "bicubic" if resample_name == "bicubic" else "bilinear"
         self.resample = Image.Resampling.BICUBIC if resample_name == "bicubic" else Image.Resampling.BILINEAR
+        mode = os.environ.get("DA360_DEPTH_MODE", "da360-relative").strip().lower()
+        mode_aliases = {
+            "relative": "da360-relative",
+            "da360-relative": "da360-relative",
+            "metric": "da360-metric",
+            "da360-metric": "da360-metric",
+        }
+        if mode not in mode_aliases:
+            raise ValueError(
+                "DA360_DEPTH_MODE must be da360-relative or da360-metric, "
+                f"got {mode!r}"
+            )
+        self.depth_mode = mode_aliases[mode]
+        self.calibration = self._load_depth_calibration()
+        if self.depth_mode == "da360-metric" and self.calibration is None:
+            raise RuntimeError(
+                "DA360 metric mode requires a valid DA360_DEPTH_CALIB_PATH; "
+                "refusing to silently use relative depth"
+            )
         self.lock = threading.Lock()
 
         if os.environ.get("DA360_NO_WARMUP") != "1":
@@ -357,10 +496,9 @@ class DA360Runner:
     def infer_metric(self, image):
         """Run DA360 inference and convert raw pred_disp to metric depth.
 
-        使用离线拟合的线性标定参数 1/z = a·pred_disp + b，
-        跳过 per-frame min-归一化步骤。标定参数文件路径由环境变量
-        DA360_DEPTH_CALIB_PATH 指定；文件不存在时回退到 env_float 的
-        DA360_DEPTH_SCALE 粗调（当前默认行为）。
+        使用启动时验证并冻结的线性标定参数 1/z = a·pred_disp + b，
+        跳过 per-frame min-归一化步骤。没有有效标定时直接失败，避免
+        把相对深度静默冒充为米制深度。
 
         Returns
         -------
@@ -368,41 +506,94 @@ class DA360Runner:
         """
         raw = self.infer_raw(image)
         pred_disp = raw["pred_disp"]
-        calib = self._load_depth_calibration()
-        if calib is not None:
-            a, b = calib["a"], calib["b"]
-            min_d = calib.get("depth_min_m", self.min_dis)
-            max_d = calib.get("depth_max_m", self.max_dis)
-            metric = 1.0 / np.maximum(a * pred_disp + b, 1e-6)
-            metric = np.clip(metric, min_d, max_d)
-        else:
-            # 无标定文件时退回旧行为：per-frame min-归一化 + 常数缩放
-            depth = 1.0 / np.maximum(pred_disp, 1e-6)
-            valid = np.isfinite(depth) & (depth > 0)
-            if np.any(valid):
-                depth = depth / max(float(depth[valid].min()), 1e-6)
-            scale = env_float("DA360_DEPTH_SCALE", 1.0)
-            metric = depth * scale
+        calib = self.calibration
+        if calib is None:
+            raise RuntimeError("metric inference requested without a validated calibration")
+        a, b = calib["a"], calib["b"]
+        inverse_depth = a * pred_disp + b
+        valid = np.isfinite(inverse_depth) & (inverse_depth > 1e-6)
+        metric = np.full(pred_disp.shape, np.nan, dtype=np.float32)
+        metric[valid] = np.clip(
+            1.0 / inverse_depth[valid],
+            calib["depth_min_m"],
+            calib["depth_max_m"],
+        )
         return metric.astype(np.float32)
 
-    @staticmethod
-    def _load_depth_calibration():
-        """加载标定参数文件。文件不存在或格式无效时返回 None。"""
+    def infer_depth(self, image):
+        """Run the explicitly configured relative or metric depth path."""
+        if self.depth_mode == "da360-metric":
+            return self.infer_metric(image)
+        return self.infer(image)
+
+    def _load_depth_calibration(self):
+        """Load and validate calibration exactly once during runner startup."""
         path = os.environ.get("DA360_DEPTH_CALIB_PATH", "")
         if not path:
             return None
         try:
-            with open(path) as f:
+            calibration_path = Path(path).resolve(strict=True)
+            with calibration_path.open(encoding="utf-8") as f:
                 calib = json.load(f)
-            a = float(calib.get("a", 0))
-            b = float(calib.get("b", 0))
-            if abs(a) < 1e-12:
-                return None
-            return {"a": a, "b": b,
-                    "depth_min_m": float(calib.get("depth_min_m", 0.04)),
-                    "depth_max_m": float(calib.get("depth_max_m", 20.0))}
-        except Exception:
-            return None
+            if calib.get("schema_version") != 1:
+                raise ValueError("unsupported or missing calibration schema_version")
+            if calib.get("accepted") is not True:
+                raise ValueError("calibration has not passed acceptance gates")
+            if calib.get("acceptance", {}).get("passed") is not True:
+                raise ValueError("calibration acceptance report is not passed")
+            expected_relation = "inverse_depth_1_per_m = a * pred_disp + b"
+            if calib.get("relation") != expected_relation:
+                raise ValueError("calibration inverse-depth relation is missing or incompatible")
+            a = float(calib["a"])
+            b = float(calib["b"])
+            min_depth = float(calib.get("depth_min_m", 0.04))
+            max_depth = float(calib.get("depth_max_m", 20.0))
+            if not all(math.isfinite(value) for value in (a, b, min_depth, max_depth)):
+                raise ValueError("a, b and depth limits must be finite")
+            if a <= 0:
+                raise ValueError("calibration slope a must be positive")
+            if min_depth <= 0 or max_depth <= min_depth:
+                raise ValueError("calibration depth range must satisfy 0 < min < max")
+
+            context = calib.get("input", {})
+            expected = {
+                "model": self.model_name,
+                "width": self.width,
+                "height": self.height,
+                "resample": self.resample_name,
+                "checkpoint_sha256": self.checkpoint_sha256,
+            }
+            observed = {
+                key: calib.get(key, context.get(key)) for key in expected
+            }
+            missing = [key for key, value in observed.items() if value is None]
+            if missing:
+                raise ValueError(
+                    "calibration is missing inference fingerprint fields: "
+                    + ", ".join(missing)
+                )
+            for key, expected_value in expected.items():
+                actual = observed[key]
+                if key in {"width", "height"}:
+                    actual = int(actual)
+                else:
+                    actual = str(actual)
+                if actual != expected_value:
+                    raise ValueError(
+                        f"calibration {key} mismatch: {actual!r} != {expected_value!r}"
+                    )
+
+            calibration_sha = _file_sha256(calibration_path)
+            return {
+                "a": a,
+                "b": b,
+                "depth_min_m": min_depth,
+                "depth_max_m": max_depth,
+                "id": calibration_sha[:16],
+                "sha256": calibration_sha,
+            }
+        except Exception as exc:
+            raise RuntimeError(f"invalid DA360 calibration {path}: {exc}") from exc
 
     def infer_raw(self, image):
         """Return raw pred_disp without per-frame min-normalization.
@@ -451,6 +642,9 @@ class DA360Runner:
                 "input_scale": self.input_scale,
                 "resample": self.resample_name,
                 "amp": self.use_amp,
+                "depth_mode": self.depth_mode,
+                "calibration_id": self.calibration["id"] if self.calibration else None,
+                "checkpoint_sha256": self.checkpoint_sha256,
                 "epsilon": float(eps),
                 "unit_pred_disp": "raw disparity (inverse depth), NOT per-frame normalized",
                 "unit_relative_depth": "1/pred_disp (not divided by frame min)",
@@ -458,133 +652,211 @@ class DA360Runner:
         }
 
 
-def create_app(runner):
-    app = Flask(__name__)
-    if CORS is not None:
-        CORS(app, resources={r"/*": {"origins": "*"}})
+def _runner_calibration_id(runner):
+    calibration = getattr(runner, "calibration", None)
+    return calibration.get("id") if calibration else None
 
-    @app.after_request
-    def add_cors_headers(response):
-        response.headers["Access-Control-Allow-Origin"] = "*"
-        response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
-        response.headers["Access-Control-Allow-Headers"] = "Content-Type"
-        return response
 
-    @app.route("/health", methods=["GET"])
+def runner_health_payload(runner):
+    """Build the stable health contract shared by standalone and combined."""
+    calibration = getattr(runner, "calibration", None)
+    return {
+        "ok": True,
+        "api_version": API_VERSION,
+        "model": runner.model_name,
+        "device": str(runner.device),
+        "width": runner.width,
+        "height": runner.height,
+        "checkpoint_width": getattr(runner, "checkpoint_width", runner.width),
+        "checkpoint_height": getattr(runner, "checkpoint_height", runner.height),
+        "input_scale": runner.input_scale,
+        "resample": runner.resample_name,
+        "amp": runner.use_amp,
+        "channels_last": runner.channels_last,
+        "depth_scale": env_float("DA360_DEPTH_SCALE", 1.0),
+        "depth_mode": getattr(runner, "depth_mode", "da360-relative"),
+        "calibration": {
+            "loaded": calibration is not None,
+            "id": _runner_calibration_id(runner),
+        },
+        "checkpoint": {
+            "sha256": getattr(runner, "checkpoint_sha256", None),
+            "coverage": getattr(runner, "checkpoint_coverage", None),
+            "missing_keys": getattr(runner, "checkpoint_missing_keys", None),
+            "unexpected_keys": getattr(runner, "checkpoint_unexpected_keys", None),
+        },
+    }
+
+
+def _request_image_metadata(image):
+    rgb = np.asarray(image, dtype=np.uint8)
+    return {
+        "frame_id": request.args.get("frame_id") or request.headers.get("X-Frame-ID"),
+        "goal_id": request.args.get("goal_id") or request.headers.get("X-Goal-ID"),
+        "generation": request.args.get("generation") or request.headers.get("X-Generation"),
+        "request_width": image.width,
+        "request_height": image.height,
+        "decoded_rgb_sha256": hashlib.sha256(rgb.tobytes()).hexdigest(),
+    }
+
+
+def _infer_configured_depth(runner, image):
+    infer_depth = getattr(runner, "infer_depth", None)
+    return infer_depth(image) if infer_depth is not None else runner.infer(image)
+
+
+def register_depth_routes(app, runner_provider, on_depth=None, endpoint_prefix="da360"):
+    """Register the DA360 contract on a Flask app.
+
+    ``runner_provider`` is a callable so the combined service can register its
+    routes before the two GPU runners finish loading. ``on_depth`` receives the
+    predicted array and immutable request metadata and is used only by the
+    legacy cached ``/yopo/plan`` path.
+    """
+    def current_runner():
+        runner = runner_provider()
+        if runner is None:
+            return None
+        return runner
+
     def health():
-        return jsonify({
-            "ok": True,
-            "model": runner.model_name,
-            "device": str(runner.device),
-            "width": runner.width,
-            "height": runner.height,
-            "checkpoint_width": runner.checkpoint_width,
-            "checkpoint_height": runner.checkpoint_height,
-            "input_scale": runner.input_scale,
-            "resample": runner.resample_name,
-            "amp": runner.use_amp,
-            "channels_last": runner.channels_last,
-            "depth_scale": env_float("DA360_DEPTH_SCALE", 1.0),
-        })
+        runner = current_runner()
+        if runner is None:
+            return jsonify({"ok": False, "error": "DA360 not initialized"}), 503
+        return jsonify(runner_health_payload(runner))
 
-    @app.route("/depth/raw", methods=["POST", "OPTIONS"])
     def depth_raw():
-        """Return raw pred_disp, relative_depth, and valid_mask in .npz format.
-
-        Input:  Content-Type: image/jpeg  (ERP RGB JPEG)
-        Output: Content-Type: application/x-npz
-                Contains: pred_disp (float32), relative_depth (float32),
-                          valid_mask (uint8), metadata_json (str)
-        """
         if request.method == "OPTIONS":
             return ("", 204)
-        started = time.time()
-
+        runner = current_runner()
+        if runner is None:
+            return jsonify({"error": "DA360 not initialized"}), 503
+        started = time.perf_counter()
         try:
             image = decode_request_image(request)
-            request_width, request_height = image.size
+            request_metadata = _request_image_metadata(image)
             raw = runner.infer_raw(image)
-
+            metadata = dict(raw["metadata"])
+            metadata.update(request_metadata)
+            metadata.update({
+                "api_version": API_VERSION,
+                "depth_mode": getattr(runner, "depth_mode", "da360-relative"),
+                "calibration_id": _runner_calibration_id(runner),
+            })
             buf = io.BytesIO()
             np.savez_compressed(
                 buf,
-                pred_disp=raw["pred_disp"],
-                relative_depth=raw["relative_depth"],
-                valid_mask=raw["valid_mask"],
-                metadata_json=json.dumps(raw["metadata"]),
+                pred_disp=np.asarray(raw["pred_disp"], dtype=np.float32),
+                relative_depth=np.asarray(raw["relative_depth"], dtype=np.float32),
+                valid_mask=np.asarray(raw["valid_mask"], dtype=np.uint8),
+                metadata_json=np.asarray(json.dumps(metadata, sort_keys=True)),
             )
-            raw_bytes = buf.getvalue()
-
-            response = app.response_class(
-                raw_bytes,
+            latency_ms = (time.perf_counter() - started) * 1000.0
+            frame_token = str(request_metadata["frame_id"] or "unassigned")
+            frame_token = "".join(
+                character if character.isalnum() or character in {"-", "_"} else "_"
+                for character in frame_token[:80]
+            )
+            filename = f"depth_raw_{frame_token}.npz"
+            return app.response_class(
+                buf.getvalue(),
                 status=200,
                 mimetype="application/x-npz",
                 headers={
-                    "Content-Disposition": "attachment; filename=depth_raw.npz",
-                    "X-DA360-Model": raw["metadata"]["model"],
-                    "X-DA360-Width": str(raw["metadata"]["width"]),
-                    "X-DA360-Height": str(raw["metadata"]["height"]),
-                    "X-DA360-Latency-Ms": str((time.time() - started) * 1000.0),
+                    "Content-Disposition": f"attachment; filename={filename}",
+                    "X-DA360-Model": str(metadata["model"]),
+                    "X-DA360-Width": str(metadata["width"]),
+                    "X-DA360-Height": str(metadata["height"]),
+                    "X-DA360-Latency-Ms": str(latency_ms),
+                    "X-Frame-ID": frame_token if request_metadata["frame_id"] else "",
                 },
             )
-            return response
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 400
-        except Exception as exc:
+        except HTTPException:
+            raise
+        except Exception as exc:  # pylint: disable=broad-except
             print(f"[DA360] raw inference failed: {exc}", file=sys.stderr)
-            return jsonify({"error": str(exc)}), 500
-    @app.route("/depth", methods=["POST", "OPTIONS"])
+            return jsonify({"error": "raw depth inference failed"}), 500
+
     def depth():
         if request.method == "OPTIONS":
             return ("", 204)
-        started = time.time()
-
+        runner = current_runner()
+        if runner is None:
+            return jsonify({"error": "DA360 not initialized"}), 503
+        started = time.perf_counter()
         try:
             timings = {}
-            mark = time.time()
+            mark = time.perf_counter()
             image = decode_request_image(request)
-            timings["decode_ms"] = (time.time() - mark) * 1000.0
-            request_width, request_height = image.size
-            mark = time.time()
-            pred_depth = runner.infer(image)
-            timings["infer_ms"] = (time.time() - mark) * 1000.0
-            mark = time.time()
+            request_metadata = _request_image_metadata(image)
+            timings["decode_ms"] = (time.perf_counter() - mark) * 1000.0
+            mark = time.perf_counter()
+            pred_depth = _infer_configured_depth(runner, image)
+            timings["infer_ms"] = (time.perf_counter() - mark) * 1000.0
+            if on_depth is not None:
+                on_depth(pred_depth, request_metadata)
+            mark = time.perf_counter()
             colored, depth_scale = depth_to_color(pred_depth)
-            timings["color_ms"] = (time.time() - mark) * 1000.0
-            mark = time.time()
+            if getattr(runner, "depth_mode", "da360-relative") == "da360-metric":
+                depth_scale["unit"] = "metres"
+            timings["color_ms"] = (time.perf_counter() - mark) * 1000.0
+            mark = time.perf_counter()
             depth_image = encode_image(
                 colored,
                 os.environ.get("DA360_OUTPUT_FORMAT", "jpeg"),
                 env_int("DA360_JPEG_QUALITY", 72),
             )
-            timings["encode_ms"] = (time.time() - mark) * 1000.0
+            timings["encode_ms"] = (time.perf_counter() - mark) * 1000.0
             return jsonify({
+                "api_version": API_VERSION,
                 "depth_image": depth_image,
                 "depth_scale": depth_scale,
-                "latency_ms": (time.time() - started) * 1000.0,
+                "depth_mode": getattr(runner, "depth_mode", "da360-relative"),
+                "calibration_id": _runner_calibration_id(runner),
+                "latency_ms": (time.perf_counter() - started) * 1000.0,
                 "timings_ms": timings,
                 "model": runner.model_name,
                 "device": str(runner.device),
                 "width": runner.width,
                 "height": runner.height,
-                "request_width": request_width,
-                "request_height": request_height,
+                "request_width": request_metadata["request_width"],
+                "request_height": request_metadata["request_height"],
                 "input_pixels": runner.width * runner.height,
-                "request_pixels": request_width * request_height,
+                "request_pixels": request_metadata["request_width"] * request_metadata["request_height"],
+                "frame_id": request_metadata["frame_id"],
+                "goal_id": request_metadata["goal_id"],
+                "generation": request_metadata["generation"],
+                "input_sha256": request_metadata["decoded_rgb_sha256"],
             })
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 400
+        except HTTPException:
+            raise
         except Exception as exc:  # pylint: disable=broad-except
             print(f"[DA360] inference failed: {exc}", file=sys.stderr)
-            return jsonify({"error": str(exc)}), 500
+            return jsonify({"error": "depth inference failed"}), 500
 
+    app.add_url_rule("/health", f"{endpoint_prefix}_health", health, methods=["GET"])
+    app.add_url_rule(
+        "/depth/raw", f"{endpoint_prefix}_depth_raw", depth_raw, methods=["POST", "OPTIONS"]
+    )
+    app.add_url_rule("/depth", f"{endpoint_prefix}_depth", depth, methods=["POST", "OPTIONS"])
+    return app
+
+
+def create_app(runner):
+    app = Flask(__name__)
+    configure_api_security(app)
+    register_depth_routes(app, lambda: runner)
     return app
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Start the DA360 panoramic depth API.")
     parser.add_argument("--model-path", default=str(DEFAULT_MODEL), help="Path to DA360 .pth checkpoint.")
-    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", default=5688, type=int)
     parser.add_argument("--input-scale", default=env_float("DA360_INPUT_SCALE", DEFAULT_INPUT_SCALE), type=float)
     parser.add_argument("--input-width", default=env_int("DA360_INPUT_WIDTH", 0), type=int)
@@ -606,6 +878,7 @@ def main():
     print(f"Model: {args.model_path}")
     print(f"Device: {runner.device}")
     print(f"Input: {runner.width}x{runner.height} (checkpoint {runner.checkpoint_width}x{runner.checkpoint_height})")
+    print(f"Depth mode: {runner.depth_mode}; calibration={_runner_calibration_id(runner) or 'none'}")
     app.run(host=args.host, port=args.port, debug=args.debug, threaded=True)
 
 

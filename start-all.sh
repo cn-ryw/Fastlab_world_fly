@@ -1,72 +1,359 @@
 #!/usr/bin/env bash
-# MindCloud World Fly — 全部服务启动脚本
-# Usage: ./start-all.sh
-set -euo pipefail
+# MindCloud World Fly — verified local-only service launcher
+set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
+
 PID_FILE="$SCRIPT_DIR/.dev-web.pid"
+WEB_HOST="${MINDCLOUD_WEB_HOST:-127.0.0.1}"
+WEB_PORT="${MINDCLOUD_WEB_PORT:-8080}"
+API_PORT="${MINDCLOUD_API_PORT:-5688}"
+API_CONTAINER="${MINDCLOUD_API_CONTAINER:-mindcloud-da360-yopo}"
+LEGACY_WEB_CONTAINER="google-tiles-flight"
+API_IMAGE="${MINDCLOUD_API_IMAGE:-mindcloud-da360-yopo:latest}"
+DA360_MODEL="${DA360_MODEL_PATH_HOST:-$SCRIPT_DIR/third_party/DA360/checkpoints/DA360_large.pth}"
+YOPO_MODEL="${YOPO_MODEL_PATH_HOST:-/home/ykx/ros1/YOPO_360_v15/YOPO/saved/YOPO_55/epoch10.pth}"
+YOPO_CONFIG_NAME="${YOPO_CONFIG:-x5_cruise15_18m_a12_mask_wc3.yaml}"
+YOPO_CONFIG_PATH="$SCRIPT_DIR/third_party/YOPO/config/$YOPO_CONFIG_NAME"
+DEPENDENCY_LOCK="$SCRIPT_DIR/dependencies.lock.json"
+STARTUP_TIMEOUT="${MINDCLOUD_STARTUP_TIMEOUT:-180}"
+DEPTH_MODE="${DA360_DEPTH_MODE:-da360-relative}"
+RESAMPLE="${DA360_RESAMPLE:-bicubic}"
+INPUT_SCALE="${DA360_INPUT_SCALE:-0.46}"
+START_COMPLETE=0
+API_STARTED=0
+WEB_STARTED=0
+WEB_PID=""
+
+die() {
+    echo "ERROR: $*" >&2
+    exit 1
+}
+
+require_command() {
+    command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"
+}
+
+is_owned_web_pid() {
+    local pid="${1:-}"
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+    [[ -r "/proc/$pid/cmdline" ]] || return 1
+    local argument process_cwd found=0
+    while IFS= read -r -d '' argument; do
+        [[ "$argument" == "$SCRIPT_DIR/scripts/serve.py" ]] && found=1
+    done < "/proc/$pid/cmdline" 2>/dev/null || true
+    process_cwd="$(readlink -f "/proc/$pid/cwd" 2>/dev/null || true)"
+    [[ "$found" == "1" && "$process_cwd" == "$SCRIPT_DIR" ]]
+}
+
+find_owned_web_pids() {
+    local proc pid
+    for proc in /proc/[0-9]*; do
+        pid="${proc##*/}"
+        if is_owned_web_pid "$pid"; then
+            echo "$pid"
+        fi
+    done
+}
+
+stop_owned_web_pid() {
+    local pid="$1"
+    is_owned_web_pid "$pid" || return 1
+    kill -TERM "$pid"
+    for _ in $(seq 1 50); do
+        is_owned_web_pid "$pid" || return 0
+        sleep 0.1
+    done
+    if is_owned_web_pid "$pid"; then
+        echo "  Web PID $pid did not stop after 5s; sending KILL" >&2
+        kill -KILL "$pid"
+    fi
+}
+
+port_is_free() {
+    python3 - "$1" "$2" <<'PY'
+import socket
+import sys
+
+host, port = sys.argv[1], int(sys.argv[2])
+sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+try:
+    sock.bind((host, port))
+except OSError:
+    raise SystemExit(1)
+finally:
+    sock.close()
+PY
+}
+
+container_owns_port() {
+    local name="$1" port="$2"
+    docker inspect "$name" >/dev/null 2>&1 || return 1
+    docker port "$name" 2>/dev/null | grep -Eq "(^|:)$port($|[^0-9])"
+}
+
+da360_health_ok() {
+    curl --noproxy '*' --fail --silent --max-time 2 \
+        "http://127.0.0.1:$API_PORT/health" \
+        | python3 -c '
+import json, sys
+p = json.load(sys.stdin)
+expected_sha, expected_mode, expected_resample, expected_channels, expected_scale = sys.argv[1:]
+valid = (
+    p.get("ok") is True
+    and p.get("api_version") == 2
+    and p.get("checkpoint", {}).get("sha256") == expected_sha
+    and p.get("depth_mode") == expected_mode
+    and (
+        expected_mode != "da360-metric"
+        or (
+            p.get("calibration", {}).get("loaded") is True
+            and bool(p.get("calibration", {}).get("id"))
+        )
+    )
+    and p.get("resample") == expected_resample
+    and p.get("channels_last") is (
+        expected_channels.strip().lower() not in {"0", "false", "no", "off", ""}
+    )
+    # Input dimensions are rounded to 14-pixel patches, so the reported
+    # effective scale is intentionally approximate.
+    and abs(float(p.get("input_scale")) - float(expected_scale)) < 0.02
+)
+raise SystemExit(0 if valid else 1)
+' "$DA360_SHA256" "$DEPTH_MODE" \
+          "$RESAMPLE" "${DA360_CHANNELS_LAST:-0}" \
+          "$INPUT_SCALE"
+}
+
+yopo_health_ok() {
+    curl --noproxy '*' --fail --silent --max-time 2 \
+        "http://127.0.0.1:$API_PORT/yopo/health" \
+        | python3 -c '
+import json, sys
+p = json.load(sys.stdin)
+valid = (
+    p.get("ok") is True
+    and p.get("api_version") == 2
+    and p.get("checkpoint_sha256") == sys.argv[1]
+    and p.get("config_sha256") == sys.argv[2]
+)
+raise SystemExit(0 if valid else 1)
+' "$YOPO_SHA256" "$YOPO_CONFIG_SHA256"
+}
+
+cleanup_failed_start() {
+    local status=$?
+    if (( status != 0 )) && (( START_COMPLETE == 0 )); then
+        echo "启动未完成，清理本次启动的服务..." >&2
+        if (( WEB_STARTED == 1 )) && [[ -n "$WEB_PID" ]] && is_owned_web_pid "$WEB_PID"; then
+            stop_owned_web_pid "$WEB_PID" || true
+        fi
+        if (( WEB_STARTED == 1 )) && [[ -f "$PID_FILE" ]]; then
+            rm -f "$PID_FILE"
+        fi
+        if (( API_STARTED == 1 )); then
+            docker rm -f "$API_CONTAINER" >/dev/null 2>&1 || true
+        fi
+    fi
+    trap - EXIT
+    exit "$status"
+}
+trap cleanup_failed_start EXIT
 
 echo "========================================="
-echo " MindCloud World Fly — 启动"
+echo " MindCloud World Fly — 安全启动"
 echo "========================================="
 
-# ── 1. DA360 + YOPO 推理服务 (GPU, 端口 5688) ──
 echo ""
-echo "=== 1/3 DA360 + YOPO 推理服务 (GPU) ==="
-docker rm -f mindcloud-da360-yopo 2>/dev/null || true
-docker run --rm -d --init \
-  --name mindcloud-da360-yopo \
-  --gpus all -p 5688:5688 \
-  -v "$SCRIPT_DIR/third_party/DA360/checkpoints/DA360_large.pth:/models/DA360_large.pth:ro" \
-  -v /home/ykx/ros1/YOPO_360_v15/YOPO/saved/YOPO_55/epoch10.pth:/models/epoch10.pth:ro \
-  -v "$SCRIPT_DIR/scripts:/opt/server:ro" \
-  -e DA360_INPUT_SCALE=0.46 \
-  -e DA360_DEPTH_SCALE=2.0 \
-  mindcloud-da360-yopo:latest
-echo "  DA360+YOPO 启动中 (端口 5688)..."
-
-# ── 2. Web 服务（本地 Python，从磁盘直读最新 JS，端口 8080）──
-echo ""
-echo "=== 2/3 Web 服务（本地开发模式，实时加载最新 JS）==="
-# 释放 8080 端口：停旧 Docker 容器 + 杀残留 Python 进程
-docker rm -f google-tiles-flight 2>/dev/null || true
-if [ -f "$PID_FILE" ]; then
-    kill "$(cat "$PID_FILE")" 2>/dev/null || true
-    rm -f "$PID_FILE"
+echo "=== 1/4 预检 ==="
+for command_name in docker curl python3 nvidia-smi sha256sum readlink; do
+    require_command "$command_name"
+done
+[[ "$WEB_PORT" =~ ^[0-9]+$ ]] || die "invalid web port: $WEB_PORT"
+[[ "$API_PORT" =~ ^[0-9]+$ ]] || die "invalid API port: $API_PORT"
+[[ "$STARTUP_TIMEOUT" =~ ^[0-9]+$ ]] || die "invalid startup timeout: $STARTUP_TIMEOUT"
+[[ "$YOPO_CONFIG_NAME" =~ ^[A-Za-z0-9._-]+\.yaml$ ]] \
+    || die "YOPO_CONFIG must be a YAML filename inside third_party/YOPO/config"
+case "$DEPTH_MODE" in
+    relative|da360-relative) DEPTH_MODE="da360-relative" ;;
+    metric|da360-metric) DEPTH_MODE="da360-metric" ;;
+    *) die "DA360_DEPTH_MODE must be da360-relative or da360-metric" ;;
+esac
+RESAMPLE="${RESAMPLE,,}"
+[[ "$RESAMPLE" == "bicubic" || "$RESAMPLE" == "bilinear" ]] \
+    || die "DA360_RESAMPLE must be bicubic or bilinear"
+python3 -c 'import sys; value=float(sys.argv[1]); assert 0.2 <= value <= 1.0' "$INPUT_SCALE" \
+    2>/dev/null || die "DA360_INPUT_SCALE must be a number in [0.2, 1.0]"
+[[ -s "$DA360_MODEL" ]] || die "DA360 checkpoint missing or empty: $DA360_MODEL"
+[[ -s "$YOPO_MODEL" ]] || die "YOPO checkpoint missing or empty: $YOPO_MODEL"
+[[ -s "$YOPO_CONFIG_PATH" ]] || die "YOPO config missing or empty: $YOPO_CONFIG_PATH"
+[[ -s "$DEPENDENCY_LOCK" ]] || die "dependency lock missing or empty: $DEPENDENCY_LOCK"
+CALIBRATION_FILE=""
+if [[ -n "${DA360_DEPTH_CALIB_PATH_HOST:-}" ]]; then
+    [[ -s "$DA360_DEPTH_CALIB_PATH_HOST" ]] \
+        || die "calibration file missing or empty: $DA360_DEPTH_CALIB_PATH_HOST"
+    CALIBRATION_FILE="$(readlink -f "$DA360_DEPTH_CALIB_PATH_HOST")"
 fi
-# 兜底：fuser 杀掉任何占着 8080 的进程
-fuser -k 8080/tcp 2>/dev/null || true
-sleep 0.3
-python3 "$SCRIPT_DIR/scripts/serve.py" 8080 &
+if [[ "$DEPTH_MODE" == "da360-metric" && -z "$CALIBRATION_FILE" ]]; then
+    die "da360-metric mode requires DA360_DEPTH_CALIB_PATH_HOST"
+fi
+docker info >/dev/null 2>&1 || die "Docker daemon is unavailable"
+docker image inspect "$API_IMAGE" >/dev/null 2>&1 \
+    || die "Docker image missing: $API_IMAGE (build Dockerfile.da360-yopo first)"
+nvidia-smi -L >/dev/null 2>&1 || die "NVIDIA GPU/driver is unavailable"
+
+DA360_MODEL="$(readlink -f "$DA360_MODEL")"
+YOPO_MODEL="$(readlink -f "$YOPO_MODEL")"
+DA360_SHA256="$(sha256sum "$DA360_MODEL" | awk '{print $1}')"
+YOPO_SHA256="$(sha256sum "$YOPO_MODEL" | awk '{print $1}')"
+YOPO_CONFIG_SHA256="$(sha256sum "$YOPO_CONFIG_PATH" | awk '{print $1}')"
+python3 "$SCRIPT_DIR/scripts/verify_dependencies.py" --skip-checkpoints \
+    || die "browser/source dependency lock verification failed"
+readarray -t LOCKED_SHA256 < <(python3 - "$DEPENDENCY_LOCK" <<'PY'
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as stream:
+    lock = json.load(stream)
+print(lock["model_checkpoints"]["da360_large"]["sha256"])
+print(lock["model_checkpoints"]["yopo_epoch10"]["sha256"])
+print(lock["runtime_dependencies"]["yopo_config"]["sha256"])
+PY
+)
+[[ "$DA360_SHA256" == "${LOCKED_SHA256[0]:-}" ]] \
+    || die "DA360 checkpoint does not match dependencies.lock.json"
+[[ "$YOPO_SHA256" == "${LOCKED_SHA256[1]:-}" ]] \
+    || die "YOPO checkpoint does not match dependencies.lock.json"
+[[ "$YOPO_CONFIG_SHA256" == "${LOCKED_SHA256[2]:-}" ]] \
+    || die "YOPO config does not match dependencies.lock.json"
+echo "  DA360: $(basename "$DA360_MODEL") sha256=${DA360_SHA256:0:16}..."
+echo "  YOPO:  $(basename "$YOPO_MODEL") sha256=${YOPO_SHA256:0:16}..."
+echo "  config: $YOPO_CONFIG_NAME sha256=${YOPO_CONFIG_SHA256:0:16}..."
+
+OWNED_WEB_PIDS=()
+if [[ -f "$PID_FILE" ]]; then
+    PID_FILE_VALUE="$(tr -d '[:space:]' < "$PID_FILE")"
+    if [[ -n "$PID_FILE_VALUE" ]] && is_owned_web_pid "$PID_FILE_VALUE"; then
+        OWNED_WEB_PIDS+=("$PID_FILE_VALUE")
+    else
+        if [[ "$PID_FILE_VALUE" =~ ^[0-9]+$ ]] && kill -0 "$PID_FILE_VALUE" 2>/dev/null; then
+            die "PID file points to a non-project process ($PID_FILE_VALUE); refusing to kill it"
+        fi
+        echo "  Removing stale Web PID file"
+        rm -f "$PID_FILE"
+    fi
+fi
+
+while IFS= read -r discovered_pid; do
+    already_listed=0
+    for known_pid in "${OWNED_WEB_PIDS[@]:-}"; do
+        [[ "$known_pid" == "$discovered_pid" ]] && already_listed=1
+    done
+    (( already_listed == 1 )) || OWNED_WEB_PIDS+=("$discovered_pid")
+done < <(find_owned_web_pids)
+
+if ! port_is_free "$WEB_HOST" "$WEB_PORT"; then
+    if (( ${#OWNED_WEB_PIDS[@]} > 0 )); then
+        : # safe to replace below
+    elif container_owns_port "$LEGACY_WEB_CONTAINER" "$WEB_PORT"; then
+        : # known project container; safe to replace below
+    else
+        die "$WEB_HOST:$WEB_PORT is occupied by a process not owned by this project"
+    fi
+fi
+if ! port_is_free 127.0.0.1 "$API_PORT" \
+    && ! container_owns_port "$API_CONTAINER" "$API_PORT"; then
+    die "127.0.0.1:$API_PORT is occupied by a process not owned by $API_CONTAINER"
+fi
+
+echo ""
+echo "=== 2/4 DA360 + YOPO 推理服务 ==="
+docker rm -f "$API_CONTAINER" >/dev/null 2>&1 || true
+
+run_args=(
+    --rm -d --init
+    --name "$API_CONTAINER"
+    --gpus all
+    -p "127.0.0.1:$API_PORT:5688"
+    -v "$DA360_MODEL:/models/DA360_large.pth:ro"
+    -v "$YOPO_MODEL:/models/epoch10.pth:ro"
+    -v "$SCRIPT_DIR/third_party/DA360:/opt/DA360:ro"
+    -v "$SCRIPT_DIR/third_party/YOPO:/opt/YOPO_360/YOPO:ro"
+    -v "$SCRIPT_DIR/scripts:/opt/server:ro"
+    -e "DA360_MODEL_SHA256=$DA360_SHA256"
+    -e "YOPO_MODEL_SHA256=$YOPO_SHA256"
+    -e "YOPO_CONFIG=$YOPO_CONFIG_NAME"
+    -e "YOPO_CONFIG_SHA256=$YOPO_CONFIG_SHA256"
+    -e "DA360_INPUT_SCALE=$INPUT_SCALE"
+    -e "DA360_DEPTH_SCALE=${DA360_DEPTH_SCALE:-2.0}"
+    -e "DA360_DEPTH_MODE=$DEPTH_MODE"
+    -e "DA360_RESAMPLE=$RESAMPLE"
+    -e "DA360_CHANNELS_LAST=${DA360_CHANNELS_LAST:-0}"
+    -e "YOPO_CHANNELS_LAST=${YOPO_CHANNELS_LAST:-0}"
+    -e "DA360_MAX_CONTENT_LENGTH=${DA360_MAX_CONTENT_LENGTH:-8388608}"
+    -e "DA360_ALLOWED_ORIGINS=http://127.0.0.1:$WEB_PORT,http://localhost:$WEB_PORT"
+)
+
+if [[ -n "$CALIBRATION_FILE" ]]; then
+    run_args+=(
+        -v "$CALIBRATION_FILE:/opt/calibration/depth_calibration.json:ro"
+        -e "DA360_DEPTH_CALIB_PATH=/opt/calibration/depth_calibration.json"
+    )
+fi
+
+docker run "${run_args[@]}" "$API_IMAGE" \
+    python3 /opt/server/combined_server.py --host 0.0.0.0 --port 5688 >/dev/null
+API_STARTED=1
+echo "  容器已启动，仅发布到 127.0.0.1:$API_PORT"
+
+echo ""
+echo "=== 3/4 Web 服务 ==="
+for old_web_pid in "${OWNED_WEB_PIDS[@]:-}"; do
+    [[ -n "$old_web_pid" ]] || continue
+    stop_owned_web_pid "$old_web_pid" || die "refused to stop unowned Web PID $old_web_pid"
+done
+rm -f "$PID_FILE"
+docker rm -f "$LEGACY_WEB_CONTAINER" >/dev/null 2>&1 || true
+port_is_free "$WEB_HOST" "$WEB_PORT" \
+    || die "$WEB_HOST:$WEB_PORT is still occupied after stopping the previous project service"
+python3 "$SCRIPT_DIR/scripts/serve.py" "$WEB_PORT" "$WEB_HOST" &
 WEB_PID=$!
+WEB_STARTED=1
 echo "$WEB_PID" > "$PID_FILE"
 sleep 0.3
-kill -0 "$WEB_PID" 2>/dev/null || { echo "  Web 服务启动失败"; exit 1; }
-echo "  Web 已启动 http://127.0.0.1:8080 (PID $WEB_PID)"
+is_owned_web_pid "$WEB_PID" || die "Web service failed to start"
+echo "  Web 已启动 http://$WEB_HOST:$WEB_PORT (PID $WEB_PID)"
 
-# ── 3. 等待模型加载 ──
 echo ""
-echo "=== 3/3 等待模型加载 ==="
-for i in $(seq 1 30); do
-  if curl -s http://127.0.0.1:5688/health 2>/dev/null | grep -q '"ok":true'; then
-    echo "  DA360+YOPO 就绪 (${i}s)"
-    break
-  fi
-  sleep 2
+echo "=== 4/4 验证健康状态 ==="
+deadline=$((SECONDS + STARTUP_TIMEOUT))
+ready=0
+while (( SECONDS < deadline )); do
+    if da360_health_ok && yopo_health_ok; then
+        ready=1
+        break
+    fi
+    sleep 2
 done
+if (( ready == 0 )); then
+    echo "  推理服务在 ${STARTUP_TIMEOUT}s 内未同时通过 DA360/YOPO 健康检查" >&2
+    docker logs --tail 80 "$API_CONTAINER" >&2 || true
+    exit 1
+fi
+echo "  DA360 与 YOPO 均已就绪"
 
-# ── Clash 规则 ──
-./fix-clash-rules.sh 2>/dev/null || true
+if [[ "${MINDCLOUD_FIX_CLASH:-0}" == "1" ]]; then
+    echo "  MINDCLOUD_FIX_CLASH=1：执行显式 Clash 修复"
+    "$SCRIPT_DIR/fix-clash-rules.sh" || echo "WARNING: Clash 修复失败" >&2
+fi
 
+START_COMPLETE=1
+trap - EXIT
 echo ""
 echo "========================================="
 echo " 全部就绪"
-echo "  Web:    http://127.0.0.1:8080"
-echo "  DA360:  http://127.0.0.1:5688/health"
-echo "  YOPO:   http://127.0.0.1:5688/yopo/health"
+echo "  Web:    http://$WEB_HOST:$WEB_PORT"
+echo "  DA360:  http://127.0.0.1:$API_PORT/health"
+echo "  YOPO:   http://127.0.0.1:$API_PORT/yopo/health"
 echo "========================================="
-echo ""
 echo "  启动 Firefox: ./launch-firefox-gpu.sh"
 echo "  停止全部:     ./stop-all.sh"
-echo ""

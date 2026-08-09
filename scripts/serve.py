@@ -16,11 +16,16 @@
 # limitations under the License.
 #
 
-"""Simple HTTP server for the Google 3D Tiles flight app.
+"""Local-only HTTP server for the Google 3D Tiles flight app.
 
-Serves static files under the project root (same as `python -m http.server`)
-plus a small persistence API for per-scene gate-course paths, see the
-`/api/path/` routes at the bottom of `Handler`.
+Only the application entry point and the explicit ``/src``, ``/asset`` and
+``/ThirdParty/Cesium`` mounts are exposed.  The project root is deliberately
+*not* a document root: it contains Git metadata, checkpoints, scripts and
+experiment notes which must never be reachable through the development web
+server.
+
+The server also provides the same-origin ``/api/path`` persistence API used by
+the gate-course editor.
 """
 
 import http.server
@@ -28,18 +33,28 @@ import socketserver
 import os
 import re
 import sys
+import tempfile
+from pathlib import Path
+from urllib.parse import unquote, urlsplit
 
 PORT = 8080
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-PATHS_DIR = os.path.join(PROJECT_ROOT, 'asset', 'gate-paths')
+DEFAULT_HOST = '127.0.0.1'
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PATHS_DIR = PROJECT_ROOT / 'asset' / 'gate-paths'
 # Cesium 静态资源目录：优先用环境变量，其次检查常见 Docker 镜像挂载点
-CESIUM_DIR = os.environ.get(
+CESIUM_DIR = Path(os.environ.get(
     'CESIUM_DIR',
     '/var/www/ThirdParty/Cesium' if os.path.isdir('/var/www/ThirdParty/Cesium')
-    else os.path.join(PROJECT_ROOT, 'third_party', 'Cesium')
-)
+    else str(PROJECT_ROOT / 'third_party' / 'Cesium')
+)).resolve()
 MAX_PATH_BODY = 64 * 1024  # 64 KB — tracks are a few hundred bytes each
 SAFE_NAME_RE = re.compile(r'^[A-Za-z0-9._-]{1,200}\.json$')
+ROOT_STATIC_FILES = {'/': 'index.html', '/index.html': 'index.html'}
+STATIC_MOUNTS = {
+    '/src/': PROJECT_ROOT / 'src',
+    '/asset/': PROJECT_ROOT / 'asset',
+    '/ThirdParty/Cesium/': CESIUM_DIR,
+}
 
 
 def _safe_path_file(name):
@@ -51,11 +66,32 @@ def _safe_path_file(name):
     """
     if not name or not SAFE_NAME_RE.match(name):
         return None
-    candidate = os.path.normpath(os.path.join(PATHS_DIR, name))
-    # os.path.commonpath raises on Windows drive mismatch — not a concern
-    # on this project's Linux-only deployment, but we still guard.
+    base = PATHS_DIR.resolve()
+    candidate = (base / name).resolve()
     try:
-        if os.path.commonpath([candidate, PATHS_DIR]) != PATHS_DIR:
+        if os.path.commonpath([str(candidate), str(base)]) != str(base):
+            return None
+    except ValueError:
+        return None
+    return str(candidate)
+
+
+def _contains_forbidden_segment(relative_path):
+    """Reject traversal, hidden files and platform-specific path tricks."""
+    if '\x00' in relative_path or '\\' in relative_path:
+        return True
+    parts = relative_path.split('/')
+    return any(part in {'.', '..'} or part.startswith('.') for part in parts if part)
+
+
+def _resolve_inside(base, relative_path):
+    """Resolve a URL-relative path and prove it remains under *base*."""
+    if _contains_forbidden_segment(relative_path):
+        return None
+    base = Path(base).resolve()
+    candidate = (base / relative_path).resolve()
+    try:
+        if os.path.commonpath([str(candidate), str(base)]) != str(base):
             return None
     except ValueError:
         return None
@@ -64,14 +100,49 @@ def _safe_path_file(name):
 
 class Handler(http.server.SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
-        super().__init__(*args, directory=PROJECT_ROOT, **kwargs)
+        self._resolved_static_path = None
+        super().__init__(*args, directory=str(PROJECT_ROOT), **kwargs)
 
     def translate_path(self, path):
-        """将 /ThirdParty/Cesium/... 映射到 third_party/Cesium/..."""
-        if path.startswith('/ThirdParty/Cesium/'):
-            rel = path[len('/ThirdParty/Cesium/'):]
-            return os.path.join(CESIUM_DIR, rel)
-        return super().translate_path(path)
+        """Return only the path pre-authorised by :meth:`_static_path`."""
+        if self._resolved_static_path is not None:
+            return str(self._resolved_static_path)
+        # ``send_head`` must never fall back to PROJECT_ROOT if a future
+        # handler method calls it without first performing the whitelist check.
+        return str(PROJECT_ROOT / '__forbidden_static_path__')
+
+    def _static_path(self):
+        try:
+            url_path = unquote(urlsplit(self.path or '/').path, errors='strict')
+        except (UnicodeDecodeError, ValueError):
+            return None
+        if url_path in ROOT_STATIC_FILES:
+            candidate = _resolve_inside(PROJECT_ROOT, ROOT_STATIC_FILES[url_path])
+        else:
+            candidate = None
+            for prefix, base in STATIC_MOUNTS.items():
+                if url_path.startswith(prefix):
+                    candidate = _resolve_inside(base, url_path[len(prefix):])
+                    break
+        # No directory listing and no implicit index lookup.  Symlink targets
+        # have already been constrained by ``_resolve_inside``.
+        return candidate if candidate is not None and candidate.is_file() else None
+
+    def _serve_static(self, head_only=False):
+        resolved = self._static_path()
+        if resolved is None:
+            self._send_plain(404, 'not found')
+            return
+        self._resolved_static_path = resolved
+        try:
+            if head_only:
+                response = self.send_head()
+                if response:
+                    response.close()
+            else:
+                super().do_GET()
+        finally:
+            self._resolved_static_path = None
 
     def handle(self):
         try:
@@ -80,10 +151,15 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             print(f"Client connection closed while handling request: {e}", file=sys.stderr)
 
     def end_headers(self):
-        # Enable CORS and proper MIME types for ES modules
-        self.send_header('Access-Control-Allow-Origin', '*')
-        self.send_header('Access-Control-Allow-Methods', 'GET, PUT, DELETE, OPTIONS')
-        self.send_header('Access-Control-Allow-Headers', 'Content-Type')
+        # This API is intentionally same-origin.  Do not add wildcard CORS:
+        # without it an unrelated web page cannot read or mutate local paths.
+        origin = self.headers.get('Origin')
+        if origin and self._origin_allowed(origin):
+            self.send_header('Access-Control-Allow-Origin', origin)
+            self.send_header('Vary', 'Origin')
+            self.send_header('Access-Control-Allow-Methods', 'GET, PUT, DELETE, OPTIONS')
+            self.send_header('Access-Control-Allow-Headers', 'Content-Type')
+        self.send_header('X-Content-Type-Options', 'nosniff')
         # Per-path caching: immutable assets get long max-age; HTML revalidates
         path_no_query = (self.path or '').split('?', 1)[0]
         # 开发服务器：所有动态资源 no-cache。长缓存只用于版本化的第三方库。
@@ -96,6 +172,17 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             self.send_header('Pragma', 'no-cache')
             self.send_header('Expires', '0')
         super().end_headers()
+
+    def _origin_allowed(self, origin):
+        host = self.headers.get('Host', '')
+        return origin in {f'http://{host}', f'https://{host}'}
+
+    def _reject_cross_origin_api(self):
+        origin = self.headers.get('Origin')
+        if origin and not self._origin_allowed(origin):
+            self._send_plain(403, 'cross-origin API access denied')
+            return True
+        return False
 
     def guess_type(self, path):
         if path.endswith('.js'):
@@ -135,13 +222,17 @@ class Handler(http.server.SimpleHTTPRequestHandler):
     def do_OPTIONS(self):
         # CORS pre-flight for PUT/DELETE issued by the browser.
         if self.path.startswith('/api/path/'):
+            if self._reject_cross_origin_api():
+                return
             self.send_response(204)
             self.end_headers()
             return
-        super().do_OPTIONS() if hasattr(super(), 'do_OPTIONS') else self._send_plain(405, 'method not allowed')
+        self._send_plain(405, 'method not allowed')
 
     def do_GET(self):
         if self.path.startswith('/api/path/'):
+            if self._reject_cross_origin_api():
+                return
             fp = self._handle_api()
             if fp is None:
                 return
@@ -160,12 +251,19 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
             return
-        # Fall through to static file serving.
-        super().do_GET()
+        self._serve_static()
+
+    def do_HEAD(self):
+        if self.path.startswith('/api/path/'):
+            self._send_plain(405, 'method not allowed')
+            return
+        self._serve_static(head_only=True)
 
     def do_PUT(self):
         if not self.path.startswith('/api/path/'):
             self._send_plain(405, 'PUT only allowed on /api/path/')
+            return
+        if self._reject_cross_origin_api():
             return
         fp = self._handle_api()
         if fp is None:
@@ -192,12 +290,20 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             # Write to a tempfile and rename so a crash mid-write doesn't
             # leave half a file on disk. Same-dir rename is atomic on
             # POSIX; good enough for single-user local persistence.
-            tmp = fp + '.tmp'
-            with open(tmp, 'wb') as f:
+            with tempfile.NamedTemporaryFile('wb', dir=PATHS_DIR, delete=False) as f:
+                tmp = f.name
                 f.write(body)
+                f.flush()
+                os.fsync(f.fileno())
             os.replace(tmp, fp)
         except OSError as e:
-            self._send_plain(500, f'write failed: {e}')
+            try:
+                if 'tmp' in locals():
+                    os.unlink(tmp)
+            except OSError:
+                pass
+            print(f'gate path write failed: {e}', file=sys.stderr)
+            self._send_plain(500, 'write failed')
             return
         self.send_response(204)
         self.end_headers()
@@ -205,6 +311,8 @@ class Handler(http.server.SimpleHTTPRequestHandler):
     def do_DELETE(self):
         if not self.path.startswith('/api/path/'):
             self._send_plain(405, 'DELETE only allowed on /api/path/')
+            return
+        if self._reject_cross_origin_api():
             return
         fp = self._handle_api()
         if fp is None:
@@ -227,9 +335,10 @@ class ReusableTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
 
 if __name__ == '__main__':
     port = int(sys.argv[1]) if len(sys.argv) > 1 else PORT
+    host = sys.argv[2] if len(sys.argv) > 2 else os.environ.get('MINDCLOUD_WEB_HOST', DEFAULT_HOST)
     os.makedirs(PATHS_DIR, exist_ok=True)
-    with ReusableTCPServer(("", port), Handler) as httpd:
-        print(f"Google 3D Tiles Flight running at http://127.0.0.1:{port}")
+    with ReusableTCPServer((host, port), Handler) as httpd:
+        print(f"Google 3D Tiles Flight running at http://{host}:{port}")
         print(f"Gate-path persistence: {PATHS_DIR}")
         print("Press Ctrl+C to stop")
         try:

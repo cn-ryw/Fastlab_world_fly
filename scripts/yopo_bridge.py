@@ -3,7 +3,7 @@
 
 POST /yopo/plan
   Input JSON: { depth: float32[192][384], pose: {x,y,z,qx,qy,qz,qw}, goal: {x,y,z},
-                vel: {vx,vy,vz}, yaw: float }
+                reference_pose: {x,y,z}, vel: {vx,vy,vz}, yaw: float }
   Output JSON: { endstate: [px,vx,ax, py,vy,ay, pz,vz,az], traj_time: 1.125,
                  score: float, fixed_height: float }
   注：响应里的 fixed_height 是**训练配置值**（0.8m），仅供参考。实际规划所用的
@@ -18,6 +18,7 @@ drone.js 与 tests/test_yopo_endstate_layout.js。
 """
 
 import argparse
+import hashlib
 import json
 import os
 import sys
@@ -45,18 +46,67 @@ DEFAULT_CONFIG = os.environ.get("YOPO_CONFIG", "x5_cruise15_18m_a12_mask_wc3.yam
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
+def _sha256_file(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def _load_model(model_path, device):
-    """Load YOPO model weights."""
+    """Load YOPO weights with safe deserialization and coverage checks."""
     if not Path(model_path).is_file():
         raise FileNotFoundError(f"YOPO checkpoint missing: {model_path}")
-    payload = torch.load(model_path, map_location=device, weights_only=False)
+    try:
+        payload = torch.load(model_path, map_location=device, weights_only=True)
+    except TypeError as exc:
+        if os.environ.get("YOPO_ALLOW_UNSAFE_CHECKPOINT", "0").strip().lower() \
+                not in {"1", "true", "yes", "on"}:
+            raise RuntimeError(
+                "this PyTorch version does not support safe weights_only loading; "
+                "upgrade PyTorch or explicitly set YOPO_ALLOW_UNSAFE_CHECKPOINT=1 "
+                "for a verified local checkpoint"
+            ) from exc
+        print("[YOPO] WARNING: unsafe checkpoint pickle loading explicitly enabled", file=sys.stderr)
+        payload = torch.load(model_path, map_location=device, weights_only=False)
+    except Exception as exc:
+        if os.environ.get("YOPO_ALLOW_UNSAFE_CHECKPOINT", "0").strip().lower() \
+                not in {"1", "true", "yes", "on"}:
+            raise RuntimeError(
+                "YOPO checkpoint was rejected by the safe tensor-only loader; "
+                "set YOPO_ALLOW_UNSAFE_CHECKPOINT=1 only for a verified local file"
+            ) from exc
+        print("[YOPO] WARNING: unsafe checkpoint pickle loading explicitly enabled", file=sys.stderr)
+        payload = torch.load(model_path, map_location=device, weights_only=False)
     state_dict = payload.get("model_state_dict", payload)
     net = YopoNetwork(
         observation_dim=9,
         output_dim=10,
         hidden_state=64,
     )
-    net.load_state_dict(state_dict, strict=False)
+    model_state = net.state_dict()
+    compatible = {
+        key: value for key, value in state_dict.items()
+        if key in model_state
+        and hasattr(value, "shape")
+        and tuple(value.shape) == tuple(model_state[key].shape)
+    }
+    total_numel = sum(value.numel() for value in model_state.values())
+    loaded_numel = sum(model_state[key].numel() for key in compatible)
+    coverage = loaded_numel / max(1, total_numel)
+    try:
+        minimum_coverage = float(os.environ.get("YOPO_MIN_CHECKPOINT_COVERAGE", "0.99"))
+    except ValueError:
+        minimum_coverage = 0.99
+    if coverage < minimum_coverage:
+        raise RuntimeError(
+            f"YOPO checkpoint coverage is too low: {coverage:.2%} < {minimum_coverage:.2%}"
+        )
+    incompatible = net.load_state_dict(compatible, strict=False)
+    net.checkpoint_coverage = coverage
+    net.checkpoint_missing_keys = len(incompatible.missing_keys)
+    net.checkpoint_unexpected_keys = len(incompatible.unexpected_keys)
     net.to(device)
     net.eval()
     return net
@@ -71,7 +121,15 @@ runner = None  # set by main()
 def health():
     if runner is None:
         return jsonify({"ok": False, "error": "not initialized"}), 503
-    return jsonify({"ok": True, "model": str(runner.model_path), "device": runner.device})
+    return jsonify({
+        "ok": True,
+        "model": Path(str(runner.model_path)).name,
+        "device": runner.device,
+        "checkpoint_sha256": runner.checkpoint_sha256,
+        "checkpoint_coverage": runner.checkpoint_coverage,
+        "config": runner.config_name,
+        "config_sha256": runner.config_sha256,
+    })
 
 
 @app.route("/yopo/plan", methods=["POST", "OPTIONS"])
@@ -89,6 +147,7 @@ def plan():
         # --- parse inputs ---
         depth_arr = np.array(data["depth"], dtype=np.float32)  # [192, 384]
         pose = data["pose"]    # {x,y,z,qx,qy,qz,qw}
+        reference_pose = data.get("reference_pose", data.get("reference_pos", pose))
         goal = data["goal"]    # {x,y,z}
         vel = data.get("vel", {"vx": 0, "vy": 0, "vz": 0})
         yaw = float(data.get("yaw", 0.0))
@@ -97,6 +156,9 @@ def plan():
         endstate, score, traj_time = runner.infer(
             depth_arr=depth_arr,
             pos=np.array([pose["x"], pose["y"], pose["z"]], dtype=np.float32),
+            reference_pos=np.array([
+                reference_pose["x"], reference_pose["y"], reference_pose["z"]
+            ], dtype=np.float32),
             vel=np.array([vel["vx"], vel["vy"], vel["vz"]], dtype=np.float32),
             acc=np.array([acc["ax"], acc["ay"], acc["az"]], dtype=np.float32),
             goal=np.array([goal["x"], goal["y"], goal["z"]], dtype=np.float32),
@@ -122,6 +184,28 @@ class YopoRunner:
         self.device = device
 
         self.net = _load_model(model_path, device)
+        actual_checkpoint_sha256 = _sha256_file(model_path)
+        expected_checkpoint_sha256 = os.environ.get("YOPO_MODEL_SHA256", "").strip().lower()
+        if expected_checkpoint_sha256 and actual_checkpoint_sha256 != expected_checkpoint_sha256:
+            raise RuntimeError(
+                "YOPO checkpoint fingerprint mismatch: "
+                f"{actual_checkpoint_sha256} != {expected_checkpoint_sha256}"
+            )
+        self.checkpoint_sha256 = actual_checkpoint_sha256
+        self.checkpoint_coverage = self.net.checkpoint_coverage
+        self.checkpoint_missing_keys = self.net.checkpoint_missing_keys
+        self.checkpoint_unexpected_keys = self.net.checkpoint_unexpected_keys
+        self.config_name = os.environ.get("YOPO_CONFIG", DEFAULT_CONFIG)
+        config_path = YOPO_ROOT / "YOPO" / "config" / self.config_name
+        if not config_path.is_file():
+            raise FileNotFoundError(f"YOPO config missing: {config_path}")
+        self.config_sha256 = _sha256_file(config_path)
+        expected_config_sha = os.environ.get("YOPO_CONFIG_SHA256", "").strip().lower()
+        if expected_config_sha and self.config_sha256 != expected_config_sha:
+            raise RuntimeError(
+                "YOPO config fingerprint mismatch: "
+                f"{self.config_sha256} != {expected_config_sha}"
+            )
         # channels_last 在 RTX 5070 Ti + PyTorch 2.8 + Flask 主进程中有 200x 减速 bug，
         # 症状同 DA360_CHANNELS_LAST。默认禁用，换 GPU/PyTorch 版本可重新启用。
         self.use_amp = device == "cuda" and os.environ.get("YOPO_AMP", "1") != "0"
@@ -150,12 +234,18 @@ class YopoRunner:
             self.net(dummy_depth, dummy_obs)
 
     @torch.inference_mode()
-    def infer(self, depth_arr, pos, vel, acc, goal, yaw):
+    def infer(self, depth_arr, pos, vel, acc, goal, yaw, reference_pos=None):
         """Run YOPO inference and return the decoded best endstate.
+
+        ``pos`` is the actual vehicle origin used to translate the decoded
+        world endpoint. ``reference_pos`` is the active polynomial reference
+        used only for the network goal observation (goal-reference).  Keeping
+        these origins separate matches the authoritative ROS implementation.
 
         Returns
         -------
-        endstate : np.ndarray  shape [9]  (px,py,pz,vx,vy,vz,ax,ay,az) world-frame
+        endstate : np.ndarray shape [9], axis-major
+                   (px,vx,ax, py,vy,ay, pz,vz,az) world-frame
         score    : float
         traj_time : float
         """
@@ -182,6 +272,11 @@ class YopoRunner:
         # YOPO world: x=east, y=north, z=up
         # -> YOPO x = sim_x, YOPO y = sim_z, YOPO z = sim_y
         yopo_pos = np.array([pos[0], pos[2], pos[1]], dtype=np.float32)
+        if reference_pos is None:
+            reference_pos = pos
+        yopo_reference_pos = np.array(
+            [reference_pos[0], reference_pos[2], reference_pos[1]], dtype=np.float32
+        )
         yopo_vel = np.array([vel[0], vel[2], vel[1]], dtype=np.float32) if vel is not None else np.zeros(3, dtype=np.float32)
         yopo_acc = np.array([acc[0], acc[2], acc[1]], dtype=np.float32) if acc is not None else np.zeros(3, dtype=np.float32)
         yopo_goal = np.array([goal[0], goal[2], goal[1]], dtype=np.float32)
@@ -208,7 +303,7 @@ class YopoRunner:
 
         vel_c = np.dot(Rotation_cw, yopo_vel)
         acc_c = np.dot(Rotation_cw, yopo_acc)
-        goal_w = yopo_goal - yopo_pos
+        goal_w = yopo_goal - yopo_reference_pos
         goal_c = np.dot(Rotation_cw, goal_w)
 
         obs = np.concatenate([vel_c, acc_c, goal_c], axis=0).astype(np.float32)
@@ -261,7 +356,7 @@ class YopoRunner:
 def parse_args():
     p = argparse.ArgumentParser(description="YOPO planning bridge API")
     p.add_argument("--model-path", default=DEFAULT_MODEL)
-    p.add_argument("--host", default="0.0.0.0")
+    p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", default=5699, type=int)
     p.add_argument("--debug", action="store_true")
     return p.parse_args()
