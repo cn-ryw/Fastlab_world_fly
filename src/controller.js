@@ -35,12 +35,14 @@ const SETTINGS_IDS = [
     'cam-hfov',
     'cam-mount-angle',
     'ctrl-pos-kp', 'ctrl-pos-ki', 'ctrl-pos-kd', 'ctrl-vel-kp', 'ctrl-vel-ki', 'ctrl-vel-kd', 'ctrl-alt-kp', 'ctrl-alt-ki', 'ctrl-alt-kd',
+    'so3-kx', 'so3-kv', 'so3-kr', 'so3-komega',
     'phys-mass', 'phys-thrust', 'phys-drag-cd', 'phys-drag-area',
     'phys-drone-size', 'phys-collision-radius',
     'clean-mode-toggle', 'osd-toggle',
+    'pano-level-toggle', 'yaw-lock-toggle',
 ];
 
-const CONFIG_VERSION = 3;
+const CONFIG_VERSION = 4;
 const DEFAULT_EASY_MAX_SPEED = '83.333';
 const DEFAULT_EASY_MAX_VSPEED = '8';
 const DEFAULT_DRAG_AREA = '0.0015';
@@ -100,6 +102,8 @@ const KEYBOARD_MAP = {
     'KeyS':       { action: 'throttle', value: -1 },
     'KeyA':       { action: 'yaw',      value: -1 },
     'KeyD':       { action: 'yaw',      value: 1 },
+    // Arrow keys = drone position control (Easy/Drone mode):
+    //   pitch → fwd/back velocity,  roll → left/right velocity
     'ArrowUp':    { action: 'pitch',    value: -1 },
     'ArrowDown':  { action: 'pitch',    value: 1 },
     'ArrowLeft':  { action: 'roll',     value: -1 },
@@ -2036,8 +2040,14 @@ export class Controller {
         this._bindSliderNum('ctrl-vel-kd', 'ctrl-vel-kd-num');
         this._bindSliderNum('ctrl-alt-kd', 'ctrl-alt-kd-num');
 
+        // SO3 geometric controller gains
+        this._bindSliderNum('so3-kx', 'so3-kx-num');
+        this._bindSliderNum('so3-kv', 'so3-kv-num');
+        this._bindSliderNum('so3-kr', 'so3-kr-num');
+        this._bindSliderNum('so3-komega', 'so3-komega-num');
+
         // Display toggle checkboxes
-        for (const cbId of ['clean-mode-toggle', 'osd-toggle']) {
+        for (const cbId of ['clean-mode-toggle', 'osd-toggle', 'pano-level-toggle', 'yaw-lock-toggle']) {
             const cb = document.getElementById(cbId);
             if (cb && !cb._bound) {
                 cb._bound = true;
@@ -2110,6 +2120,18 @@ export class Controller {
             const savedDragArea = Number(settings['phys-drag-area']);
             if (!Number.isFinite(savedDragArea) || savedDragArea === PREVIOUS_DRAG_AREA) {
                 settings['phys-drag-area'] = DEFAULT_DRAG_AREA;
+            }
+        }
+        // v4: mass 500→980g, thrust 1000→2600gf (YOPO Hummingbird params)
+        if (version < 4 && config.settings && typeof config.settings === 'object') {
+            const settings = config.settings;
+            const savedMass = Number(settings['phys-mass']);
+            if (!Number.isFinite(savedMass) || savedMass <= 510) {
+                settings['phys-mass'] = '980';
+            }
+            const savedThrust = Number(settings['phys-thrust']);
+            if (!Number.isFinite(savedThrust) || savedThrust <= 1010) {
+                settings['phys-thrust'] = '2600';
             }
         }
         config.configVersion = CONFIG_VERSION;

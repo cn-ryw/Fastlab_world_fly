@@ -38,6 +38,15 @@ const DEFAULT_VIEW = {
     height: 1800,
 };
 const CESIUM_DRONE_MODEL_URI = 'asset/models/CesiumDrone.glb';
+// CesiumDrone.glb 的原始包围盒为 3.964 × 1.120 × 4.668 单位（水平最大跨度 4.668）。
+// 目标是让渲染尺寸匹配物理机体：半径约 0.4 m，即跨度 0.8 m。
+//   scale = 0.8 / 4.668 ≈ 0.171
+// 旧默认值 1.35 会渲染出 6.3 m 跨度（等效半径 3.15 m），比物理碰撞半径
+// (collisionRadius = 0.6 m) 大一个数量级，视觉上完全失真。
+const CESIUM_DRONE_MODEL_SCALE = clampNumber(
+    urlNumber('droneScale', 0.171),
+    0.01, 10.0, 0.171
+);
 const HEIGHT_CACHE_TTL_MS = 140;
 const HEIGHT_CACHE_LIMIT = 256;
 const PANORAMA_FACE_DEFS = [
@@ -226,8 +235,9 @@ class PanoramaEquirectProjector {
             vec3 directionFromPitchYaw(float pitch, float yaw) {
                 float cosPitch = cos(pitch);
                 float forward = cosPitch * cos(yaw);
-                float left = cosPitch * sin(yaw);
-                return normalize(vec3(left, sin(pitch), -forward));
+                float right = cosPitch * sin(yaw);
+                // negate x → mirror left/right to match YOPO training ERP layout
+                return normalize(vec3(-right, sin(pitch), -forward));
             }
 
             void main() {
@@ -408,10 +418,10 @@ export class CesiumWorld {
             2048
         ));
         this.panoramaTileSSE = clampNumber(
-            urlNumber('panoramaTileSse', options.panoramaTileSSE ?? 32),
+            urlNumber('panoramaTileSse', options.panoramaTileSSE ?? 512),
             4,
-            128,
-            32
+            1024,
+            512
         );
         this.Cesium = null;
         this.viewer = null;
@@ -429,6 +439,7 @@ export class CesiumWorld {
         this.enuToFixed = null;
         this.fixedToEnu = null;
         this.spawnMarker = null;
+        this._goalMarker = null;
         this.aircraftEntities = [];
         this.aircraftModelEntity = null;
         this._aircraftModelPosition = null;
@@ -468,15 +479,18 @@ export class CesiumWorld {
             shouldAnimate: true,
             globe: false,
             skyAtmosphere: new Cesium.SkyAtmosphere(),
-            requestRenderMode: false,
-            targetFrameRate: 60,
+            requestRenderMode: true,    // Cesium 社区 #1 CPU 优化：空闲时 0% CPU
+            // GPU仅7%，瓶颈在主线程 Cesium 场景遍历。降目标帧率 + 降分辨率双重释压
+            targetFrameRate: 20,
+            // resolutionScale 降低渲染像素数，同时减少 CPU draw-call 准备开销
+            resolutionScale: 0.7,
             useBrowserRecommendedResolution: true,
             orderIndependentTranslucency: false,
             contextOptions: {
                 webgl: {
                     alpha: false,
                     antialias: false,
-                    preserveDrawingBuffer: true,
+                    preserveDrawingBuffer: false,
                     powerPreference: 'high-performance',
                     failIfMajorPerformanceCaveat: false,
                 },
@@ -517,7 +531,7 @@ export class CesiumWorld {
         this.viewer.scene.requestRender();
         if (progressCb) progressCb('Waiting for initial Google 3D Tiles...');
         await new Promise(resolve => window.setTimeout(resolve, 150));
-        await this.waitForTilesIdle(4500, 250);
+        await this.waitForTilesIdle(3000, 250);
 
         this.ready = true;
         this.viewer.scene.requestRender();
@@ -630,6 +644,9 @@ export class CesiumWorld {
         setIfPresent('foveatedScreenSpaceError', true);
         setIfPresent('foveatedConeSize', flightMode ? 0.2 : 0.28);
         setIfPresent('foveatedMinimumScreenSpaceErrorRelaxation', flightMode ? 4 : 2);
+        setIfPresent('dynamicScreenSpaceError', true);               // 远处自动降 LOD
+        setIfPresent('dynamicScreenSpaceErrorDensity', 0.2);
+        setIfPresent('dynamicScreenSpaceErrorFactor', 4.0);
         setIfPresent('foveatedTimeDelay', flightMode ? 0.08 : 0.15);
         setIfPresent('dynamicScreenSpaceError', true);
         setIfPresent('dynamicScreenSpaceErrorDensity', flightMode ? 0.0035 : 0.0025);
@@ -697,7 +714,6 @@ export class CesiumWorld {
                     renderViewer.scene
                 ) {
                     renderViewer.scene.requestRender();
-                    this._renderViewerNow(renderViewer);
                 }
                 const now = performance.now();
                 const pending = loadState ? loadState.pending : this._tileLoadPending;
@@ -1119,6 +1135,39 @@ export class CesiumWorld {
         if (this.spawnMarker) this.spawnMarker.show = false;
     }
 
+    showGoalMarker(local) {
+        const Cesium = this.Cesium;
+        if (this._goalMarker) this.viewer.entities.remove(this._goalMarker);
+        const pos = this.localToCartesian(local);
+        const groundPos = this.localToCartesian({ x: local.x, y: 0, z: local.z });
+        this._goalMarker = this.viewer.entities.add({
+            position: pos,
+            point: { pixelSize: 10, color: Cesium.Color.LIME, outlineColor: Cesium.Color.BLACK, outlineWidth: 2 },
+            label: {
+                text: `${Math.round(local.y)}m`,
+                font: `${(typeof window !== 'undefined' && window._goalFontSize) || 18}px Chakra Petch, monospace`,
+                fillColor: Cesium.Color.LIME,
+                outlineColor: Cesium.Color.BLACK,
+                outlineWidth: 3,
+                style: Cesium.LabelStyle.FILL_AND_OUTLINE,
+                verticalOrigin: Cesium.VerticalOrigin.BOTTOM,
+                pixelOffset: new Cesium.Cartesian2(0, -14),
+            },
+            polyline: {
+                positions: [groundPos, pos],
+                material: new Cesium.PolylineDashMaterialProperty({ color: Cesium.Color.LIME.withAlpha(0.6), dashLength: 8 }),
+                width: 2,
+            },
+        });
+    }
+
+    clearGoalMarker() {
+        if (this._goalMarker) {
+            this.viewer.entities.remove(this._goalMarker);
+            this._goalMarker = null;
+        }
+    }
+
     _collisionExclusions() {
         const excluded = [];
         if (this.spawnMarker) excluded.push(this.spawnMarker);
@@ -1149,9 +1198,12 @@ export class CesiumWorld {
             ), false),
             model: {
                 uri: CESIUM_DRONE_MODEL_URI,
-                scale: 1.35,
-                minimumPixelSize: 44,
-                maximumScale: 18,
+                scale: CESIUM_DRONE_MODEL_SCALE,
+                // minimumPixelSize 会在远距离强行把模型撑到给定屏占像素，
+                // 从而让实际观感脱离物理尺寸。之前的 44 是视觉过大的第二个原因，
+                // 这里降到刚好保证远处可见的程度。
+                minimumPixelSize: 8,
+                maximumScale: 4,
                 runAnimations: true,
                 incrementallyLoadTextures: false,
                 shadows: Cesium.ShadowMode.DISABLED,
@@ -1560,7 +1612,12 @@ export class CesiumWorld {
         }
 
         if (!this._panoramaInitPromise) {
-            this._panoramaInitPromise = this._createPanoramaCaptureViewer(faceSize)
+            const initTimeoutMs = 20000;
+            const initPromise = this._createPanoramaCaptureViewer(faceSize);
+            this._panoramaInitPromise = Promise.race([
+                initPromise,
+                new Promise((_, reject) => setTimeout(() => reject(new Error('Panorama capture viewer init timed out')), initTimeoutMs))
+            ])
                 .finally(() => {
                     this._panoramaInitPromise = null;
                 });
@@ -1612,6 +1669,7 @@ export class CesiumWorld {
         const frameDelayMs = Math.max(0, Math.min(1000, Number(options.frameDelayMs) || 0));
         const tileTimeoutMs = Math.max(0, Math.min(120000, Number(options.tileTimeoutMs) || 0));
         const tileQuietMs = Math.max(0, Math.min(5000, Number(options.tileQuietMs) || 0));
+        const captureAnyway = !!options.captureAnyway;
         const progressCb = typeof options.progressCb === 'function' ? options.progressCb : null;
         const sleep = (ms) => new Promise(resolve => window.setTimeout(resolve, ms));
 
@@ -1638,6 +1696,10 @@ export class CesiumWorld {
                     await sleep(frameDelayMs);
                     viewer.scene.requestRender();
                     this._renderViewerNow(viewer);
+                }
+                if (captureAnyway) {
+                    projector.updateFace(faceDef.name, viewer.scene.canvas);
+                    continue;
                 }
                 if (tileTimeoutMs > 0) {
                     const tilesReady = await this.waitForTilesIdle(
@@ -1694,6 +1756,7 @@ export class CesiumWorld {
             frameDelayMs: options.frameDelayMs,
             tileTimeoutMs: options.tileTimeoutMs,
             tileQuietMs: options.tileQuietMs,
+            captureAnyway: options.captureAnyway,
             progressCb: options.progressCb,
         });
     }
@@ -1715,6 +1778,7 @@ export class CesiumWorld {
             frameDelayMs: options.frameDelayMs,
             tileTimeoutMs: options.tileTimeoutMs,
             tileQuietMs: options.tileQuietMs,
+            captureAnyway: options.captureAnyway,
             progressCb: options.progressCb,
         });
     }

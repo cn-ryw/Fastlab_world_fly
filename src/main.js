@@ -26,10 +26,11 @@
 import { CesiumWorld } from './cesium-world.js?v=20260703-panorama-tile-idle';
 import { TilesCollisionProvider } from './tiles-collision.js';
 import { Controller } from './controller.js';
-import { Drone } from './drone.js';
+import { Drone } from './drone.js?v=20260807';
 import { HUD } from './hud.js';
 import { OSD } from './osd.js';
-import { PanoramaSensor } from './panorama-sensor.js';
+import { PanoramaSensor } from './panorama-sensor.js?v=20260807';
+import { FlightLogger } from './flight-logger.js?v=20260807';
 import { reportUserError } from './error-report.js';
 
 let world = null;
@@ -39,6 +40,7 @@ let controller = null;
 let hud = null;
 let osd = null;
 let panoramaSensor = null;
+let flightLogger = null;
 
 let mode = 'loading'; // loading | placement | view-select | flight
 let cameraMode = 'first'; // first | third
@@ -50,6 +52,7 @@ let lastFrameTime = 0;
 let placementKeysDown = new Set();
 let placementInitClickUntil = 0;
 let screenHandler = null;
+let flightGoalHandler = null;
 let spawnConfirmInProgress = false;
 let startTilesModeInProgress = false;
 let panoramaWarmupPromise = null;
@@ -75,7 +78,7 @@ const FLIGHT_PRELOAD_MIN_COVERAGE = urlNumber('flightPreloadMinCoverage', 0.95, 
 const FLIGHT_PRELOAD_VIEW_TIMEOUT_MS = Math.round(urlNumber('flightPreloadViewTimeoutMs', 20000, 3000, 60000));
 const FLIGHT_PRELOAD_VIEW_ATTEMPTS = Math.round(urlNumber('flightPreloadViewAttempts', 2, 1, 5));
 const FLIGHT_PRELOAD_STRICT = urlNumber('flightPreloadStrict', 0, 0, 1) >= 0.5;
-const PANORAMA_PRELOAD_REQUIRED = urlNumber('panoPreloadRequired', 1, 0, 1) >= 0.5;
+const PANORAMA_PRELOAD_REQUIRED = urlNumber('panoPreloadRequired', 0, 0, 1) >= 0.5;
 const VIEW_CHOICE_HINT_HTML = '1 / O: First Person &nbsp;|&nbsp; 2: Third Person<br>Easy speed: ↑/↓ forward/back, Shift boost, Tab &gt; Easy Max Speed';
 const MAX_PHYSICS_FRAME_DT = 0.25;
 const PHYSICS_SUBSTEP_DT = 0.05;
@@ -213,9 +216,11 @@ function initSubsystems() {
 
     controller = new Controller();
     drone = new Drone();
+    window.__drone = drone;  // debug: inspect mass/thrust from console
     hud = new HUD();
     osd = new OSD('osd-canvas');
     panoramaSensor = new PanoramaSensor();
+    if (!flightLogger) flightLogger = new FlightLogger();
 
     setupDisplaySettingsListeners();
 }
@@ -233,6 +238,10 @@ export async function startTilesMode() {
         if (screenHandler) {
             screenHandler.destroy();
             screenHandler = null;
+        }
+        if (flightGoalHandler) {
+            flightGoalHandler.destroy();
+            flightGoalHandler = null;
         }
         if (world) world.destroy();
         panoramaWarmupPromise = null;
@@ -338,9 +347,9 @@ async function preloadInitialFlightViewsBeforeControl() {
     const bodyTransform = drone.getBodyTransform ? drone.getBodyTransform() : drone.getCameraTransform();
     const cameraTransform = drone.getCameraTransform();
     const settleOptions = {
-        dwellMs: 260,
+        dwellMs: 180,
         timeoutMs: FLIGHT_PRELOAD_VIEW_TIMEOUT_MS,
-        quietMs: 650,
+        quietMs: 500,
     };
 
     world.setFlightPerformanceMode(true);
@@ -412,7 +421,116 @@ function setupCesiumPlacementHandler() {
     }, Cesium.ScreenSpaceEventType.LEFT_CLICK);
 }
 
+// 目标高度覆盖值：null = 沿用无人机当前高度（等价于参考实现 callback_set_goal
+// 里"目标落在当前 fixed_height 平面"的行为）；用户按住 G 滚滚轮后变为显式高度，
+// 等价于 callback_set_goal_3d 移动整个高度平面。按 C 取消航点时复位。
+let goalAltitudeOverride = null;
+
+function setupFlightGoalClickHandler() {
+    if (!world || !world.viewer || flightGoalHandler) return;
+    const Cesium = world.Cesium;
+    const canvas = world.viewer.scene.canvas;
+
+    let _goalGdown = false;
+    const onMouseDown = (e) => {
+        if (mode !== 'flight' || !drone) return;
+        if (drone.flightMode !== 'so3') return;
+        if (!_goalGdown) { console.log('[G+click] G not held, _goalGdown=' + _goalGdown); return; }
+        console.log('[G+click] picking...');
+
+        e.stopPropagation();
+        e.preventDefault();
+
+        const rect = canvas.getBoundingClientRect();
+        const clickPos = new Cesium.Cartesian2(e.clientX - rect.left, e.clientY - rect.top);
+
+        let cartesian = null;
+        try {
+            if (world.viewer.scene.pickPositionSupported) {
+                const p = world.viewer.scene.pickPosition(clickPos);
+                if (Cesium.defined(p)) cartesian = p;
+            }
+        } catch (_) {}
+        if (!cartesian) {
+            try {
+                const p = world.viewer.camera.pickEllipsoid(clickPos, Cesium.Ellipsoid.WGS84);
+                if (Cesium.defined(p)) cartesian = p;
+            } catch (_) {}
+        }
+        if (!cartesian) { console.log('[goal] no ground — click on buildings/terrain, not sky'); return; }
+
+        const local = world.cartesianToLocal(cartesian);
+        const altY = goalAltitudeOverride != null ? goalAltitudeOverride : drone.y;
+        console.log('[goal] SET:', local.x.toFixed(1), altY.toFixed(1), local.z.toFixed(1),
+            goalAltitudeOverride != null ? '(高度已手动指定)' : '(沿用当前高度)');
+        drone.setIdealGoal({ x: local.x, y: altY, z: local.z });
+        world.showGoalMarker({ x: local.x, y: altY, z: local.z });
+        // 目标高度即 YOPO 的高度平面，服务端会把轨迹末端拉到该平面
+        panoramaSensor?.setYopoGoal({ x: local.x, y: altY, z: local.z });
+        flightLogger?.start({ x: local.x, y: altY, z: local.z }, spawnAltitudeMeters);
+    };
+
+    // Track G key state
+    window.addEventListener('keydown', (e) => {
+        if (e.code === 'KeyG' && mode === 'flight' && drone && (drone.flightMode === 'so3')) {
+            _goalGdown = true;
+            console.log('[G key] DOWN');
+        }
+    }, true);
+    window.addEventListener('keyup', (e) => {
+        if (e.code === 'KeyG') { _goalGdown = false; console.log('[G key] UP'); }
+    }, true);
+    window.addEventListener('blur', () => { _goalGdown = false; });
+
+    canvas.addEventListener('pointerdown', onMouseDown, true);
+
+    // Click on radar minimap also sets goal
+    const radarCanvas = document.getElementById('radar-canvas');
+    if (radarCanvas) {
+        radarCanvas.addEventListener('mousedown', (e) => {
+            if (mode !== 'flight' || !drone || drone.flightMode !== 'so3') return;
+            e.stopPropagation();
+            const rw = radarCanvas.width, rh = radarCanvas.height;
+            const range = 200; // must match drawRadar
+            const scale = (rw/2 - 10) / range;
+            const rx = (e.offsetX - rw/2) / scale;
+            const rz = -(e.offsetY - rh/2) / scale; // invert Y
+            const goalX = drone.x + rx;
+            const goalZ = drone.z + rz;
+            const altY = goalAltitudeOverride != null ? goalAltitudeOverride : drone.y;
+            console.log('[radar goal] SET:', goalX.toFixed(1), altY.toFixed(1), goalZ.toFixed(1));
+            drone.setIdealGoal({ x: goalX, y: altY, z: goalZ });
+            world.showGoalMarker({ x: goalX, y: altY, z: goalZ });
+            panoramaSensor?.setYopoGoal({ x: goalX, y: altY, z: goalZ });
+            flightLogger?.start({ x: goalX, y: altY, z: goalZ }, spawnAltitudeMeters);
+        });
+    }
+
+    // mouse wheel adjusts goal altitude when G is held
+    const onWheel = (e) => {
+        if (mode !== 'flight' || !drone || drone.flightMode !== 'so3') return;
+        if (!placementKeysDown.has('KeyG')) return;
+        e.stopPropagation();
+        e.preventDefault();
+        const step = placementKeysDown.has('ShiftLeft') || placementKeysDown.has('ShiftRight') ? 25 : 5;
+        // 首次滚动从当前高度起步，之后才是纯粹的增量调整
+        const base = goalAltitudeOverride != null ? goalAltitudeOverride : drone.y;
+        goalAltitudeOverride = Math.max(SPAWN_ALTITUDE_MIN,
+            Math.min(SPAWN_ALTITUDE_MAX, base - Math.sign(e.deltaY) * step));
+        console.log('[goal] 目标高度:', goalAltitudeOverride.toFixed(1), 'm');
+    };
+    canvas.addEventListener('wheel', onWheel, { passive: false, capture: true });
+
+    // Store for cleanup
+    flightGoalHandler = { destroy: () => {
+        canvas.removeEventListener('mousedown', onMouseDown, true);
+        canvas.removeEventListener('wheel', onWheel, { capture: true });
+    }};
+}
+
 async function enterPlacementMode(autoPick = false) {
+    flightLogger?.stop(false);  // cancel any active recording
+
     if (!world) return;
     mode = 'placement';
 
@@ -486,14 +604,14 @@ async function confirmSpawnAndFly() {
                 gridSpacing: 160,
                 viewDistance: 240,
                 maxTargets: 22,
-                dwellMs: 220,
-                perViewTimeoutMs: 3200,
-                finalIdleTimeoutMs: 20000,
+                dwellMs: 160,
+                perViewTimeoutMs: 2500,
+                finalIdleTimeoutMs: 15000,
                 verifyCoverage: true,
                 coverageSpacing: 160,
                 minCoverageRatio: FLIGHT_PRELOAD_MIN_COVERAGE,
-                repairPasses: 2,
-                repairTargets: 22,
+                repairPasses: 1,
+                repairTargets: 12,
                 progressCb: setProgress,
             });
             const coverage = preload && preload.coverage ? preload.coverage.ratio : 0;
@@ -532,6 +650,10 @@ async function confirmSpawnAndFly() {
             rememberFlightStartWarning(`flight tile preload skipped: ${shortStatusMessage(msg)}`);
         }
 
+        // Run flight-view preload first to warm main tileset cache, then
+        // panorama preload second — serialized because parallel streaming
+        // from two independent Google tilesets competes for bandwidth and
+        // leaves both caches cold.
         try {
             await preloadInitialFlightViewsBeforeControl();
         } catch (e) {
@@ -585,6 +707,18 @@ function startFlight(viewMode = 'first') {
     hud?.show();
     if (!panoramaSensor?.hasRgbFrame?.()) panoramaSensor?.reset();
     panoramaSensor?.setActive(true);
+
+    // Wire YOPO: depth → YOPO plan → drone trajectory
+    if (panoramaSensor) {
+        panoramaSensor.onYopoResult = (endstate, trajTime) => {
+            drone?.setYopoTrajectory(endstate, trajTime);
+        };
+        panoramaSensor.onDepthResult = (latencyMs) => { flightLogger?.recordDepth(latencyMs); };
+        panoramaSensor.onYopoLatency = (latencyMs) => { flightLogger?.recordYopo(latencyMs); };
+    }
+
+    // Setup click-to-goal for ideal mode
+    setupFlightGoalClickHandler();
 
     const transform = drone.getBodyTransform ? drone.getBodyTransform() : drone.getCameraTransform();
     if (cameraMode === 'third') {
@@ -652,6 +786,73 @@ function getCameraHFov(now = performance.now()) {
     const v = el ? parseFloat(el.value) : 120;
     cachedHFov = Number.isFinite(v) ? v : 120;
     return cachedHFov;
+}
+
+function drawRadar() {
+    const panel = document.getElementById('radar-panel');
+    const canvas = document.getElementById('radar-canvas');
+    if (!panel || !canvas || !drone) return;
+    if (mode !== 'flight') { panel.classList.remove('visible'); return; }
+    panel.classList.add('visible');
+
+    const ctx = canvas.getContext('2d');
+    const w = canvas.width, h = canvas.height, cx = w/2, cy = h/2;
+    const range = 200; // meters
+    const scale = (w/2 - 10) / range;
+
+    ctx.clearRect(0, 0, w, h);
+    // Background
+    ctx.fillStyle = 'rgba(3,7,18,0.95)';
+    ctx.fillRect(0, 0, w, h);
+
+    // Range rings
+    for (let r = 50; r <= range; r += 50) {
+        ctx.beginPath();
+        ctx.arc(cx, cy, r * scale, 0, Math.PI * 2);
+        ctx.strokeStyle = 'rgba(125,211,252,0.15)';
+        ctx.stroke();
+    }
+
+    // North indicator
+    ctx.strokeStyle = '#f44';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(cx, cy); ctx.lineTo(cx, 8);
+    ctx.stroke();
+
+    // Drone (green dot, facing direction)
+    const dx = drone.x * scale, dz = -drone.z * scale; // x=east→right, z=north→up
+    const droneSx = cx + dx, droneSy = cy + dz;
+    ctx.fillStyle = '#0f0';
+    ctx.beginPath();
+    ctx.arc(droneSx, droneSy, 5, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Goal (red dot)
+    const goal = drone._idealGoal;
+    if (goal) {
+        const gx = goal.x * scale, gz = -goal.z * scale;
+        const goalSx = cx + gx, goalSy = cy + gz;
+        ctx.fillStyle = '#f44';
+        ctx.beginPath();
+        ctx.arc(goalSx, goalSy, 4, 0, Math.PI * 2);
+        ctx.fill();
+        // Line from drone to goal
+        ctx.strokeStyle = 'rgba(255,64,43,0.5)';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(droneSx, droneSy);
+        ctx.lineTo(goalSx, goalSy);
+        ctx.stroke();
+    }
+
+    // Range text
+    document.querySelector('.radar-range').textContent = `${range}m`;
+    // Drone position text
+    ctx.fillStyle = '#7dd3fc';
+    ctx.font = '8px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText(`${drone.x.toFixed(0)},${drone.z.toFixed(0)}`, droneSx, droneSy + 16);
 }
 
 function gameLoop(now) {
@@ -724,8 +925,44 @@ function updateFlight(dt) {
         world.setCameraFromDroneTransform(cameraTransform, getCameraHFov(now));
     }
 
-    const panoramaTransform = drone.getPanoramaTransform ? drone.getPanoramaTransform() : bodyTransform;
+    // Level panorama horizon if checkbox enabled (default on, like YOPO use_leveled_depth)
+    const panoLevelEl = document.getElementById('pano-level-toggle');
+    const useLeveled = panoLevelEl ? panoLevelEl.checked : true;
+    const panoramaTransform = useLeveled && drone.getLeveledPanoramaTransform
+        ? drone.getLeveledPanoramaTransform()
+        : (drone.getPanoramaTransform ? drone.getPanoramaTransform() : bodyTransform);
+    if (!updateFlight._loggedPanoMode) {
+        console.log(`[pano] leveled=${useLeveled} method=${useLeveled && drone.getLeveledPanoramaTransform ? 'getLeveledPanoramaTransform' : 'getPanoramaTransform'}`);
+        updateFlight._loggedPanoMode = true;
+    }
+    // 位姿必须在 panorama update 之前设置——_requestDepth 在 update 内触发
+    // plan_full 需要 _yopoGoal && _yopoPose 同时非空才走一次调用
+    if (panoramaSensor && drone) {
+        panoramaSensor.setYopoPose(
+            { x: drone.x, y: drone.y, z: drone.z, vx: drone.vx, vy: drone.vy, vz: drone.vz },
+            drone.getFixedYaw ? drone.getFixedYaw() : drone.yaw
+        );
+    }
     panoramaSensor?.update(world, panoramaTransform, now);
+
+    // Flight log recording
+    if (flightLogger?.recording) {
+        const ref = drone._yopoPolyX ? drone._getYopoReference
+            ? drone._getYopoReference(drone._yopoTrackerTime || 0)
+            : { x: drone.x, y: drone.y, z: drone.z }
+            : (drone._idealGoal ? drone._idealGoal : { x: drone.x, y: drone.y, z: drone.z });
+        flightLogger.record(drone, ref?.x ?? drone.x, ref?.y ?? drone.y, ref?.z ?? drone.z);
+    }
+    // 到达判定：仅当 YOPO 轨迹曾被启动、目标已被清除、且无活跃轨迹/衰减时触发。
+    // _yopoPlanTriggered 门控防止"设目标即 4m 内"的假到达。
+    if (drone._yopoPlanTriggered && !drone._idealGoal && !drone._yopoPolyX && !drone._yopoDecayRef) {
+        panoramaSensor?.resetYopoGoal();  // 先停 YOPO，后续深度帧只显示不再规划
+        drone._yopoPlanTriggered = false;
+        flightLogger?.stop(true);
+    }
+
+    // Radar minimap
+    drawRadar();
     hud?.update(drone, controller, null);
     applyDisplaySettings();
     osd?.update(drone, controller);
@@ -771,6 +1008,44 @@ function setupDisplaySettingsListeners() {
         el._tilesDisplayBound = true;
         el.addEventListener('change', applyDisplaySettings);
     }
+    // Drone model scale slider
+    const modelScaleSlider = document.getElementById('drone-model-scale');
+    const modelScaleNum = document.getElementById('drone-model-scale-num');
+    if (modelScaleSlider && modelScaleNum && !modelScaleSlider._bound) {
+        modelScaleSlider._bound = true;
+        const sync = () => {
+            const v = parseFloat(modelScaleSlider.value);
+            modelScaleNum.value = v;
+            // 属性名是 aircraftModelEntity（无下划线）。此前误写成 _aircraftModelEntity，
+            // 取到 undefined，滑块一直是空操作。
+            if (world && world.aircraftModelEntity && world.aircraftModelEntity.model) {
+                world.aircraftModelEntity.model.scale = v;
+            }
+        };
+        modelScaleSlider.addEventListener('input', sync);
+        modelScaleNum.addEventListener('change', () => {
+            modelScaleSlider.value = modelScaleNum.value;
+            sync();
+        });
+    }
+    // Goal font size slider
+    const goalFontSlider = document.getElementById('goal-font-size');
+    const goalFontNum = document.getElementById('goal-font-size-num');
+    if (goalFontSlider && goalFontNum && !goalFontSlider._bound) {
+        goalFontSlider._bound = true;
+        const sync = () => {
+            const v = parseInt(goalFontSlider.value);
+            goalFontNum.value = v;
+            // stored for showGoalMarker
+            window._goalFontSize = v;
+        };
+        goalFontSlider.addEventListener('input', sync);
+        goalFontNum.addEventListener('change', () => {
+            goalFontSlider.value = goalFontNum.value;
+            sync();
+        });
+        sync();
+    }
 }
 
 function setupSpawnAltitudeControls() {
@@ -815,14 +1090,30 @@ function updateKeyGuide() {
         el.classList.remove('visible');
         return;
     }
-    const isFPV = drone && drone.flightMode === 'fpv';
-    const title = isFPV ? 'FLIGHT CONTROLS - FPV' : 'FLIGHT CONTROLS - EASY';
+    const fm = drone ? drone.flightMode : '';
+    const isFPV = fm === 'fpv';
+    const isStab = fm === 'stabilized';
+    const isSO3 = fm === 'so3';
+    const title = isFPV ? 'FLIGHT CONTROLS - FPV' : isStab ? 'FLIGHT CONTROLS - STABILIZED' : isSO3 ? 'FLIGHT CONTROLS - SO3' : 'FLIGHT CONTROLS - EASY';
+
     const rows = isFPV ? [
         '<kbd>↑ ↓</kbd>  Pitch Forward / Back',
         '<kbd>← →</kbd>  Roll Left / Right',
         '<kbd>W S</kbd>  Motor Thrust',
         '<kbd>A D</kbd>  Yaw Left / Right',
         '<span style="color:#8cff8c">Nose down builds forward speed</span>',
+    ] : isStab ? [
+        '<kbd>↑ ↓</kbd>  Tilt Forward / Back',
+        '<kbd>← →</kbd>  Tilt Left / Right (auto-level)',
+        '<kbd>W S</kbd>  Throttle Up / Down',
+        '<kbd>A D</kbd>  Yaw Left / Right',
+    ] : isSO3 ? [
+        '<kbd>↑ ↓</kbd>  Forward / Back',
+        '<kbd>← →</kbd>  Strafe Left / Right',
+        '<kbd>W S</kbd>  Climb / Descend',
+        '<kbd>A D</kbd>  Yaw Left / Right',
+        '<kbd>G+click</kbd> Set waypoint (YOPO auto-plan)',
+        '<kbd>C</kbd>    Cancel waypoint',
     ] : [
         '<kbd>↑ ↓</kbd>  Forward / Back',
         '<kbd>← →</kbd>  Strafe Left / Right',
@@ -937,10 +1228,26 @@ function setupThirdPersonPointerControls() {
     }, { passive: false });
 }
 
+function cancelWaypoint() {
+    flightLogger?.stop(false);
+    if (!drone) return;
+    drone.cancelWaypoint();
+    panoramaSensor?.resetYopoGoal();
+    goalAltitudeOverride = null;   // 复位高度覆盖，下次设点重新沿用当前高度
+    if (world && typeof world.clearGoalMarker === 'function') world.clearGoalMarker();
+    console.log('[waypoint] cancelled');
+}
+
 function setupKeyboard() {
     window.addEventListener('keydown', (e) => {
         if (controller && controller.isSettingsOpen && controller.isSettingsOpen()) return;
         if (isTextEntryTarget(e.target)) {
+            // G key for goal setting works even when focus is on a text input
+            if (e.code === 'KeyG' && mode === 'flight' && drone && (drone.flightMode === 'so3')) {
+                placementKeysDown.add(e.code);
+                e.preventDefault();
+                return;
+            }
             if (mode === 'placement' && e.code === 'KeyI' && isPointerOverCesiumCanvas()) {
                 placementKeysDown.add(e.code);
                 e.preventDefault();
@@ -968,6 +1275,17 @@ function setupKeyboard() {
                 enterPlacementMode(false);
             }
         } else if (mode === 'flight') {
+            // G key: hold to click goal in ideal mode
+            if (e.code === 'KeyG' && drone && (drone.flightMode === 'so3')) {
+                placementKeysDown.add(e.code);
+                e.preventDefault();
+                return;
+            }
+            if (e.code === 'KeyC') {
+                e.preventDefault();
+                cancelWaypoint();
+                return;
+            }
             if (e.code === 'KeyV') {
                 e.preventDefault();
                 cameraMode = cameraMode === 'third' ? 'first' : 'third';
