@@ -220,6 +220,11 @@ function initSubsystems() {
     hud = new HUD();
     osd = new OSD('osd-canvas');
     panoramaSensor = new PanoramaSensor();
+    window.__getPerceptionFrame = () => panoramaSensor?.getLatestPerceptionFrame?.() || null;
+    window.__captureMetricCalibration = (locationId, options = {}) => {
+        if (!panoramaSensor || !world) throw new Error('flight world is not ready');
+        return panoramaSensor.captureCalibrationSample(world, { ...options, locationId });
+    };
     if (!flightLogger) flightLogger = new FlightLogger();
 
     setupDisplaySettingsListeners();
@@ -732,6 +737,7 @@ function startFlight(viewMode = 'first') {
         };
         panoramaSensor.onDepthResult = (latencyMs) => { flightLogger?.recordDepth(latencyMs); };
         panoramaSensor.onYopoLatency = (latencyMs) => { flightLogger?.recordYopo(latencyMs); };
+        panoramaSensor.onPerceptionMetrics = (metrics) => { flightLogger?.recordPerception(metrics); };
     }
 
     // Setup click-to-goal for ideal mode

@@ -1659,6 +1659,7 @@ export class CesiumWorld {
     }
 
     async _capturePanoramaHybridWithViewerAsync(viewer, transform, width, height, faceSize, verticalFovDeg = 180, options = {}) {
+        const totalStartedAt = performance.now();
         const projector = this._getPanoramaProjector();
         if (!projector) return { canvas: null, complete: false, ready: false };
         if (projector.readyFaces) projector.readyFaces.clear();
@@ -1679,8 +1680,25 @@ export class CesiumWorld {
         const tileTimeoutMs = Math.max(0, Math.min(120000, Number(options.tileTimeoutMs) || 0));
         const tileQuietMs = Math.max(0, Math.min(5000, Number(options.tileQuietMs) || 0));
         const captureAnyway = !!options.captureAnyway;
+        const signal = options.signal || null;
+        const facesPerSlice = Math.max(1, Math.min(
+            PANORAMA_FACE_DEFS.length,
+            Math.round(Number(options.facesPerSlice) || 2)
+        ));
         const progressCb = typeof options.progressCb === 'function' ? options.progressCb : null;
         const sleep = (ms) => new Promise(resolve => window.setTimeout(resolve, ms));
+        const yieldFrame = () => new Promise(resolve => {
+            if (typeof window.requestAnimationFrame === 'function') window.requestAnimationFrame(() => resolve());
+            else window.setTimeout(resolve, 0);
+        });
+        const throwIfAborted = () => {
+            if (!signal?.aborted) return;
+            const error = new Error(String(signal.reason || 'panorama capture aborted'));
+            error.name = 'AbortError';
+            throw error;
+        };
+        let renderMs = 0;
+        let yieldMs = 0;
 
         try {
             if (frustum) {
@@ -1690,8 +1708,10 @@ export class CesiumWorld {
             }
 
             for (let faceIndex = 0; faceIndex < PANORAMA_FACE_DEFS.length; faceIndex++) {
+                throwIfAborted();
                 const faceDef = PANORAMA_FACE_DEFS[faceIndex];
                 if (progressCb) progressCb(`face ${faceIndex + 1}/${PANORAMA_FACE_DEFS.length} ${faceDef.name}`);
+                const renderStartedAt = performance.now();
                 camera.setView({
                     destination,
                     orientation: {
@@ -1708,9 +1728,7 @@ export class CesiumWorld {
                 }
                 if (captureAnyway) {
                     projector.updateFace(faceDef.name, viewer.scene.canvas);
-                    continue;
-                }
-                if (tileTimeoutMs > 0) {
+                } else if (tileTimeoutMs > 0) {
                     const tilesReady = await this.waitForTilesIdle(
                         tileTimeoutMs,
                         tileQuietMs,
@@ -1729,15 +1747,31 @@ export class CesiumWorld {
                         };
                     }
                 }
-                projector.updateFace(faceDef.name, viewer.scene.canvas);
+                if (!captureAnyway) projector.updateFace(faceDef.name, viewer.scene.canvas);
+                renderMs += performance.now() - renderStartedAt;
+
+                if ((faceIndex + 1) % facesPerSlice === 0 && faceIndex + 1 < PANORAMA_FACE_DEFS.length) {
+                    const yieldStartedAt = performance.now();
+                    await yieldFrame();
+                    yieldMs += performance.now() - yieldStartedAt;
+                }
             }
 
+            throwIfAborted();
+            const projectStartedAt = performance.now();
             const canvas = projector.render(width, height, verticalFovDeg, faceFovDeg, topPoleGuardDeg, bottomPoleGuardDeg);
+            const projectMs = performance.now() - projectStartedAt;
             return {
                 canvas,
                 complete: !!canvas,
                 ready: !!canvas,
                 faces: PANORAMA_FACE_DEFS.length,
+                timings_ms: {
+                    render: renderMs,
+                    project: projectMs,
+                    scheduler_yield: yieldMs,
+                    total: performance.now() - totalStartedAt,
+                },
             };
         } finally {
             if (frustum) {
@@ -1766,6 +1800,8 @@ export class CesiumWorld {
             tileTimeoutMs: options.tileTimeoutMs,
             tileQuietMs: options.tileQuietMs,
             captureAnyway: options.captureAnyway,
+            facesPerSlice: options.facesPerSlice,
+            signal: options.signal,
             progressCb: options.progressCb,
         });
     }
@@ -1788,6 +1824,8 @@ export class CesiumWorld {
             tileTimeoutMs: options.tileTimeoutMs,
             tileQuietMs: options.tileQuietMs,
             captureAnyway: options.captureAnyway,
+            facesPerSlice: options.facesPerSlice,
+            signal: options.signal,
             progressCb: options.progressCb,
         });
     }

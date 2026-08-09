@@ -198,7 +198,8 @@ async function nextTask() {
     assert.match(calls.at(-1), /\/yopo\/plan_full\?/);
     assert.match(calls.at(-1), new RegExp(`goal_id=${goalId}`));
     const planningUrl = new URL(calls.at(-1));
-    assert.equal(planningUrl.searchParams.get('px'), '11', 'YOPO goal delta origin uses frame reference position');
+    assert.equal(planningUrl.searchParams.get('px'), '1', 'trajectory endpoint origin uses frame actual position');
+    assert.equal(planningUrl.searchParams.get('rpx'), '11', 'YOPO goal delta origin uses frame reference position');
     assert.equal(planningUrl.searchParams.get('vx'), '4', 'YOPO observation keeps frame actual velocity');
     assert.equal(planningUrl.searchParams.get('ax'), '0.1', 'YOPO observation uses frame reference acceleration');
     assert.equal(callbackContext.goalId, goalId);
@@ -246,18 +247,69 @@ async function nextTask() {
 {
     const sensor = newSensorWithFrame();
     let resolveFetch;
+    const outcomes = [];
     globalThis.createImageBitmap = async () => fakeBitmap('old-frame');
     globalThis.fetch = () => new Promise(resolve => { resolveFetch = resolve; });
+    sensor.onPerceptionMetrics = metrics => outcomes.push(metrics);
 
     const oldRequest = sensor._requestDepth(sensor.rgbCanvas);
     await nextTask();
     sensor.primeFromCaptureResult(new FakeCanvas('newer-rgb'));
+    sensor._lastRequestedFrameId = sensor._rgbFrameId; // keep this test focused on the stale response
     resolveFetch(response({ depth_image: DEPTH_JPEG, latency_ms: 14 }));
 
     assert.equal(await oldRequest, false);
     assert.equal(sensor.hasDepth, false, 'old frame response must not mark depth ready');
     assert.equal(sensor.depthCanvas.context.drawCalls.length, 0, 'old frame response must not touch canvas');
-    assert.equal(sensor.getDepthState().outcome, 'stale');
+    assert.ok(outcomes.some(item => item.outcome === 'stale' && item.dropReason === 'response-after-session-change'),
+        'old frame is recorded with an explicit stale drop reason');
+}
+
+// Calibration artifacts all originate from one frozen PerceptionFrame.
+{
+    const sensor = newSensorWithFrame();
+    const materialized = await sensor._materializePerceptionFrame(sensor._rgbFrameContext);
+    sensor._perceptionFrame = materialized.frame;
+    let sampledTransform = null;
+    const world = {
+        sampleMetricDepthAnchors(transform, options) {
+            sampledTransform = transform;
+            return {
+                anchors: [{ u: 10, v: 10, distance: 5 }],
+                failures: [],
+                metadata: { ...options, validAnchors: 1, failureCount: 0 },
+            };
+        },
+    };
+    const rawBytes = new Uint8Array([1, 2, 3, 4]);
+    globalThis.fetch = async (_url, options) => {
+        assert.equal(options.headers['X-Frame-ID'], String(materialized.frame.frameId));
+        assert.equal(options.body, materialized.frame.rgb, 'raw request reuses the frozen frame JPEG');
+        return {
+            ok: true,
+            status: 200,
+            headers: { get(name) {
+                return ({
+                    'X-Frame-ID': String(materialized.frame.frameId),
+                    'X-DA360-Model': 'large',
+                    'X-DA360-Width': '476',
+                    'X-DA360-Height': '238',
+                    'X-DA360-Latency-Ms': '30',
+                })[name] || null;
+            } },
+            async arrayBuffer() { return rawBytes.buffer; },
+        };
+    };
+    const artifacts = await sensor.captureCalibrationSample(world, {
+        locationId: 'street-a',
+        captureId: 'capture-001',
+        download: false,
+    });
+    assert.equal(sampledTransform, materialized.frame.transform, 'anchors use the exact frozen panorama transform');
+    assert.equal(artifacts.manifest.frameId, String(materialized.frame.frameId));
+    assert.equal(artifacts.anchors.metadata.locationId, 'street-a');
+    assert.ok(artifacts.files['capture-001-raw.npz']);
+    assert.ok(artifacts.files['capture-001-rgb.jpg']);
 }
 
 // HTML contract: one visible canvas, no hidden image, and 0.6 m collision defaults.

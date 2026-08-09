@@ -17,6 +17,12 @@ export class FlightLogger {
         this._yopoCount = 0;
         this._yopoLatencies = [];
         this._yopoTrackerCount = 0;  // 帧数：有活跃 YOPO 轨迹
+        this._perceptionMetrics = [];
+        this._planningApplyTimes = [];
+        this._appliedPlanningFrames = new Set();
+        this._dropReasons = {};
+        this._physicsUpdateIntervals = [];
+        this._lastPhysicsUpdateAt = null;
     }
 
     /** Start a new recording session. Called when a goal is set. */
@@ -31,6 +37,12 @@ export class FlightLogger {
         this._yopoCount = 0;
         this._yopoLatencies = [];
         this._yopoTrackerCount = 0;
+        this._perceptionMetrics = [];
+        this._planningApplyTimes = [];
+        this._appliedPlanningFrames = new Set();
+        this._dropReasons = {};
+        this._physicsUpdateIntervals = [];
+        this._lastPhysicsUpdateAt = null;
         console.log('[FlightLog] recording started, goal:', goal);
     }
 
@@ -48,10 +60,31 @@ export class FlightLogger {
         if (Number.isFinite(latencyMs)) this._yopoLatencies.push(latencyMs);
     }
 
+    /** Record one immutable perception/planning outcome with segmented timing. */
+    recordPerception(metrics) {
+        if (!this._recording || !metrics) return;
+        const item = { ...metrics, recordedAtMs: performance.now() };
+        this._perceptionMetrics.push(item);
+        if (item.outcome !== 'applied') {
+            const reason = item.dropReason || item.outcome || 'unknown';
+            this._dropReasons[reason] = (this._dropReasons[reason] || 0) + 1;
+            return;
+        }
+        if (item.mode === 'planning' && !this._appliedPlanningFrames.has(item.frameId)) {
+            this._appliedPlanningFrames.add(item.frameId);
+            this._planningApplyTimes.push(item.recordedAtMs);
+        }
+    }
+
     /** Record one frame. Call from updateFlight(). */
     record(drone, refX, refY, refZ) {
         if (!this._recording || !drone) return;
-        const t = (performance.now() - this._startTime) / 1000;
+        const now = performance.now();
+        const t = (now - this._startTime) / 1000;
+        if (this._lastPhysicsUpdateAt != null) {
+            this._physicsUpdateIntervals.push(now - this._lastPhysicsUpdateAt);
+        }
+        this._lastPhysicsUpdateAt = now;
         this._frames.push({
             t: Math.round(t * 1000) / 1000,
             x:  Math.round(drone.x  * 100) / 100,
@@ -88,6 +121,19 @@ export class FlightLogger {
             ? Math.round(this._depthLatencies.reduce((a,b) => a+b, 0) / this._depthLatencies.length) : null;
         const avgYopoLatency = this._yopoLatencies.length > 0
             ? Math.round(this._yopoLatencies.reduce((a,b) => a+b, 0) / this._yopoLatencies.length) : null;
+        const percentile = (values, quantile) => {
+            const finite = values.filter(Number.isFinite).sort((a, b) => a - b);
+            if (!finite.length) return null;
+            const index = Math.min(finite.length - 1, Math.ceil(quantile * finite.length) - 1);
+            return Math.round(finite[Math.max(0, index)] * 10) / 10;
+        };
+        const metricValues = key => this._perceptionMetrics.map(item => Number(item[key])).filter(Number.isFinite);
+        const planningIntervals = this._planningApplyTimes.slice(1).map(
+            (time, index) => time - this._planningApplyTimes[index]
+        );
+        const calibrationIds = [...new Set(
+            this._perceptionMetrics.map(item => item.calibrationId).filter(Boolean)
+        )];
 
         const log = {
             startTime: new Date().toISOString(),
@@ -105,7 +151,24 @@ export class FlightLogger {
                 yopoLatencyAvgMs: avgYopoLatency,
                 yopoTrackerFraction: this._frames.length > 0
                     ? Math.round(this._yopoTrackerCount / this._frames.length * 100) : 0,
+                uniquePlanningHz: Math.round(this._appliedPlanningFrames.size / duration * 10) / 10,
+                uniquePlanningFrames: this._appliedPlanningFrames.size,
+                planningIntervalP95Ms: percentile(planningIntervals, 0.95),
+                captureToApplyP95Ms: percentile(metricValues('captureToApplyMs'), 0.95),
+                frameAgeP95Ms: percentile(metricValues('frameAgeMs'), 0.95),
+                captureP95Ms: percentile(metricValues('captureMs'), 0.95),
+                renderP95Ms: percentile(metricValues('renderMs'), 0.95),
+                projectP95Ms: percentile(metricValues('projectMs'), 0.95),
+                jpegP95Ms: percentile(metricValues('jpegMs'), 0.95),
+                networkP95Ms: percentile(metricValues('networkMs'), 0.95),
+                da360P95Ms: percentile(metricValues('da360Ms'), 0.95),
+                yopoP95Ms: percentile(metricValues('yopoMs'), 0.95),
+                applyP95Ms: percentile(metricValues('applyMs'), 0.95),
+                physicsUpdateIntervalP95Ms: percentile(this._physicsUpdateIntervals, 0.95),
+                droppedByReason: this._dropReasons,
+                calibrationIds,
             },
+            perception: this._perceptionMetrics,
             frames: this._frames,
         };
         const blob = new Blob([JSON.stringify(log, null, 2)], { type: 'application/json' });

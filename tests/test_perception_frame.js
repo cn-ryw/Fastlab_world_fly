@@ -28,7 +28,8 @@ const frame = new PerceptionFrame({
 });
 
 const observation = frame.planningObservation({ x: 50, y: 20, z: 30 });
-assert.deepEqual(observation.position, { x: 10, y: 20, z: 30 }, 'goal delta origin uses reference position');
+assert.deepEqual(observation.actualPosition, { x: 1, y: 2, z: 3 }, 'trajectory endpoint origin uses actual position');
+assert.deepEqual(observation.referencePosition, { x: 10, y: 20, z: 30 }, 'goal delta origin uses reference position');
 assert.deepEqual(observation.velocity, { x: 4, y: 5, z: 6 }, 'observation keeps actual velocity');
 assert.deepEqual(observation.acceleration, { x: 0.1, y: 0.2, z: 0.3 }, 'observation uses reference acceleration');
 assert(Object.isFrozen(frame) && Object.isFrozen(frame.transform) && Object.isFrozen(frame.actualState));
@@ -36,4 +37,4 @@ assert(Object.isFrozen(frame) && Object.isFrozen(frame.transform) && Object.isFr
 const legacy = normalizePlanningState({ x: 1, y: 2, z: 3, vx: 4, vy: 5, vz: 6 }, 20);
 assert.deepEqual(legacy.referenceState.position, { x: 1, y: 2, z: 3 }, 'legacy flat pose remains compatible');
 
-console.log('\nPerceptionFrame contract: 5 passed, 0 failed');
+console.log('\nPerceptionFrame contract: 6 passed, 0 failed');

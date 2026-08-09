@@ -79,7 +79,8 @@ export class PerceptionFrame {
     planningObservation(goal) {
         const frozenGoal = freezeVector(goal, 'goal');
         return Object.freeze({
-            position: this.referenceState.position,
+            actualPosition: this.actualState.position,
+            referencePosition: this.referenceState.position,
             velocity: this.actualState.velocity,
             acceleration: this.referenceState.acceleration,
             goal: frozenGoal,
