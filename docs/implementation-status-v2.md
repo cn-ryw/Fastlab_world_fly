@@ -4,7 +4,7 @@
 
 分支：`feat/da360-metric-depth-v2`
 
-实现基线：`0053448` 加当前收口工作树（严格 bundle、授权门禁、运行时尺寸契约和运维指纹；提交号以最终 Git 记录为准）
+实现基线：`63fd9f1`（严格 bundle、授权门禁、运行时尺寸契约和运维指纹）
 
 本文件只报告证据，不把“代码已写”视为“真实系统已验收”。
 
@@ -99,7 +99,7 @@
 
 - `dependencies.lock.json` 已记录本地固定依赖和 checkpoint SHA。
 - 本地 Cesium 与 `index.html` CDN fallback 均已固定为 1.117。
-- v2 工作分支尚未确认推送到 origin；archive 远端备份不能替代 v2 push。
+- v2 工作分支已推送到 `origin/feat/da360-metric-depth-v2`，首次实现提交为 `63fd9f1`；未向 upstream 推送。
 - 文档外的 `../reference_notes` 和 `../experiment_data` 不受主仓库 Git 保护，需要单独归档。
 
 ## 下一次验收命令
