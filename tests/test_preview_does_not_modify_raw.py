@@ -1,21 +1,26 @@
 """Verify that calling /depth (preview) does NOT mutate the raw output of /depth/raw."""
 import io, os, sys
 import numpy as np
+import pytest
 import requests
 from PIL import Image
 
+pytestmark = pytest.mark.integration
+
 DA360_URL = os.environ.get("DA360_URL", "http://127.0.0.1:5688")
+SESSION = requests.Session()
+SESSION.trust_env = False
 
 
 def _post_raw(image_bytes):
-    return requests.post(f"{DA360_URL}/depth/raw",
+    return SESSION.post(f"{DA360_URL}/depth/raw",
                          data=image_bytes,
                          headers={"Content-Type": "image/jpeg"},
                          timeout=60)
 
 
 def _post_depth(image_bytes):
-    return requests.post(f"{DA360_URL}/depth",
+    return SESSION.post(f"{DA360_URL}/depth",
                          data=image_bytes,
                          headers={"Content-Type": "image/jpeg"},
                          timeout=60)

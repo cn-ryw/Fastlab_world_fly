@@ -371,6 +371,19 @@ function componentDirectionToLocal(basis, component) {
     });
 }
 
+function captureTransformsEquivalent(a, b, positionToleranceM = 1e-5, orientationTolerance = 1e-6) {
+    if (!a?.position || !a?.orientation || !b?.position || !b?.orientation) return false;
+    const positionDelta = Math.hypot(
+        a.position.x - b.position.x,
+        a.position.y - b.position.y,
+        a.position.z - b.position.z,
+    );
+    const qa = a.orientation;
+    const qb = b.orientation;
+    const dot = Math.abs(qa.x * qb.x + qa.y * qb.y + qa.z * qb.z + qa.w * qb.w);
+    return positionDelta <= positionToleranceM && Math.abs(1 - dot) <= orientationTolerance;
+}
+
 function clampNumber(value, min, max, fallback) {
     const n = Number(value);
     if (!Number.isFinite(n)) return fallback;
@@ -443,6 +456,9 @@ export class CesiumWorld {
         this._panoramaProjector = null;
         this._panoramaTileset = null;
         this._panoramaTileLoadState = { pending: null, processing: null };
+        this._panoramaCaptureActiveCount = 0;
+        this._panoramaCaptureRevision = 0;
+        this._lastCompletedPanoramaCapture = null;
 
         this.originCartographic = null;
         this.enuToFixed = null;
@@ -1538,6 +1554,8 @@ export class CesiumWorld {
         this._panoramaFaceSize = 0;
         this._panoramaTileset = null;
         this._panoramaTileLoadState = { pending: null, processing: null };
+        this._panoramaCaptureActiveCount = 0;
+        this._lastCompletedPanoramaCapture = null;
     }
 
     async _createPanoramaCaptureViewer(faceSize) {
@@ -1653,7 +1671,7 @@ export class CesiumWorld {
 
     async warmPanoramaCaptureViewer(faceSize = 256) {
         if (!this.viewer || !this.ready) return false;
-        const size = Math.max(96, Math.round(faceSize || 256));
+        const size = Math.max(64, Math.round(faceSize || 256));
         await this._ensurePanoramaCaptureViewer(size);
         return !!this._getPanoramaProjector();
     }
@@ -1699,6 +1717,13 @@ export class CesiumWorld {
         };
         let renderMs = 0;
         let yieldMs = 0;
+        const faceTileReadiness = [];
+        const captureRevision = Number.isSafeInteger(this._panoramaCaptureRevision)
+            ? this._panoramaCaptureRevision + 1
+            : 1;
+        this._panoramaCaptureRevision = captureRevision;
+        const captureTileset = this._panoramaTileset;
+        this._panoramaCaptureActiveCount = Math.max(0, Number(this._panoramaCaptureActiveCount) || 0) + 1;
 
         try {
             if (frustum) {
@@ -1726,17 +1751,27 @@ export class CesiumWorld {
                     viewer.scene.requestRender();
                     this._renderViewerNow(viewer);
                 }
+                let faceTilesReady = false;
                 if (captureAnyway) {
-                    projector.updateFace(faceDef.name, viewer.scene.canvas);
+                    const loadState = this._panoramaTileLoadState;
+                    const queueKnown = loadState && (
+                        loadState.pending !== null || loadState.processing !== null
+                    );
+                    const queueIdle = !queueKnown || (
+                        (loadState.pending || 0) <= 0 && (loadState.processing || 0) <= 0
+                    );
+                    faceTilesReady = !!captureTileset
+                        && captureTileset.tilesLoaded === true
+                        && queueIdle;
                 } else if (tileTimeoutMs > 0) {
-                    const tilesReady = await this.waitForTilesIdle(
+                    faceTilesReady = await this.waitForTilesIdle(
                         tileTimeoutMs,
                         tileQuietMs,
                         this._panoramaTileset,
                         this._panoramaTileLoadState,
                         viewer
                     );
-                    if (!tilesReady) {
+                    if (!faceTilesReady) {
                         return {
                             canvas: null,
                             complete: false,
@@ -1746,8 +1781,14 @@ export class CesiumWorld {
                             faces: PANORAMA_FACE_DEFS.length,
                         };
                     }
+                } else {
+                    faceTilesReady = !!captureTileset && captureTileset.tilesLoaded === true;
                 }
-                if (!captureAnyway) projector.updateFace(faceDef.name, viewer.scene.canvas);
+                projector.updateFace(faceDef.name, viewer.scene.canvas);
+                faceTileReadiness.push(Object.freeze({
+                    face: faceDef.name,
+                    readyWhenCopied: faceTilesReady,
+                }));
                 renderMs += performance.now() - renderStartedAt;
 
                 if ((faceIndex + 1) % facesPerSlice === 0 && faceIndex + 1 < PANORAMA_FACE_DEFS.length) {
@@ -1761,10 +1802,32 @@ export class CesiumWorld {
             const projectStartedAt = performance.now();
             const canvas = projector.render(width, height, verticalFovDeg, faceFovDeg, topPoleGuardDeg, bottomPoleGuardDeg);
             const projectMs = performance.now() - projectStartedAt;
+            if (canvas && viewer === this._panoramaViewer && captureTileset === this._panoramaTileset
+                && captureRevision > (this._lastCompletedPanoramaCapture?.revision || 0)) {
+                this._lastCompletedPanoramaCapture = Object.freeze({
+                    revision: captureRevision,
+                    viewer,
+                    tileset: captureTileset,
+                    transform: Object.freeze({
+                        position: Object.freeze({ ...transform.position }),
+                        orientation: Object.freeze({ ...transform.orientation }),
+                    }),
+                    width,
+                    height,
+                    faceSize,
+                    verticalFovDeg,
+                    faceTileReadiness: Object.freeze(faceTileReadiness.slice()),
+                    allFacesTileReady: faceTileReadiness.length === PANORAMA_FACE_DEFS.length
+                        && faceTileReadiness.every(face => face.readyWhenCopied),
+                    completedAt: performance.now(),
+                });
+            }
             return {
                 canvas,
                 complete: !!canvas,
                 ready: !!canvas,
+                allFacesTileReady: faceTileReadiness.length === PANORAMA_FACE_DEFS.length
+                    && faceTileReadiness.every(face => face.readyWhenCopied),
                 faces: PANORAMA_FACE_DEFS.length,
                 timings_ms: {
                     render: renderMs,
@@ -1774,6 +1837,7 @@ export class CesiumWorld {
                 },
             };
         } finally {
+            this._panoramaCaptureActiveCount = Math.max(0, this._panoramaCaptureActiveCount - 1);
             if (frustum) {
                 if (saved.fov !== undefined && 'fov' in frustum) frustum.fov = saved.fov;
                 if (saved.near !== undefined && 'near' in frustum) frustum.near = saved.near;
@@ -1789,7 +1853,7 @@ export class CesiumWorld {
 
         const width = Math.max(256, Math.round(options.width || 512));
         const height = Math.max(128, Math.round(options.height || Math.round(width / 2)));
-        const faceSize = Math.max(96, Math.round(options.faceSize || 128));
+        const faceSize = Math.max(64, Math.round(options.faceSize || 128));
         const verticalFovDeg = Math.max(1, Math.min(180, Number(options.verticalFovDeg) || 180));
         const viewer = await this._ensurePanoramaCaptureViewer(faceSize);
         return this._capturePanoramaHybridWithViewerAsync(viewer, transform, width, height, faceSize, verticalFovDeg, {
@@ -1813,7 +1877,7 @@ export class CesiumWorld {
 
         const width = Math.max(256, Math.round(options.width || 512));
         const height = Math.max(128, Math.round(options.height || Math.round(width / 2)));
-        const faceSize = Math.max(96, Math.round(options.faceSize || 128));
+        const faceSize = Math.max(64, Math.round(options.faceSize || 128));
         const verticalFovDeg = Math.max(1, Math.min(180, Number(options.verticalFovDeg) || 180));
         const viewer = await this._ensurePanoramaCaptureViewer(faceSize);
         return this._capturePanoramaHybridWithViewerAsync(viewer, transform, width, height, faceSize, verticalFovDeg, {
@@ -1860,9 +1924,10 @@ export class CesiumWorld {
      *
      * Each anchor is an ERP grid cell centre projected through the exact same
      * sensor-NWU → cubemap-component → capture-transform path as the RGB
-     * panorama, then ray-cast through `pickLocalRay`.  The returned object
-     * contains both successful hits and per-anchor failure reasons so the
-     * downstream metric-fitting stage can decide how to handle missing data.
+     * panorama, then ray-cast against that panorama capture viewer's own scene
+     * and tileset.  The returned object contains both successful hits and
+     * per-anchor failure reasons so the downstream metric-fitting stage can
+     * decide how to handle missing data.
      *
      * @param {object} transform  – { position: {x,y,z}, orientation: quaternion }
      * @param {object} [options]
@@ -1874,6 +1939,7 @@ export class CesiumWorld {
      * @param {number} [options.imageWidth=384]     – ERP width for geometry
      * @param {number} [options.imageHeight=192]    – ERP height for geometry
      * @param {number} [options.verticalFovDeg=180]
+     * @param {string} options.sessionId            – stable collection-session ID
      * @param {string} [options.locationId]         – stable physical-site ID for held-out validation
      * @param {string} [options.captureId]          – ID shared by RGB/raw/anchor artifacts
      * @param {string} [options.frameId]            – perception frame that supplied the RGB
@@ -1888,11 +1954,50 @@ export class CesiumWorld {
             verticalFovDeg: 180,
         };
         const opts = { ...defaults, ...options };
-        const vfovRad = opts.verticalFovDeg / 180 * Math.PI;
 
         if (!transform || !transform.position || !transform.orientation) {
             throw new TypeError('sampleMetricDepthAnchors requires a panorama capture transform');
         }
+        const positionValues = [transform.position.x, transform.position.y, transform.position.z];
+        const orientationValues = [
+            transform.orientation.x,
+            transform.orientation.y,
+            transform.orientation.z,
+            transform.orientation.w,
+        ];
+        if (![...positionValues, ...orientationValues].every(Number.isFinite)) {
+            throw new TypeError('sampleMetricDepthAnchors requires a finite capture transform');
+        }
+        const quaternionNorm = Math.hypot(...orientationValues);
+        if (Math.abs(quaternionNorm - 1) > 1e-3) {
+            throw new RangeError('sampleMetricDepthAnchors requires a unit capture quaternion');
+        }
+        for (const key of ['gridCols', 'gridRows', 'imageWidth', 'imageHeight']) {
+            if (!Number.isInteger(opts[key]) || opts[key] <= 0) {
+                throw new RangeError(`${key} must be a positive integer`);
+            }
+        }
+        for (const key of ['maxRangeM', 'excludeTopDeg', 'excludeBottomDeg', 'verticalFovDeg']) {
+            if (!Number.isFinite(opts[key])) throw new RangeError(`${key} must be finite`);
+        }
+        if (opts.maxRangeM <= 0) throw new RangeError('maxRangeM must be positive');
+        if (opts.excludeTopDeg < 0 || opts.excludeTopDeg >= 90
+            || opts.excludeBottomDeg < 0 || opts.excludeBottomDeg >= 90) {
+            throw new RangeError('ERP pole exclusions must be in [0, 90) degrees');
+        }
+        if (opts.verticalFovDeg <= 0 || opts.verticalFovDeg > 180) {
+            throw new RangeError('verticalFovDeg must be in (0, 180]');
+        }
+        const identity = {};
+        for (const key of ['sessionId', 'captureId', 'locationId', 'frameId']) {
+            if (typeof opts[key] !== 'string' || opts[key].trim() === '') {
+                throw new TypeError(`${key} is required for metric anchor capture`);
+            }
+            identity[key] = opts[key];
+        }
+        const vfovRad = opts.verticalFovDeg / 180 * Math.PI;
+        const raySource = this._metricAnchorRaySource(transform, opts);
+        const tilesReady = this._tilesReady(raySource.tileset);
 
         const anchors = [];
         const failures = [];
@@ -1928,17 +2033,22 @@ export class CesiumWorld {
 
             // Ray cast
             const origin = transform.position;
-            const hit = this.pickLocalRay(origin, dir, opts.maxRangeM);
+            const hit = this._pickLocalRayFromViewer(
+                raySource.viewer,
+                origin,
+                dir,
+                opts.maxRangeM,
+            );
 
             if (!hit) {
                 // Distinguish failure modes
-                const reason = this._tilesReady()
+                const reason = tilesReady
                     ? 'no_hit' : 'tile_not_ready';
                 failures.push({ col, row, u, v, reason });
                 continue;
             }
 
-            if (!Number.isFinite(hit.distance) || hit.distance > opts.maxRangeM) {
+            if (!Number.isFinite(hit.distance) || hit.distance <= 0 || hit.distance > opts.maxRangeM) {
                 failures.push({ col, row, u, v, reason: 'out_of_range', distance: hit.distance });
                 continue;
             }
@@ -1960,33 +2070,134 @@ export class CesiumWorld {
             anchors,
             failures,
             metadata: {
-                gridCols: opts.gridCols,
-                gridRows: opts.gridRows,
-                maxRangeM: opts.maxRangeM,
-                excludeTopDeg: opts.excludeTopDeg,
-                excludeBottomDeg: opts.excludeBottomDeg,
-                imageWidth: opts.imageWidth,
-                imageHeight: opts.imageHeight,
-                verticalFovDeg: opts.verticalFovDeg,
-                pixelCoordinateConvention: 'integer-pixel-centres',
-                sensorFrame: 'NWU(+x forward,+y left,+z up)',
-                componentFrame: '(+x right,+y up,+z back)',
+                schemaVersion: 1,
+                identity,
+                image: {
+                    width: opts.imageWidth,
+                    height: opts.imageHeight,
+                    pixelCoordinateConvention: 'integer-pixel-centres',
+                },
+                erp: {
+                    verticalFovDeg: opts.verticalFovDeg,
+                    sensorFrame: 'NWU(+x forward,+y left,+z up)',
+                    componentFrame: '(+x right,+y up,+z back)',
+                },
+                sampling: {
+                    gridCols: opts.gridCols,
+                    gridRows: opts.gridRows,
+                    maxRangeM: opts.maxRangeM,
+                    excludeTopDeg: opts.excludeTopDeg,
+                    excludeBottomDeg: opts.excludeBottomDeg,
+                },
                 transform: JSON.parse(JSON.stringify(transform)),
-                locationId: opts.locationId == null ? null : String(opts.locationId),
-                captureId: opts.captureId == null ? null : String(opts.captureId),
-                frameId: opts.frameId == null ? null : String(opts.frameId),
                 totalCells: opts.gridCols * opts.gridRows,
                 validAnchors: anchors.length,
                 failureCount: failures.length,
-                tileState: this._tilesReady() ? 'ready' : 'loading',
+                raycastSource: 'panorama-capture-viewer',
+                tilesetSharedWithRgb: true,
+                panoramaFaceSize: this._panoramaFaceSize || null,
+                panoramaCaptureRevision: raySource.capture.revision,
+                panoramaSourceImage: {
+                    width: raySource.capture.width,
+                    height: raySource.capture.height,
+                    verticalFovDeg: raySource.capture.verticalFovDeg,
+                },
+                panoramaFaceTileReadiness: raySource.capture.faceTileReadiness,
+                tileState: tilesReady ? 'ready' : 'loading',
                 timestamp: Date.now(),
             },
         };
     }
 
-    _tilesReady() {
-        if (this.tileset && typeof this.tileset.tilesLoaded !== 'undefined') {
-            return this.tileset.tilesLoaded;
+    _metricAnchorRaySource(transform, options) {
+        const viewer = this._panoramaViewer;
+        const tileset = this._panoramaTileset;
+        if (!viewer || (typeof viewer.isDestroyed === 'function' && viewer.isDestroyed()) || !viewer.scene) {
+            throw new Error('panorama capture viewer unavailable for metric anchor sampling');
+        }
+        if (!tileset) {
+            throw new Error('panorama capture tileset unavailable for metric anchor sampling');
+        }
+        if (this._panoramaCaptureActiveCount > 0) {
+            throw new Error('panorama capture is in progress; retry metric anchor sampling after the frame is frozen');
+        }
+        const capture = this._lastCompletedPanoramaCapture;
+        if (!capture || capture.viewer !== viewer || capture.tileset !== tileset) {
+            throw new Error('no completed RGB panorama capture matches the metric anchor ray source');
+        }
+        if (!captureTransformsEquivalent(capture.transform, transform)) {
+            throw new Error('metric anchor transform does not match the completed RGB panorama capture');
+        }
+        if (Math.abs(capture.verticalFovDeg - options.verticalFovDeg) > 1e-6) {
+            throw new Error('metric anchor vertical FOV does not match the completed RGB panorama capture');
+        }
+        if (capture.allFacesTileReady !== true) {
+            throw new Error('RGB panorama was copied before every cubemap face reported tiles ready');
+        }
+        // The upload canvas rounds width and height independently. Accept a
+        // target only when both rounded dimensions can come from one common
+        // source scale; this permits half-pixel rounding without admitting a
+        // genuinely distorted ERP aspect ratio.
+        const widthScaleRange = [
+            (options.imageWidth - 0.5) / capture.width,
+            (options.imageWidth + 0.5) / capture.width,
+        ];
+        const heightScaleRange = [
+            (options.imageHeight - 0.5) / capture.height,
+            (options.imageHeight + 0.5) / capture.height,
+        ];
+        const scaleRangesOverlap = Math.max(widthScaleRange[0], heightScaleRange[0])
+            <= Math.min(widthScaleRange[1], heightScaleRange[1]) + 1e-12;
+        if (!scaleRangesOverlap) {
+            throw new Error('metric anchor image aspect does not match the completed RGB panorama capture');
+        }
+        const primitives = viewer.scene.primitives;
+        if (primitives && typeof primitives.contains === 'function' && !primitives.contains(tileset)) {
+            throw new Error('panorama capture tileset is not attached to the RGB capture viewer');
+        }
+        return { viewer, tileset, capture };
+    }
+
+    _pickLocalRayFromViewer(viewer, originLocal, directionLocal, maxDistance) {
+        if (!viewer || !viewer.scene) return null;
+        const Cesium = this.Cesium;
+        const scene = viewer.scene;
+        if (!Cesium || typeof scene.pickFromRay !== 'function') return null;
+
+        const dir = normalize3(directionLocal);
+        if (Math.hypot(dir.x, dir.y, dir.z) < 1e-6) return null;
+
+        const origin = this.localToCartesian(originLocal);
+        const direction = this.localDirectionToFixed(dir);
+        const ray = new Cesium.Ray(origin, direction);
+
+        let hit;
+        try {
+            // The dedicated capture scene contains only its Google 3D Tileset,
+            // so exclusions from the main viewer must not be mixed into this pick.
+            hit = scene.pickFromRay(ray);
+        } catch (error) {
+            reportUserError('Panorama scene pickFromRay failed during metric anchor capture', error, {
+                key: 'panorama-anchor-pick-from-ray',
+                intervalMs: 10000,
+            });
+            return null;
+        }
+        if (!hit || !Cesium.defined(hit.position)) return null;
+
+        const local = this.cartesianToLocal(hit.position);
+        const distance = Math.hypot(
+            local.x - originLocal.x,
+            local.y - originLocal.y,
+            local.z - originLocal.z,
+        );
+        if (!Number.isFinite(distance) || distance <= 0 || distance > maxDistance) return null;
+        return { position: local, distance };
+    }
+
+    _tilesReady(tileset = this.tileset) {
+        if (tileset && typeof tileset.tilesLoaded !== 'undefined') {
+            return tileset.tilesLoaded;
         }
         return true; // optimistic
     }

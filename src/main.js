@@ -538,7 +538,14 @@ function setupFlightGoalClickHandler() {
 }
 
 async function enterPlacementMode(autoPick = false) {
-    flightLogger?.stop(false);  // cancel any active recording
+    if (mode === 'flight') {
+        // Placement is a navigation terminal state, not a visual overlay.
+        // Abort the request generation and clear the old trajectory/marker so
+        // returning to flight cannot resurrect a previous goal.
+        finishNavigationSession('mode-exit', { cancelDrone: true, arrived: false });
+    } else {
+        flightLogger?.stop(false);
+    }
 
     if (!world) return;
     mode = 'placement';

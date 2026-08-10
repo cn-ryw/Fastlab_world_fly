@@ -30,6 +30,7 @@ def evaluate_log(log, warmup_samples=5):
     applied = [
         item for item in log.get("perception", [])
         if item.get("mode") == "planning" and item.get("outcome") == "applied"
+        and item.get("planningAuthorized") is True
     ]
     unique = {}
     for item in applied:

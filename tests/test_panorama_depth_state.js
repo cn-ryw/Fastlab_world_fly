@@ -153,13 +153,17 @@ async function nextTask() {
 {
     const sensor = newSensorWithFrame();
     const calls = [];
+    let lastRequestOptions = null;
     globalThis.createImageBitmap = async () => fakeBitmap();
-    globalThis.fetch = async (url) => {
+    globalThis.fetch = async (url, options) => {
+        lastRequestOptions = options;
         calls.push(String(url));
         if (String(url).includes('/yopo/plan_full')) {
             return response({
                 depth_image: DEPTH_JPEG,
                 latency_ms: 18,
+                planning_authorized: true,
+                planning_reason: 'validated-da360-metric',
                 endstate: [1, 2, 3, 4, 5, 6, 7, 8, 9],
                 traj_time: 1.125,
                 depth_mode: 'da360-relative',
@@ -202,6 +206,11 @@ async function nextTask() {
     assert.equal(planningUrl.searchParams.get('rpx'), '11', 'YOPO goal delta origin uses frame reference position');
     assert.equal(planningUrl.searchParams.get('vx'), '4', 'YOPO observation keeps frame actual velocity');
     assert.equal(planningUrl.searchParams.get('ax'), '0.1', 'YOPO observation uses frame reference acceleration');
+    const runtimeProjection = JSON.parse(lastRequestOptions.headers['X-Projection-Config']);
+    assert.equal(runtimeProjection.verticalFovDeg, 180,
+        'planning request carries the frozen frame projection fingerprint');
+    assert.equal(runtimeProjection.jpegQuality, 0.74,
+        'planning request carries the actual JPEG encoder quality');
     assert.equal(callbackContext.goalId, goalId);
     assert.equal(callbackContext.mode, 'planning');
 
@@ -210,6 +219,41 @@ async function nextTask() {
     assert.equal(sensor.hasDepth, true);
     assert.equal(sensor.depthCanvas.context.drawCalls.length, retainedDrawCount + 1,
         'cancel must retain the last depth pixels');
+}
+
+// Relative depth may update the canvas, but it is preview-only and must never
+// be reported or applied as a successful planning frame.
+{
+    const sensor = newSensorWithFrame();
+    sensor.setYopoPose({ x: 0, y: 100, z: 0, vx: 0, vy: 0, vz: 0 }, 0);
+    sensor.setYopoGoal({ x: 30, y: 100, z: 0 });
+    sensor.primeFromCaptureResult(new FakeCanvas('relative-planning-rgb'));
+    let yopoCallbacks = 0;
+    let metrics = null;
+    sensor.onYopoResult = () => { yopoCallbacks++; };
+    sensor.onPerceptionMetrics = value => { metrics = value; };
+    globalThis.createImageBitmap = async () => fakeBitmap('relative-preview');
+    globalThis.fetch = async () => response({
+        depth_image: DEPTH_JPEG,
+        latency_ms: 35,
+        planning_authorized: false,
+        planning_reason: 'da360-relative-is-preview-only',
+        depth_mode: 'da360-relative',
+        frame_id: '2',
+        goal_id: 'goal-1',
+        generation: '1',
+    });
+
+    assert.equal(await sensor._requestDepth(sensor.rgbCanvas), true,
+        'blocked planning still commits the useful depth preview');
+    assert.equal(sensor.hasDepth, true);
+    assert.equal(sensor.getDepthState().mode, 'planning');
+    assert.equal(sensor.getDepthState().outcome, 'blocked');
+    assert.match(sensor.depthStatusEl.textContent, /blocked/);
+    assert.equal(yopoCallbacks, 0, 'relative depth never installs a YOPO trajectory');
+    assert.equal(metrics.outcome, 'blocked');
+    assert.equal(metrics.planningAuthorized, false);
+    assert.equal(metrics.dropReason, 'da360-relative-is-preview-only');
 }
 
 // A delayed preview response cannot overwrite a new planning generation.
@@ -277,13 +321,31 @@ async function nextTask() {
             return {
                 anchors: [{ u: 10, v: 10, distance: 5 }],
                 failures: [],
-                metadata: { ...options, validAnchors: 1, failureCount: 0 },
+                metadata: {
+                    schemaVersion: 1,
+                    identity: {
+                        sessionId: options.sessionId,
+                        locationId: options.locationId,
+                        captureId: options.captureId,
+                        frameId: options.frameId,
+                    },
+                    image: { width: options.imageWidth, height: options.imageHeight },
+                    validAnchors: 1,
+                    failureCount: 0,
+                },
             };
         },
     };
     const rawBytes = new Uint8Array([1, 2, 3, 4]);
-    globalThis.fetch = async (_url, options) => {
+    let requestedUrl = null;
+    globalThis.fetch = async (url, options) => {
+        requestedUrl = new URL(url);
         assert.equal(options.headers['X-Frame-ID'], String(materialized.frame.frameId));
+        assert.deepEqual(
+            JSON.parse(options.headers['X-Projection-Config']),
+            materialized.frame.projectionConfig,
+            'raw request carries the frozen projection fingerprint',
+        );
         assert.equal(options.body, materialized.frame.rgb, 'raw request reuses the frozen frame JPEG');
         return {
             ok: true,
@@ -291,6 +353,9 @@ async function nextTask() {
             headers: { get(name) {
                 return ({
                     'X-Frame-ID': String(materialized.frame.frameId),
+                    'X-Session-ID': sensor._calibrationSessionId,
+                    'X-Capture-ID': 'capture-001',
+                    'X-Location-ID': 'street-a',
                     'X-DA360-Model': 'large',
                     'X-DA360-Width': '476',
                     'X-DA360-Height': '238',
@@ -306,10 +371,188 @@ async function nextTask() {
         download: false,
     });
     assert.equal(sampledTransform, materialized.frame.transform, 'anchors use the exact frozen panorama transform');
+    assert.equal(artifacts.manifest.schemaVersion, 2);
     assert.equal(artifacts.manifest.frameId, String(materialized.frame.frameId));
-    assert.equal(artifacts.anchors.metadata.locationId, 'street-a');
+    assert.equal(artifacts.anchors.metadata.identity.locationId, 'street-a');
+    assert.equal(artifacts.anchors.metadata.identity.sessionId, artifacts.manifest.sessionId);
+    assert.equal(artifacts.anchors.metadata.identity.captureId, artifacts.manifest.captureId);
+    assert.equal(requestedUrl.searchParams.get('frame_id'), String(materialized.frame.frameId));
+    assert.equal(requestedUrl.searchParams.get('session_id'), artifacts.manifest.sessionId);
+    assert.equal(requestedUrl.searchParams.get('capture_id'), 'capture-001');
+    assert.equal(requestedUrl.searchParams.get('location_id'), 'street-a');
+    assert.equal(artifacts.manifest.files.raw.sha256, artifacts.manifest.rawSha256);
+    assert.equal(artifacts.manifest.rgbWidth, materialized.frame.projectionConfig.rgbWidth);
+    assert.equal(artifacts.manifest.projectionConfig.jpegQuality, 0.74);
+    assert.equal(artifacts.manifest.projectionConfig.uploadScale, 1);
     assert.ok(artifacts.files['capture-001-raw.npz']);
     assert.ok(artifacts.files['capture-001-rgb.jpg']);
+    await assert.rejects(
+        sensor.captureCalibrationSample(world, {
+            locationId: 'street-a', captureId: 'capture-duplicate', download: false,
+        }),
+        /already exported/,
+        'one frozen perception frame may only be consumed once',
+    );
+}
+
+// Concurrent exporters are serialized; a pending request cannot consume the
+// same frame under a second capture identity.
+{
+    const sensor = newSensorWithFrame();
+    const materialized = await sensor._materializePerceptionFrame(sensor._rgbFrameContext);
+    sensor._perceptionFrame = materialized.frame;
+    const world = {
+        sampleMetricDepthAnchors(_transform, options) {
+            return { anchors: [], failures: [], metadata: { ...options } };
+        },
+    };
+    let resolveFetch;
+    globalThis.fetch = () => new Promise(resolve => { resolveFetch = resolve; });
+    const first = sensor.captureCalibrationSample(world, {
+        locationId: 'street-lock', captureId: 'capture-lock-1', download: false,
+    });
+    await assert.rejects(
+        sensor.captureCalibrationSample(world, {
+            locationId: 'street-lock', captureId: 'capture-lock-2', download: false,
+        }),
+        /already in progress/,
+    );
+    sensor.primeFromCaptureResult(new FakeCanvas('new-rgb-during-export'));
+    const newer = await sensor._materializePerceptionFrame(sensor._rgbFrameContext);
+    sensor._perceptionFrame = newer.frame;
+    resolveFetch({
+        ok: true,
+        status: 200,
+        headers: { get(name) {
+            return ({
+                'X-Frame-ID': String(materialized.frame.frameId),
+                'X-Session-ID': sensor._calibrationSessionId,
+                'X-Capture-ID': 'capture-lock-1',
+                'X-Location-ID': 'street-lock',
+            })[name] || null;
+        } },
+        async arrayBuffer() { return new Uint8Array([9, 8, 7]).buffer; },
+    });
+    const artifacts = await first;
+    assert.equal(artifacts.frame, materialized.frame,
+        'a newer UI frame does not invalidate the already frozen export bundle');
+    assert.notEqual(artifacts.frame, sensor._perceptionFrame);
+}
+
+// Reset/mode teardown cancels the raw request without releasing the shared
+// capture-viewer lock until the exporter has actually unwound.
+{
+    const sensor = newSensorWithFrame();
+    const materialized = await sensor._materializePerceptionFrame(sensor._rgbFrameContext);
+    sensor._perceptionFrame = materialized.frame;
+    const world = {
+        sampleMetricDepthAnchors(_transform, options) {
+            return { anchors: [], failures: [], metadata: { ...options } };
+        },
+    };
+    let requestSignal = null;
+    let markFetchStarted;
+    const fetchStarted = new Promise(resolve => { markFetchStarted = resolve; });
+    globalThis.fetch = async (_url, options) => {
+        requestSignal = options.signal;
+        markFetchStarted();
+        return new Promise((_resolve, reject) => {
+            options.signal.addEventListener('abort', () => {
+                const error = new Error(String(options.signal.reason || 'aborted'));
+                error.name = 'AbortError';
+                reject(error);
+            }, { once: true });
+        });
+    };
+
+    const pending = sensor.captureCalibrationSample(world, {
+        locationId: 'street-reset', captureId: 'capture-reset', download: false,
+    });
+    await fetchStarted;
+    sensor.reset();
+    assert.equal(requestSignal.aborted, true, 'sensor reset aborts the raw calibration request');
+    assert.equal(sensor._calibrationCapturePending, true,
+        'reset does not release the viewer lock before the exporter settles');
+    await assert.rejects(pending, /sensor-reset/);
+    assert.equal(sensor._calibrationCapturePending, false);
+    assert.equal(sensor._consumedCalibrationFrames.size, 0,
+        'an aborted exporter never consumes the reset session frame');
+}
+
+// Missing frame echo is a hard error: accepting it would allow a cached or
+// reordered raw result into a capture bundle.
+{
+    const sensor = newSensorWithFrame();
+    const materialized = await sensor._materializePerceptionFrame(sensor._rgbFrameContext);
+    sensor._perceptionFrame = materialized.frame;
+    const world = {
+        sampleMetricDepthAnchors(_transform, options) {
+            return { anchors: [], failures: [], metadata: { ...options } };
+        },
+    };
+    globalThis.fetch = async () => ({
+        ok: true,
+        status: 200,
+        headers: { get() { return null; } },
+        async arrayBuffer() { return new Uint8Array([1]).buffer; },
+    });
+    await assert.rejects(
+        sensor.captureCalibrationSample(world, {
+            locationId: 'street-echo', captureId: 'capture-echo', download: false,
+        }),
+        /raw frame mismatch: missing/,
+    );
+}
+
+// Calibration waits for the current six-face capture, then freezes the newly
+// completed frame while preventing the next automatic capture from starting.
+{
+    const sensor = newSensorWithFrame();
+    const oldFrame = await sensor._materializePerceptionFrame(sensor._rgbFrameContext);
+    sensor._perceptionFrame = oldFrame.frame;
+    let resolveCaptureIdle;
+    sensor.capturing = true;
+    sensor._captureIdlePromise = new Promise(resolve => { resolveCaptureIdle = resolve; });
+    let sampledFrameId = null;
+    const world = {
+        sampleMetricDepthAnchors(_transform, options) {
+            sampledFrameId = options.frameId;
+            return { anchors: [], failures: [], metadata: { ...options } };
+        },
+    };
+    globalThis.fetch = async (_url, request) => ({
+        ok: true,
+        status: 200,
+        headers: { get(name) {
+            return ({
+                'X-Frame-ID': request.headers['X-Frame-ID'],
+                'X-Session-ID': sensor._calibrationSessionId,
+                'X-Capture-ID': 'capture-after-idle',
+                'X-Location-ID': 'street-idle',
+            })[name] || null;
+        } },
+        async arrayBuffer() { return new Uint8Array([4, 3, 2, 1]).buffer; },
+    });
+
+    const pending = sensor.captureCalibrationSample(world, {
+        locationId: 'street-idle', captureId: 'capture-after-idle', download: false,
+    });
+    await Promise.resolve();
+    assert.equal(sensor._calibrationCapturePending, true);
+    assert.equal(sampledFrameId, null, 'anchors must not sample a viewer being captured');
+
+    sensor.primeFromCaptureResult(new FakeCanvas('new-complete-rgb'), 1, {
+        capturedAt: performance.now(),
+    });
+    const expectedFrameId = String(sensor._rgbFrameContext.frameId);
+    sensor.capturing = false;
+    sensor._captureIdlePromise = null;
+    resolveCaptureIdle();
+
+    const artifacts = await pending;
+    assert.equal(String(artifacts.frame.frameId), expectedFrameId);
+    assert.equal(sampledFrameId, expectedFrameId);
+    assert.equal(sensor._calibrationCapturePending, false);
 }
 
 // HTML contract: one visible canvas, no hidden image, and 0.6 m collision defaults.
@@ -319,6 +562,11 @@ async function nextTask() {
     assert.match(html, /id="panorama-depth-canvas"/);
     assert.match(html, /id="phys-collision-radius"[^>]*value="0\.6"/);
     assert.match(html, /id="phys-collision-radius-num"[^>]*value="0\.6"/);
+    assert.equal(
+        html.match(/src\/main\.js\?v=20260807-planfull/g)?.length,
+        2,
+        'normal and slow-load fallback imports share one ES module cache key',
+    );
 }
 
 console.log('Panorama depth state tests: all passed');

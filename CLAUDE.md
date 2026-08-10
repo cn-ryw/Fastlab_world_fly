@@ -1,238 +1,241 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+本文件是本仓库的开发约束。开始工作前还应阅读 `README.md`、`docs/implementation-status-v2.md` 和 `../reference_notes/handoff.md`。
 
-浏览器内的 Google Photorealistic 3D Tiles 穿越机仿真器 + 360° ERP 全景 → DA360 深度估计 → YOPO 端到端导航。
+## 项目目标与权威实现
 
-## 任务目标：sim-to-sim 迁移
+这是 YOPO_360 的 sim-to-sim 迁移，不是重新设计规划器。
 
-本项目**不是**从零写一个规划器，而是把已经在 ROS/RViz 端跑通的 YOPO_360 闭环，原样搬到浏览器仿真器里。
+- 权威仓库：`/home/ykx/ros1/YOPO_360_v15`
+- 权威分支：`feat/x5-cruise15-release`
+- 感知/规划/Poly5：`YOPO/test_yopo_ros.py`
+- SO3 控制：`Controller/src/so3_control/src/NetworkControl.cpp`
+- 权威配置：`YOPO/config/traj_opt.yaml` 与 `x5_cruise15_18m_a12_mask_wc3.yaml`
 
-- **源（已验证 work）**：`/home/ykx/ros1/YOPO_360_v15`，分支 `feat/x5-cruise15-release`。权威实现是 `YOPO/test_yopo_ros.py`（感知→推理→Poly5 轨迹）和 `Controller/src/so3_control/src/NetworkControl.cpp`（SO3 控制器）。
-- **目标**：MindCloud_World_Fly。`scripts/yopo_bridge.py` 对应 `test_yopo_ros.py`，`src/drone.js` 的 `_controlSO3` 对应 `NetworkControl.cpp`。
-- **差异只允许出现在两处**：深度来源（ROS 是仿真栅格 raycast，这里是 Cesium 渲染 + DA360 单目估计）、控制指令下发方式（ROS 发 SO3Command 给 mavros，这里直接积分刚体）。**其余任何行为差异都应视为移植 bug，先去对照参考实现，而不是自行调参。**
+只允许两类迁移差异：深度来自 Cesium+DA360，而不是仿真 raycast；控制指令直接作用于浏览器刚体，而不是 ROS/mavros。其他差异首先按移植 bug 处理。
 
-改 `_controlSO3` / `yopo_bridge.py` / 坐标变换前，先打开对应的参考文件逐行比对。历史上的几个严重 bug 都源于"照着文档字符串写，而没照着参考代码写"。
+关键契约：
 
-## 常用命令
+- 到达距离固定为 4.0m；不能用 9m `radio_range` 代替。
+- YOPO endstate 为轴主序 `[px,vx,ax, py,vy,ay, pz,vz,az]`。
+- Sim local 为 `x=east,y=up,z=north`；YOPO world 为 `x=east,y=north,z=up`。
+- ERP canonical sensor frame 为 NWU：`+x forward,+y left,+z up`。
+- observation 使用 `goal-referencePosition` 和参考加速度，Poly5 起点使用实际位置/速度。
 
-### 全栈启停（一条命令搞定）
-
-```bash
-./start-all.sh              # DA360+YOPO(5688) + Web本地(8080) + 健康检查 + Clash规则
-./launch-firefox-gpu.sh     # Firefox + NVIDIA prime offload 打开页面
-./stop-all.sh               # 全部停掉（容器 + 本地Web服务）
-```
-
-`start-all.sh` 内部机制：DA360+YOPO 容器 bind-mount `scripts/`（Python 改动 restart 即生效），Web 走本地 `scripts/serve.py`（JS 改动刷新即生效）。不再启动 Docker Web 容器。
-
-### 改了什么，怎么生效
-
-| 改了什么 | 命令 | 生效方式 |
-|---|---|---|
-| `src/*.js` / `index.html` | 刷新浏览器 | 即时（本地 Python 从磁盘直读） |
-| `scripts/*.py` | `docker restart mindcloud-da360-yopo` | ~1 秒 |
-| `third_party/` / Dockerfile | `docker build -f Dockerfile.da360-yopo ... && ./start-all.sh` | ~2 分钟 |
-
-### 镜像构建（低频，镜像不存在或改 third_party/Dockerfile 时才需要）
+## 启停和拓扑
 
 ```bash
-docker build -f Dockerfile.da360-yopo -t mindcloud-da360-yopo:latest .   # 基镜像 dzp_yopo:sim-u2004-noetic-py38
+./start-all.sh
+./launch-firefox-gpu.sh
+./stop-all.sh
 ```
 
-### 模型下载
+实际运行拓扑：
+
+```text
+Firefox
+  ├─ 127.0.0.1:8080  scripts/serve.py，直接读取工作树
+  └─ 127.0.0.1:5688  Docker combined_server.py
+                         ├─ DA360
+                         └─ YOPO
+```
+
+- combined 服务是单进程、单端口，不存在独立的 5699 YOPO 端口。
+- Web 默认不是 Docker 容器；改前端后刷新浏览器即可。
+- 两个服务均默认只绑定 loopback。若添加远程访问，必须同时设计认证、CORS 和暴露面，不能只改 host。
+- `start-all.sh` 先检查模型、GPU、端口和镜像；health 使用 `curl --noproxy '*'`。只有 Web、`/health` 与 `/yopo/health` 全部可达才打印就绪。
+- 不要恢复 `fuser -k` 或默认修改 Clash 的行为。
+
+Python 改动通过以下命令生效：
 
 ```bash
-python3 -m pip install --user gdown
-./scripts/download_da360_model.sh large    # → third_party/DA360/checkpoints/DA360_large.pth (1.34 GB)
+docker restart mindcloud-da360-yopo
 ```
 
-YOPO checkpoint 不在本仓库，`start-all.sh` 从宿主 `/home/ykx/ros1/YOPO_360_v15/YOPO/saved/YOPO_55/epoch10.pth` 挂载。
-
-### 测试
-
-JS 测试无需服务、无需浏览器，直接 node 跑（全部 7 个文件共约 500 项断言）：
+Dockerfile、third_party 或 Python 依赖变化后重建：
 
 ```bash
-for t in tests/*.js; do node "$t" || break; done   # 跑全部
-
-node tests/test_erp_geometry.js            # ERP 像素↔方向 往返、单位长度、接缝
-node tests/test_metric_anchor_direction.js
-node tests/test_erp_anchor_seam.js
-node tests/test_yopo_endstate_layout.js    # yopo_bridge ↔ drone.js 的 endstate 布局契约
-node tests/test_so3_tilt_limit.js          # 倾角限幅：重力补偿不可被削弱（含 2 万组随机属性测试）
-node tests/test_so3_closed_loop.js         # SO3+YOPO 闭环积分：高度保持 + 收敛到目标
-node tests/test_drone_model_scale.js       # 渲染尺寸与物理机体尺寸一致性
+lock_sha="$(sha256sum dependencies.lock.json | awk '{print $1}')"
+recipe_sha="$(sha256sum Dockerfile.da360-yopo | awk '{print $1}')"
+docker build \
+  --build-arg "MINDCLOUD_DEPENDENCY_LOCK_SHA256=$lock_sha" \
+  --build-arg "MINDCLOUD_IMAGE_RECIPE_SHA256=$recipe_sha" \
+  -f Dockerfile.da360-yopo -t mindcloud-da360-yopo:latest .
 ```
 
-其中 `test_so3_closed_loop.js` 用 `createRequire` 载入仓库自带的**真实** PlayCanvas
-（`asset/vendor/playcanvas.min.js`，UMD 包在 Node 下走 CommonJS 分支）跑无头物理循环，
-不自写四元数桩件。需要 DOM 的地方只有 `readSettings()` 和 `getFixedYaw()`，
-用 `document.getElementById: () => null` 打桩即可走默认分支。
+2026-08-10 已用 base/lock/recipe 三重指纹镜像完成 live 启动。实际 health 为 API v2、`resample=bicubic`、`input_scale≈0.459`、loopback publish，DA360/YOPO checkpoint coverage 100%，19 项 live API integration 全部通过。Firefox 已加载完整页面与模块，但尚未人工完成出生点、真实 depth canvas、目标切换和飞行验收。后续代码或锁文件变化仍必须重新核验，不能沿用本次结论。
 
-Python 测试**需要 DA360 服务已在跑**（默认 `http://127.0.0.1:5688`，用 `DA360_URL` 覆盖）：
+## 前端感知与导航状态
 
-```bash
-python3 -m pytest tests/ -v
-python3 -m pytest tests/test_da360_raw_output.py -v                      # 单文件
-python3 -m pytest tests/test_da360_raw_output.py::test_raw_returns_200 -v # 单用例
-DA360_URL=http://other-host:5688 python3 -m pytest tests/ -v
+`src/panorama-sensor.js` 只有一个可见 depth canvas。DA360 JPEG 必须完成异步解码、请求 identity 校验并成功 `drawImage()` 后，才能设置 `hasDepth=true`。
+
+深度 UI 状态：
+
+- `offline`：API 不可达/超时
+- `preview`：无活动目标，调用 `/depth`
+- `planning`：有活动目标，调用 `/yopo/plan_full`
+- `error`：响应或解码错误
+- `stale` outcome：旧 frame、goal 或 generation 已丢弃
+- `blocked` outcome：深度 JPEG 已画出，但 relative 模式未授权 YOPO 轨迹
+
+到达和取消后回到 preview，但保留最后一张成功深度图。无目标时日志出现 preview 是正确行为。
+
+目标生命周期由 `goalId + generation` 守护。设置新目标时必须：
+
+1. 递增 generation 并生成新 goalId；
+2. abort 在途旧请求；
+3. 等待设置目标后的下一张完整 RGB；
+4. 响应 identity 全部匹配后才允许画深度或安装 YOPO 轨迹。
+
+## PerceptionFrame 原子契约
+
+`src/perception-frame.js` 将以下内容绑定为不可变快照：
+
+```text
+frameId, capturedAt, capture transform, RGB Blob,
+actual position/velocity,
+reference position/velocity/acceleration,
+yaw, projection config
 ```
 
-宿主 Python 只用于测试和离线脚本；推理本身在容器内（Python 3.8/3.10 + PyTorch）。
+全景 capture 开始时快照 planning state 和 transform；capture 完成后才形成该 RGB 的 frame context。`/yopo/plan_full` 必须从对应 `PerceptionFrame` 取 observation，禁止从持续变化的当前 `_yopoPose` 拼接旧 RGB。
 
-### 深度离线工具
+该原语也用于原子标定导出。无人机静止、没有活动目标且完整帧就绪时，`window.__captureMetricCalibration(locationId, options)` 会从同一个冻结 `PerceptionFrame` 生成同一 `captureId` 的 RGB、anchors、manifest 和 raw NPZ；禁止手工拼接来自不同帧的文件。manifest 必须保留 frame/location/capture ID、RGB/raw SHA、pose、capture transform、ERP 配置和模型 metadata。
 
-```bash
-python3 scripts/request_da360_raw.py test.jpg -o raw.npz     # 取 /depth/raw 的 float32 pred_disp
-python3 scripts/inspect_da360_raw.py raw.npz --vis preview.png
-python3 scripts/fit_da360_metric.py \                        # 1/z = a*pred_disp + b (Huber, 可选 --ransac)
-    --raw depth_raw.npz --anchors cesium_anchors.json --output experiment_data/metric_fit_sample/
-```
+## 服务端 API v2
 
-## 架构
+standalone `da360_server.py` 和 combined `combined_server.py` 通过共享 route registration 提供一致的深度契约：
 
-### 进程拓扑
-
-```
-浏览器 (无构建步骤, 原生 ES module)          Docker: mindcloud-da360-yopo :5688
-┌──────────────────────────────┐            ┌────────────────────────────────┐
-│ Cesium + Google 3D Tiles     │            │ combined_server.py             │
-│  6 面立方体采样 → GPU 重投影  │  JPEG      │  ├ DA360Runner  → /depth       │
-│  → ERP 全景 384×192  ────────┼───────────▶│  │                /depth/raw   │
-│                              │            │  └ YopoRunner   → /yopo/plan   │
-│ drone.js 物理 + 控制律       │◀───────────┤                   /yopo/plan_full│
-│ main.js 状态机 + 目标点交互  │  endstate  │  (两个模型并行加载, YOPO 有 lock)│
-└──────────────────────────────┘            └────────────────────────────────┘
-        Docker: google-tiles-flight :8080 (node scripts/server.js)
-```
-
-`/yopo/plan_full` 是在线闭环真正走的那条路：一次 POST 上传 JPEG，服务端内部 DA360 推理出深度再喂 YOPO，位姿/目标/速度/yaw 走 query string（`px,py,pz,gx,gy,gz,vx,vy,vz,yaw`）。`/yopo/plan` 收现成的深度数组，只在离线调试用。
-
-### 前端模块（src/，全部原生 ES module，无打包）
-
-`index.html` 加载 CesiumJS（本地 `/ThirdParty/Cesium/` + CDN fallback）和 `asset/vendor/playcanvas.min.js`（`pc.Quat`/`pc.Mat4` 全局可用），然后 import `src/main.js`。
-
-```
-main.js            模式状态机 loading → placement → view-select → flight
-  ├ cesium-world.js    Cesium Viewer 封装、Google Tiles、局部坐标互转、
-  │                    隐藏 viewer 的 6 面全景采样 + ERP shader、
-  │                    waitForTilesIdle / 起飞前区域预加载 / 覆盖率采样
-  ├ tiles-collision.js  sampleHeight + pickFromRay + swept ray 三层碰撞代理
-  ├ controller.js       键盘 / Gamepad API / WebHID 遥控器、通道映射、
-  │                     设置面板与 localStorage 持久化(CONFIG_VERSION=4 + 迁移)
-  ├ drone.js            四元数刚体物理 + 4 种控制律 + YOPO Poly5 轨迹跟踪
-  ├ panorama-sensor.js  采样节流、DA360 深度请求、YOPO 规划触发
-  ├ erp-geometry.js     ERP 像素↔方向（与 shader、与 YOPO_360 必须一致）
-  ├ flight-logger.js    设目标自动开始录制，到达/取消自动下载 JSON
-  ├ hud.js / osd.js     飞行 HUD、FPV OSD
-  ├ gates.js / path-editor.js / path-store.js / catmull-rom.js   赛道子系统
-  └ error-report.js     去重限频的用户可见错误弹窗
-```
-
-### 飞行模式（`drone.js` 的 `flightMode`，settings 面板下拉框 / `M` 键切换）
-
-| 值 | 控制律 | 说明 |
-|---|---|---|
-| `so3` | `_controlSO3` | 几何控制器，YOPO 自动导航走这条；增益 `so3Kx/Kv/KR/KOmega` 面板可调 |
-| `stabilized` | `_controlStabilized` | PX4 自稳：摇杆→角度指令，回中自动水平 |
-| `fpv` | `_controlFPV` | 角速率手动（acro），无自稳 |
-| `drone` | `_controlDrone` | 级联 PID 速度指令 |
-
-只有 `so3` 和 `stabilized` 允许设目标点（`G`+左键 / 双击 / 点雷达小地图；`G`+滚轮调高度；`C` 取消）。目标一设，`main.js` 同时喂给 `drone.setIdealGoal()`、`panoramaSensor.setYopoGoal()` 和 `flightLogger.start()`。
-
-飞控参数对齐 YOPO Hummingbird：质量 980 g、最大推力 2600 gf、`collisionRadius=0.6`、`ARRIVAL_DISTANCE_M=4.0`。改这些默认值时注意 `controller.js` 的 `_migrateConfig` —— 旧 localStorage 会覆盖新默认值，必须同步 bump `CONFIG_VERSION`。
-
-### 坐标系（改任何几何代码前先读这一节）
-
-三套坐标系，任何一处符号错都表现为"无人机往反方向飞"：
-
-| 坐标系 | 约定 |
+| 路径 | 契约 |
 |---|---|
-| Sim local | x=east, **y=up**, z=north |
-| Body frame | X=right, **Y=up/thrust**, Z=backward，forward = −Z；yaw=0 朝南 |
-| YOPO world | x=east, y=north, **z=up**（相对 sim 是 y/z 交换） |
-| ERP 像素 | `yaw = π − (u+0.5)/W·2π`，`pitch = vfov/2 − (v+0.5)/H·vfov`，`dy` 取负做左右镜像 |
+| `/health` | 模型、尺寸、resample、depth mode、标定、checkpoint 指纹 |
+| `/depth` | JPEG 请求；返回 depth JPEG 与轻量 metadata |
+| `/depth/raw` | NPZ：raw pred_disp、relative depth、valid mask、metadata |
+| `/yopo/health` | YOPO 模型/config/checkpoint 信息 |
+| `/yopo/plan_full` | JPEG+完整状态；总返回 depth/identity，只有授权 metric 模式返回 9 元 endstate |
+| `/yopo/plan` | 兼容调试路径；relative 模式 409，授权时缓存仍有最大年龄限制 |
 
-`yopo_bridge.py:170-240` 是这些转换的唯一权威实现，包含两个非显然的处理：
+所有 planning 数字、frame/goal/generation identity 和参考加速度都是必填；缺字段返回 400，模型异常返回无内部路径的 500。API CORS 只允许本机 Web origin，请求体有上限。
 
-- **yaw 映射** `yopo_yaw_rad = deg2rad(-yaw - 90)`（sim yaw 0=南、顺时针为正 → YOPO 0=东）。
-- **高度平面跟随目标高度，不做任何高度平移**。网络输入 `obs = [vel_c, acc_c, goal_c]` 里 `goal_c = R_cw·(goal − pos)` 只含**相对**位移，绝对高度根本不进网络。历史上的 `altitude_shift` 把 pos.z 和 goal.z 同减一个量，对 obs 是恒等变换（数值验证各高度下误差 < 3e-15），已删除。现在按参考实现 `test_yopo_ros.py:callback_set_goal_3d` 的做法：`height_plane = goal.z`，再用 `endstate_w[:,2,0] = height_plane − pos.z` 把轨迹末端拉到该平面。前端 `main.js` 的 `goalAltitudeOverride` 与之对应——默认 null（目标落在当前高度，等价 `callback_set_goal`），按住 G 滚滚轮后变成显式高度（等价 `callback_set_goal_3d`），按 C 复位。
+## 默认配置
 
-`erp-geometry.js` 的公式和 `cesium-world.js` 里的全景 shader 必须逐字对应，`tests/test_erp_geometry.js` 守这条不变量。
+以代码为准，每次修改默认值都同步更新本文和 README：
 
-### 配置面：URL query string
+```text
+panoWidth=384 panoHeight=192 panoFace=96 panoVfov=180
+panoMs=20 depthMs=20 panoFrameDelayMs=0 panoFacesPerSlice=2
+panoTopPoleGuard=10 panoBottomPoleGuard=2
+panoPreloadTimeoutMs=60000
+da360UploadScale=0.35
 
-运行参数几乎全部通过 URL 覆盖，没有配置文件。定义点在 `main.js` 和 `panorama-sensor.js` 顶部的 `urlNumber()` 常量。
+DA360_INPUT_SCALE=0.46
+DA360_RESAMPLE=bicubic
+DA360_CHANNELS_LAST=0
+DA360_DEPTH_MODE=da360-relative
 
-```
-panoWidth=384 panoHeight=192 panoFace=144 panoVfov=180   全景输出/采样分辨率
-panoMs=33 depthMs=100                                    采样/推理间隔
-panoTopPoleGuard=10 panoBottomPoleGuard=2                ERP 极区 guard（防天空伪影）
-panoPreloadRequired=0 panoPreloadTimeoutMs=60000         首帧预加载策略
-flightPreloadRadius=420 flightPreloadMinCoverage=0.95    起飞前主视图 tiles 预加载
-da360Url= / da360Host= / da360Port=5688                  推理服务地址
-da360UploadScale=0.35 da360UploadWidth= da360UploadHeight=  仅影响上传给 DA360 的尺寸
-droneScale=1.35                                          模型显示大小
-```
-
-`panoWidth=384` 是刻意匹配 YOPO 的 384×192 训练分辨率，别随手调大。
-
-### 服务端环境变量
-
-```
-DA360_INPUT_SCALE=0.5     模型输入缩放（低于 0.46 会让 large 输出条带化深度）
-DA360_DEPTH_SCALE=2.0     粗糙的米制缩放（见下方已知问题）
-DA360_RESAMPLE=bicubic    服务端 resize 插值
-DA360_MODEL / DA360_MODEL_PATH / DA360_JPEG_QUALITY / DA360_AMP / DA360_CHANNELS_LAST
-YOPO_MODEL_PATH / YOPO_CONFIG=x5_cruise15_18m_a12_mask_wc3.yaml / YOPO_AMP
+ARRIVAL_DISTANCE_M=4.0
+collisionRadius=0.6
+droneScale=0.171
 ```
 
-## 开发时的坑
+`DA360_CHANNELS_LAST=1` 曾在真实 Flask 进程中造成约 200 倍退化；没有同进程 benchmark 不得重新启用。
 
-- **`start-all.sh` 不会重建 Web 镜像**（只在镜像不存在时 build），而 `Dockerfile.cesium` 是把 `src/` COPY 进镜像的。改完 `src/*.js` 直接 `./start-all.sh`，浏览器拿到的是旧代码。改前端要么 `./launch.sh`（每次都 build），要么 `./launch.sh --local`（从磁盘直读），要么手动 `docker build -f Dockerfile.cesium ...`。
-- 排查"改了没生效"时先在控制台确认运行时值（如 `__drone.mass`），再考虑清 `localStorage` 的 `drone_sim_controller_config`。
-- **GPU 渲染必须用 Firefox**：本机 `prime-select on-demand`，Chrome 与 prime offload GLX 不兼容（WebGL 初始化失败已确认）。走 `./launch-firefox-gpu.sh`。
-- **Clash Verge TUN 模式会拦 `cesium.com` / `tile.googleapis.com`**，表现为 504 或 tile 加载不出来。快速诊断：`curl -m 5 -s -o /dev/null -w '%{http_code}' https://tile.googleapis.com/`，若输出 `000`（未完成）而非 `200`/`404` → 代理在拦。`./fix-clash-rules.sh` 直接改订阅 profile 并重启 Clash，`start-all.sh` 末尾会自动调。若 TUN 模式在更底层拦截，需 Clash 内加 bypass 规则或切到 System Proxy 模式。
-- `third_party/DA360/` 在 `.gitignore` 里；`third_party/YOPO/`（config + policy）和 `third_party/wheels/`（离线装 flask-cors、timm）是入库的。
+## 米制标定
 
-## 已知问题 / 当前状态
+DA360 输出 raw disparity，YOPO 期望米制深度。正式关系固定为：
 
-进度、已修 bug 清单、调试线索维护在 `../reference_notes/handoff.md`（不入库），开工前先读一遍。
+```text
+inverse_depth_1_per_m = a * pred_disp + b
+depth_m = 1 / inverse_depth_1_per_m
+```
 
-- **已修复：SO3 模式下 G+click 设目标后掉高、且不朝目标飞**。两个独立根因各治一个症状（`reference_notes/handoff.md` 里"浏览器缓存旧 JS"的旧假设已被推翻）：
-  1. **endstate 数组布局错配 → 飞错方向**。`yopo_bridge.py` 输出**轴主序** `[px,vx,ax, py,vy,ay, pz,vz,az]`（同 `test_yopo_ros.py` 的 `endstate_w[id, axis, order]`），而 `drone.js:setYopoTrajectory` 曾按**量主序** `[px,py,pz, vx,vy,vz, ax,ay,az]` 读取，把高度值(~100)填进 X 轴终端速度、把加速度填进 Z 轴终点位置。`yopo_bridge.py` 的 docstring 当时写的正是错误的量主序——**bug 源于照着文档字符串写代码，而不是照着参考实现**。现由 `tests/test_yopo_endstate_layout.js` 锁定。
-  2. **力上限做整体等比缩放 → 掉高**。`_controlSO3` 曾用 `if (Fnorm > Fmax) { FdX*=s; FdY*=s; FdZ*=s; }`，把重力补偿一起缩掉，垂直分量低于 `m·g` 必然下沉。现改为移植自 `NetworkControl.cpp: get_Q_from_ACC()` 的**倾角限幅**：拆出 `f = F_d − m·g·e_up`，**只缩 f**（`F_d' = s·f + m·g·e_up`），解析解见 `limitTiltPreservingGravity()`。上限 `so3MaxTiltDeg = 60`（同参考实现默认值），另按推重比兜底以防设置面板把 mass/thrust 改到不可行。
+已编码能力：
 
-  闭环积分测试（`test_so3_closed_loop.js`）的对照组显示：单独还原布局错位时高度仍稳（倾角限幅在护着），但会飞到离目标 1125 m 之外——两个修复缺一不可。
-- **深度没有米制标度**：DA360 输出的是逐帧归一化的相对视差，YOPO 期望"米制深度 / 20"。在线路径目前只用 `DA360_DEPTH_SCALE=2.0` 粗调。离线拟合管线（`fit_da360_metric.py`，`1/z = a·pred_disp + b`）已完成但**未接入在线路径**，也还没有端到端 benchmark。
-- **50–100 m 高空的分布外问题，真正的病灶在深度图而不在高度状态**。网络看不到绝对高度（见坐标系一节），所以 `fixed_height` 只决定轨迹末端被拉到哪个水平面。真正 OOD 的是深度输入：训练数据是 `depth_max_m=20` 归一化的地面街谷，100 m 高空视野里大半是天空（无效深度）和远处屋顶，clamp 到 20 m 后几乎全为 1.0，网络读到"四周全空"，于是径直平飞不避障。**在深度标定完成前，空高飞行结果没有参考价值；建议先在 5–30 m 街谷高度验证闭环。**
+- `/depth/raw` 输出 raw pred_disp 和输入/模型/frame metadata
+- anchor 使用 canonical ERP helper 与真实 capture transform
+- anchor 分辨率到 raw 分辨率采用像素中心映射、水平 wrap 双线性采样
+- fitter 只应用一次 Huber loss，支持多 capture 和 leave-one-location-out
+- metric calibration 启动时一次加载并绑定模型、输入尺寸、resample 和 checkpoint SHA
+- metric loader 必须校验标定的 projection/JPEG fingerprint；每次请求通过 `X-Projection-Config` 携带冻结帧的完整投影配置，并在 GPU 推理前同时匹配 RGB request size、ERP/FOV、pole guard、JPEG quality 和 upload scale
+- calibration anchor 只有在六个 cubemap 面各自在复制 RGB 像素时都已报告 tiles ready 才可导出；不能用采集结束后的单次 `tilesLoaded` 状态代替逐面 provenance
+- `DA360_DEPTH_MODE=da360-metric` fail closed；校准不合格时拒绝启动
+- `window.__captureMetricCalibration()` 原子导出同 captureId 的 RGB、anchors、manifest 与 raw NPZ
 
-### 深度米制标定（在线路径尚未启用）
+尚未完成/验收：
 
-离线拟合管线 `fit_da360_metric.py` 已算出 `1/z = a·pred_disp + b`，参数 (a,b) 存在 `fit_report.json`。在线路径的架子已搭好：
+- `../experiment_data/depth_calibration.json` 仍是 `a/b=null` 的旧占位文件
+- 没有真实 RGB/raw/anchor 数据集
+- 没有达到 4 地点×3 capture 的收集门槛
+- 没有 DA360 metric、Cesium truth parity 或低空闭环结果
 
-- **标定参数文件**：`experiment_data/depth_calibration.json`（当前占位，a/b 为 null）
-- **服务端加载**：`da360_server.py` 新增 `infer_metric()` 方法和 `_load_depth_calibration()` 静态函数。通过环境变量 `DA360_DEPTH_CALIB_PATH` 指向 JSON 文件
-- **接入点**：`combined_server.py:/yopo/plan_full` 有注释标记，把 `da360_runner.infer(image)` 改为 `da360_runner.infer_metric(image)` 即完成切换
-- **采集流程**：在浏览器控制台调用 `__world.sampleMetricDepthAnchors(__drone.getBodyTransform(), {...})` 获取 anchors；同时调 `POST /depth/raw` 获取对应帧的 `pred_disp.npz`；用 `fit_da360_metric.py` 拟合后将 (a,b) 填入 `depth_calibration.json`
+验收门槛：0.5–20m 留出数据 median AbsRel ≤15%、p90 AbsRel ≤30%、10m 内 p90 绝对误差 ≤1m、有效 anchor ≥70%，至少 4 地点、12 captures，并使用 leave-one-location-out。
 
-**标定文件无效时自动回退到旧的 per-frame min-归一化 + `DA360_DEPTH_SCALE` 行为**，不影响正常运行。完整流程文档见 `../reference_notes/handoff.md` 的深度问题章节。
-- **已修复：视觉模型尺寸与物理尺寸脱节**。`CesiumDrone.glb` 原始包围盒 3.96×1.12×4.67 单位，`droneScale` 旧默认 1.35 → 渲染跨度 6.3 m（等效半径 3.15 m）。现默认 `0.171`（= 0.8/4.668，对应 0.4 m 半径），`minimumPixelSize` 44→8，设置面板滑块范围同步改为 0.05–2.0。附带修掉了 `main.js` 里 `world._aircraftModelEntity`（正确名是 `aircraftModelEntity`，多了下划线）导致 Drone Model Scale 滑块一直是空操作的问题。由 `tests/test_drone_model_scale.js` 锁定。
+未通过前只能称为 `da360-relative`，它只能 preview/采集，不能产生可应用轨迹；不得在文档、health 或实验结论中称为米制深度。`cesium-truth` fallback 尚未实现，不能写成现有能力。
 
-  **注意物理侧仍是 `collisionRadius = 0.6 m`**（YOPO `vehicle_radius_m` 训练值），刻意不跟着改到 0.4——碰撞判据放宽会让规划器以为贴着飞也安全。`droneSize = 0.3`（相机前移量）同样未动，改它会移动全景采样点、扰动感知闭环。
+## 测试
 
-## 相关项目
+无浏览器/GPU测试：
 
-| 项目 | 用途 |
-|---|---|
-| [zwhhhhh9/YOPO_360 @velocity_15ms](https://github.com/zwhhhhh9/YOPO_360/tree/velocity_15ms) | YOPO 全景版本上游 |
-| [cn-ryw/YOPO_360_X5_PR @feat/x5-cruise15-release](https://github.com/cn-ryw/YOPO_360_X5_PR/tree/feat/x5-cruise15-release) | 我们的 YOPO fork，对应本地 `/home/ykx/ros1/YOPO_360_v15` |
-| [superboySB/MindCloud_World_Fly](https://github.com/superboySB/MindCloud_World_Fly) | 本仓库 upstream |
-| [ManifoldTechLtd/MindCloud_World_Fly](https://github.com/ManifoldTechLtd/MindCloud_World_Fly) | 更上游，racing gate / 自适应碰撞检测 / 小巧飞机控制器的来源 |
+```bash
+for test_file in tests/*.js; do node "$test_file" || break; done
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest -q \
+  tests/test_fit_da360_metric.py \
+  tests/test_serve_security.py \
+  tests/test_evaluation_gates.py
+docker run --rm --entrypoint /bin/bash -v "$PWD:/workspace:ro" \
+  mindcloud-da360-yopo:latest \
+  -lc 'cd /workspace && python3 tests/test_backend_contract.py'
+```
+
+这些宿主单元测试要求 NumPy/SciPy/Pillow/pytest；backend contract 放到已有 combined 镜像中运行，避免依赖宿主 Flask。宿主缺少 Flask 时 backend contract 模块会整体 skip；若要在宿主实际执行它，则需额外安装 Flask。连接 5688 的旧测试已标记 `integration` 并被 `pytest.ini` 默认排除；必须用下列命令覆盖默认 `addopts`：
+
+```bash
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
+  python3 -m pytest -o addopts='' -m integration tests/ -v
+```
+
+执行后应分别报告单元测试与真实集成测试，不能混写成“全部验证”。
+
+真实验收仍需 Firefox+GPU+城市 tiles：
+
+- 设置目标后的下一张完整帧进入 planning
+- 到达/取消后回 preview，深度仍更新
+- 3.9m 到达、4.1m 不到达、8.9m 不提前结束
+- 平均有效规划率 ≥15Hz、p95 规划间隔 ≤100ms
+- p95 capture-to-apply ≤150ms、服务 p95 ≤50ms
+- 低空街谷无碰撞、NaN、旧轨迹复活
+
+截至 2026-08-10，上述真实门禁尚未完成。修复后一次 relative `/yopo/plan_full` 诊断为 DA360 44.6ms、端到端 63.3ms，但它未授权 YOPO，既不是统计样本也不能证明 15Hz。修复前基线约为 depth 3.1Hz、YOPO 2.9Hz；不要把 API/单元测试通过写成 15Hz 已达标。
+
+六面 capture 当前每两面 `requestAnimationFrame` yield，并支持 AbortSignal；FlightLogger 已记录分段耗时、唯一 planning frame、drop reason 和 p95。它们属于“已实现、待 live benchmark”，不能写成 15Hz 已通过。
+
+门禁实现位于 `config/perception-sweep.json`、`scripts/evaluate_closed_loop.py` 和 `scripts/evaluate_perception_quality.py`。真实数据必须按该配置的候选顺序跑完并保存报告，不能凭 URL 参数或平均延迟口头选择配置。
+
+## 安全和文件边界
+
+`scripts/serve.py` 不是项目根目录文件服务器，只允许：
+
+- `/`、`/index.html`
+- `/src/`
+- `/asset/`
+- `/ThirdParty/Cesium/`
+- 同源 `/api/path/<safe-name>.json`
+
+禁止重新暴露 `.git`、Markdown、scripts、tests、checkpoint、目录列表或任意 traversal。路径 API 只允许同源且原子写入。
+
+模型、PID、raw NPZ/NPY 和实验大文件不得进入 Git。锁定的版本与本机 checkpoint SHA 记录在 `dependencies.lock.json`。
+
+依赖核验命令为 `python3 scripts/verify_dependencies.py`；只有核验通过并记录镜像 ID 后，才可开始 live 验收。
 
 ## Git
 
-- `origin` = `cn-ryw/MindCloud_World_Fly`，`upstream` = `superboySB/MindCloud_World_Fly`
-- 工作分支 `feat/da360-metric-depth-prototype`
-- 不直接改 main，不 force push，不向 upstream push
+- `origin=https://github.com/cn-ryw/MindCloud_World_Fly.git`
+- `upstream=https://github.com/superboySB/MindCloud_World_Fly.git`
+- 工作分支：`feat/da360-metric-depth-v2`
+- 归档分支：`archive/da360-prototype-c0b82d5-20260809`
+- 归档 tag：`archive-c0b82d5-20260809`
+- 仓外 bundle：`../backups/MindCloud_World_Fly-c0b82d5-20260809.bundle`
+
+不向 upstream push，不 force-push。`origin` 的 v2 分支未确认推送前，不得声称本轮工作已有远端备份。
+
+依赖锁定：Cesium 1.117、PlayCanvas 2.17.2（revision `2892d5e`）、DA360 commit `93dd3fc32e8e8751ac1e4b26ff1a575adfc55661`。本地 Cesium 是 1.117；`index.html` 的 CDN fallback 必须同步保持 1.117，不能混用 1.121。

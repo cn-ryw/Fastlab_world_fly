@@ -28,6 +28,9 @@ function harness() {
         camera: { frustum: {}, setView() {} },
         scene: { canvas: { width: 96, height: 96 }, requestRender() {} },
     };
+    world._panoramaViewer = viewer;
+    world._panoramaTileset = { tilesLoaded: true };
+    world._panoramaTileLoadState = { pending: 0, processing: 0 };
     const transform = {
         position: { x: 0, y: 0, z: 0 },
         orientation: { x: 0, y: 0, z: 0, w: 1 },
@@ -46,6 +49,9 @@ function harness() {
     if (yieldCount !== 2) throw new Error(`expected 2 scheduler yields, got ${yieldCount}`);
     if (!(result.timings_ms.total >= 0 && result.timings_ms.project >= 0)) {
         throw new Error('segmented capture timings missing');
+    }
+    if (!result.allFacesTileReady || !world._lastCompletedPanoramaCapture?.allFacesTileReady) {
+        throw new Error('per-face tile readiness was not retained with the completed RGB capture');
     }
 }
 
@@ -68,4 +74,32 @@ function harness() {
     if (faces.length !== 2) throw new Error(`abort should stop after first slice, got ${faces.length} faces`);
 }
 
-console.log('\nPanorama scheduler: 5 passed, 0 failed');
+// The public wrappers must preserve the 80/64 performance-sweep candidates;
+// silently clamping them to 96 would make the benchmark labels untruthful.
+{
+    const world = Object.create(CesiumWorld.prototype);
+    world.viewer = {};
+    world.ready = true;
+    const requestedSizes = [];
+    world._ensurePanoramaCaptureViewer = async size => {
+        requestedSizes.push(size);
+        return { size };
+    };
+    world._capturePanoramaHybridWithViewerAsync = async (_viewer, _transform, _width, _height, faceSize) => ({
+        faceSize,
+    });
+    const transform = {
+        position: { x: 0, y: 0, z: 0 },
+        orientation: { x: 0, y: 0, z: 0, w: 1 },
+    };
+    const low = await world.capturePanoramaIncrementalAsync(transform, { faceSize: 64 });
+    const mid = await world.preloadPanoramaAtTransform(transform, { faceSize: 80 });
+    if (low.faceSize !== 64 || mid.faceSize !== 80) {
+        throw new Error(`performance sweep face sizes were clamped: ${low.faceSize}, ${mid.faceSize}`);
+    }
+    if (requestedSizes.join(',') !== '64,80') {
+        throw new Error(`capture viewers received wrong face sizes: ${requestedSizes.join(',')}`);
+    }
+}
+
+console.log('\nPanorama scheduler: 8 passed, 0 failed');

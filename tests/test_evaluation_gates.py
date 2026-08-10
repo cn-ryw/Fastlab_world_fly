@@ -26,6 +26,7 @@ def synthetic_log(interval_ms=62.5, capture_to_apply=100, server_ms=40, physics_
             "frameId": index,
             "mode": "planning",
             "outcome": "applied",
+            "planningAuthorized": True,
             "recordedAtMs": index * interval_ms,
             "captureToApplyMs": capture_to_apply,
             "serverMs": server_ms,
@@ -49,6 +50,17 @@ def test_closed_loop_fails_slow_planning_and_service():
     assert not report["passed"]
     assert not report["checks"]["mean_planning_hz"]
     assert not report["checks"]["warm_server_p95_ms"]
+
+
+def test_closed_loop_never_counts_unauthorized_relative_preview_as_planning():
+    log = synthetic_log()
+    for item in log["perception"]:
+        item["planningAuthorized"] = False
+        item["dropReason"] = "da360-relative-is-preview-only"
+    report = closed_loop.evaluate_log(log)
+    assert not report["passed"]
+    assert report["metrics"]["unique_planning_frames"] == 0
+    assert report["metrics"]["mean_planning_hz"] == 0
 
 
 def test_perception_quality_selects_threshold_compliant_candidate():

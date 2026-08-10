@@ -4,8 +4,9 @@
 DA360:  (/health, /depth, /depth/raw)
 YOPO:   (/yopo/health, /yopo/plan, /yopo/plan_full)
 
-/yopo/plan_full accepts a JPEG image (same as DA360 /depth) plus pose/goal,
-internally runs DA360 inference → depth array → YOPO inference → trajectory.
+/yopo/plan_full accepts a JPEG image (same as DA360 /depth) plus pose/goal.
+It always returns DA360 depth; YOPO runs only when the selected depth mode is
+explicitly authorized for planning (currently an accepted metric calibration).
 """
 
 import argparse
@@ -36,6 +37,7 @@ from da360_server import (
     DA360Runner,
     DEFAULT_INPUT_SCALE,
     _infer_configured_depth,
+    _request_image_metadata,
     configure_api_security,
     decode_request_image,
     depth_to_color,
@@ -50,16 +52,29 @@ configure_api_security(app)
 da360_runner = None
 yopo_runner = None
 # 服务端缓存最近一次 DA360 推理结果（由 /depth 写入，/yopo/plan 读取，避免前端回传 1.4MB）
-_depth_cache = {"data": None, "ts": 0}
+_depth_cache = {
+    "data": None,
+    "ts": 0,
+    "frame_id": None,
+    "depth_mode": None,
+    "calibration_id": None,
+}
 _depth_cache_lock = threading.Lock()
 
 
 def _cache_depth(pred_depth, request_metadata):
     """Cache the latest preview for the legacy two-stage planning endpoint."""
+    calibration = getattr(da360_runner, "calibration", None)
     with _depth_cache_lock:
         _depth_cache["data"] = np.asarray(pred_depth, dtype=np.float32).copy()
         _depth_cache["ts"] = time.monotonic()
         _depth_cache["frame_id"] = request_metadata.get("frame_id")
+        _depth_cache["depth_mode"] = getattr(
+            da360_runner, "depth_mode", "da360-relative"
+        )
+        _depth_cache["calibration_id"] = (
+            calibration.get("id") if calibration else None
+        )
 
 
 register_depth_routes(
@@ -70,25 +85,46 @@ register_depth_routes(
 )
 
 
+def _planning_authorization():
+    """Separate API availability from permission to apply a YOPO trajectory."""
+    if da360_runner is None:
+        return False, "da360-not-initialized"
+    depth_mode = getattr(da360_runner, "depth_mode", "da360-relative")
+    if depth_mode != "da360-metric":
+        return False, "da360-relative-is-preview-only"
+    calibration = getattr(da360_runner, "calibration", None)
+    if not calibration or not calibration.get("id"):
+        return False, "metric-calibration-not-loaded"
+    if yopo_runner is None:
+        return False, "yopo-not-initialized"
+    return True, "validated-da360-metric"
+
+
 # ── YOPO endpoints ───────────────────────────────────────────────────────
 @app.route("/yopo/health", methods=["GET"])
 def yopo_health():
     if yopo_runner is None:
         return jsonify({"ok": False, "error": "YOPO not initialized"}), 503
+    planning_authorized, planning_reason = _planning_authorization()
     return jsonify({
         "ok": True,
         "api_version": API_VERSION,
         "device": yopo_runner.device,
         "model": Path(str(getattr(yopo_runner, "model_path", "unknown"))).name,
-        "checkpoint_sha256": getattr(yopo_runner, "checkpoint_sha256", None)
-            or os.environ.get("YOPO_MODEL_SHA256") or None,
+        "checkpoint_sha256": getattr(yopo_runner, "checkpoint_sha256", None),
         "checkpoint_coverage": getattr(yopo_runner, "checkpoint_coverage", None),
         "checkpoint_missing_keys": getattr(yopo_runner, "checkpoint_missing_keys", None),
         "checkpoint_unexpected_keys": getattr(yopo_runner, "checkpoint_unexpected_keys", None),
         "config": getattr(yopo_runner, "config_name", None)
             or os.environ.get("YOPO_CONFIG", "x5_cruise15_18m_a12_mask_wc3.yaml"),
-        "config_sha256": getattr(yopo_runner, "config_sha256", None)
-            or os.environ.get("YOPO_CONFIG_SHA256") or None,
+        "config_sha256": getattr(yopo_runner, "config_sha256", None),
+        "base_config": getattr(yopo_runner, "base_config_name", None) or "traj_opt.yaml",
+        "base_config_sha256": getattr(yopo_runner, "base_config_sha256", None),
+        "effective_config_sha256": getattr(
+            yopo_runner, "effective_config_sha256", None
+        ),
+        "planning_authorized": planning_authorized,
+        "planning_reason": planning_reason,
     })
 
 
@@ -128,12 +164,31 @@ def _validate_yopo_result(endstate, score, traj_time, actual_position=None):
     return endstate, score, traj_time
 
 
-def _response_identity():
-    return {
-        "frame_id": request.args.get("frame_id") or request.headers.get("X-Frame-ID"),
-        "goal_id": request.args.get("goal_id") or request.headers.get("X-Goal-ID"),
-        "generation": request.args.get("generation") or request.headers.get("X-Generation"),
+def _response_identity(mapping=None, *, required=False):
+    mapping = mapping if isinstance(mapping, dict) else {}
+    identity = {
+        "frame_id": request.args.get("frame_id")
+            or request.headers.get("X-Frame-ID") or mapping.get("frame_id"),
+        "goal_id": request.args.get("goal_id")
+            or request.headers.get("X-Goal-ID") or mapping.get("goal_id"),
+        "generation": request.args.get("generation")
+            or request.headers.get("X-Generation") or mapping.get("generation"),
     }
+    identity = {
+        key: None if value is None else str(value)
+        for key, value in identity.items()
+    }
+    if required:
+        for key in ("frame_id", "goal_id"):
+            token = identity[key]
+            if not token or token != token.strip() or len(token) > 128 \
+                    or any(ord(character) < 32 for character in token):
+                raise ValueError(f"{key} must be a non-empty identity token")
+        generation = identity["generation"]
+        if not generation or any(character not in "0123456789" for character in generation) \
+                or int(generation) > 2**53 - 1:
+            raise ValueError("generation must be a non-negative safe integer")
+    return identity
 
 
 def _json_vector(mapping, keys, field):
@@ -150,30 +205,39 @@ def yopo_plan():
     """Accept depth array + pose + goal → return trajectory endpoint."""
     if request.method == "OPTIONS":
         return ("", 204)
-    if yopo_runner is None:
-        return jsonify({"error": "YOPO not initialized"}), 503
     try:
         data = request.get_json(force=True)
         if not isinstance(data, dict):
             raise ValueError("JSON body must be an object")
-        started = time.perf_counter()
-        # 优先用请求中的 depth 数组；未提供时从服务端缓存取（省去前端 1.4MB JSON 回传）
+        planning_authorized, planning_reason = _planning_authorization()
+        calibration = getattr(da360_runner, "calibration", None)
+        planning_metadata = {
+            "api_version": API_VERSION,
+            "depth_mode": getattr(da360_runner, "depth_mode", "da360-relative"),
+            "calibration_id": calibration.get("id") if calibration else None,
+            "planning_authorized": planning_authorized,
+            "planning_reason": planning_reason,
+        }
+        identity = _response_identity(data, required=planning_authorized)
+        planning_metadata.update(identity)
+        if not planning_authorized:
+            return jsonify(planning_metadata), 409
         if "depth" in data:
-            depth_arr = np.array(data["depth"], dtype=np.float32)
-        elif _depth_cache["data"] is not None:
-            with _depth_cache_lock:
-                cache_age = time.monotonic() - _depth_cache["ts"]
-                if cache_age > env_float("DA360_DEPTH_CACHE_MAX_AGE", 2.0):
-                    return jsonify({"error": "cached depth is stale"}), 409
-                depth_arr = _depth_cache["data"].copy()
-        else:
-            return jsonify({"error": "no depth provided and cache empty"}), 400
+            raise ValueError(
+                "authorized two-stage planning only accepts server-cached depth"
+            )
+        started = time.perf_counter()
         pose = data["pose"]
-        reference_pose = data.get("reference_pose", data.get("reference_pos", pose))
+        if "reference_pose" in data:
+            reference_pose = data["reference_pose"]
+        elif "reference_pos" in data:
+            reference_pose = data["reference_pos"]
+        else:
+            raise ValueError("reference_pose or reference_pos is required")
         goal = data["goal"]
-        vel = data.get("vel", {"vx": 0, "vy": 0, "vz": 0})
-        yaw = _finite_float(data.get("yaw", 0.0), "yaw")
-        acc = data.get("acc", {"ax": 0, "ay": 0, "az": 0})
+        vel = data["vel"]
+        yaw = _finite_float(data["yaw"], "yaw")
+        acc = data["acc"]
         actual_position = _json_vector(pose, ("x", "y", "z"), "pose")
         reference_position = _json_vector(
             reference_pose, ("x", "y", "z"), "reference_pose"
@@ -181,6 +245,30 @@ def yopo_plan():
         goal_position = _json_vector(goal, ("x", "y", "z"), "goal")
         velocity = _json_vector(vel, ("vx", "vy", "vz"), "vel")
         acceleration = _json_vector(acc, ("ax", "ay", "az"), "acc")
+
+        current_depth_mode = getattr(
+            da360_runner, "depth_mode", "da360-relative"
+        )
+        current_calibration = getattr(da360_runner, "calibration", None)
+        current_calibration_id = (
+            current_calibration.get("id") if current_calibration else None
+        )
+        with _depth_cache_lock:
+            if _depth_cache["data"] is None:
+                return jsonify({"error": "server depth cache is empty"}), 400
+            cache_age = time.monotonic() - _depth_cache["ts"]
+            if cache_age > env_float("DA360_DEPTH_CACHE_MAX_AGE", 2.0):
+                return jsonify({"error": "cached depth is stale"}), 409
+            cached_frame_id = _depth_cache["frame_id"]
+            if cached_frame_id is not None:
+                cached_frame_id = str(cached_frame_id)
+            if cached_frame_id != identity["frame_id"]:
+                return jsonify({"error": "cached depth frame_id mismatch"}), 409
+            if _depth_cache["depth_mode"] != current_depth_mode:
+                return jsonify({"error": "cached depth mode mismatch"}), 409
+            if _depth_cache["calibration_id"] != current_calibration_id:
+                return jsonify({"error": "cached depth calibration mismatch"}), 409
+            depth_arr = _depth_cache["data"].copy()
 
         with yopo_runner.lock:
             endstate, score, traj_time = yopo_runner.infer(
@@ -195,8 +283,7 @@ def yopo_plan():
         endstate, score, traj_time = _validate_yopo_result(
             endstate, score, traj_time, actual_position
         )
-        return jsonify({
-            "api_version": API_VERSION,
+        response_payload = {
             "endstate": endstate.tolist(),
             "score": float(score),
             "traj_time": traj_time,
@@ -205,7 +292,9 @@ def yopo_plan():
                 "actual": actual_position.tolist(),
                 "reference": reference_position.tolist(),
             },
-        })
+        }
+        response_payload.update(planning_metadata)
+        return jsonify(response_payload)
     except (KeyError, TypeError, ValueError) as exc:
         return jsonify({"error": str(exc)}), 400
     except HTTPException:
@@ -217,13 +306,14 @@ def yopo_plan():
 
 @app.route("/yopo/plan_full", methods=["POST", "OPTIONS"])
 def yopo_plan_full():
-    """JPEG → DA360 → depth → YOPO → trajectory. One-shot planning call."""
+    """Return depth and, only when authorized, a one-shot YOPO trajectory."""
     if request.method == "OPTIONS":
         return ("", 204)
-    if da360_runner is None or yopo_runner is None:
-        return jsonify({"error": "servers not initialized"}), 503
+    if da360_runner is None:
+        return jsonify({"error": "DA360 not initialized"}), 503
     try:
         started = time.perf_counter()
+        identity = _response_identity(required=True)
 
         # Validate all state before spending GPU time on the image.
         def query_number(name, header):
@@ -245,15 +335,16 @@ def yopo_plan_full():
         vel_vy = query_number("vy", "X-Vel-Y")
         vel_vz = query_number("vz", "X-Vel-Z")
         drone_yaw = query_number("yaw", "X-Yaw")
-        acc_x = _finite_float(request.args.get("ax", 0), "ax")
-        acc_y = _finite_float(request.args.get("ay", 0), "ay")
-        acc_z = _finite_float(request.args.get("az", 0), "az")
+        acc_x = query_number("ax", "X-Acc-X")
+        acc_y = query_number("ay", "X-Acc-Y")
+        acc_z = query_number("az", "X-Acc-Z")
 
         # 1. Decode JPEG → DA360 depth
         t0 = time.perf_counter()
         image = decode_request_image(request)
+        request_metadata = _request_image_metadata(image)
         t_decode = time.perf_counter()
-        pred_depth = _infer_configured_depth(da360_runner, image)
+        pred_depth = _infer_configured_depth(da360_runner, image, request_metadata)
         t1 = time.perf_counter()
 
         # 生成小 JPEG 深度图供前端显示（原项目做法，~6KB，不塞 1.3MB depth_array）
@@ -263,33 +354,37 @@ def yopo_plan_full():
         depth_jpeg = encode_image(colored, "jpeg", env_int("DA360_JPEG_QUALITY", 72))
         t_color = time.perf_counter()
 
-        # 2. YOPO inference
-        with yopo_runner.lock:
-            endstate, score, traj_time = yopo_runner.infer(
-                depth_arr=pred_depth,
-                pos=np.array([pose_x, pose_y, pose_z], dtype=np.float32),
-                reference_pos=np.array(
-                    [reference_x, reference_y, reference_z], dtype=np.float32
-                ),
-                vel=np.array([vel_vx, vel_vy, vel_vz], dtype=np.float32),
-                acc=np.array([acc_x, acc_y, acc_z], dtype=np.float32),
-                goal=np.array([goal_x, goal_y, goal_z], dtype=np.float32),
-                yaw=drone_yaw,
+        # 2. Only validated metric depth may authorize an applicable trajectory.
+        # Relative DA360 remains useful as a live preview, but scale-normalized
+        # depth must never be silently fed to a metric-trained YOPO policy.
+        planning_authorized, planning_reason = _planning_authorization()
+        endstate = score = traj_time = None
+        if planning_authorized:
+            with yopo_runner.lock:
+                endstate, score, traj_time = yopo_runner.infer(
+                    depth_arr=pred_depth,
+                    pos=np.array([pose_x, pose_y, pose_z], dtype=np.float32),
+                    reference_pos=np.array(
+                        [reference_x, reference_y, reference_z], dtype=np.float32
+                    ),
+                    vel=np.array([vel_vx, vel_vy, vel_vz], dtype=np.float32),
+                    acc=np.array([acc_x, acc_y, acc_z], dtype=np.float32),
+                    goal=np.array([goal_x, goal_y, goal_z], dtype=np.float32),
+                    yaw=drone_yaw,
+                )
+            endstate, score, traj_time = _validate_yopo_result(
+                endstate, score, traj_time, [pose_x, pose_y, pose_z]
             )
-        endstate, score, traj_time = _validate_yopo_result(
-            endstate, score, traj_time, [pose_x, pose_y, pose_z]
-        )
         t2 = time.perf_counter()
         calibration = getattr(da360_runner, "calibration", None)
         resp_payload = {
             "api_version": API_VERSION,
-            "endstate": endstate.tolist(),
-            "score": float(score),
-            "traj_time": traj_time,
             "depth_image": depth_jpeg,
             "depth_scale": depth_scale,
             "depth_mode": getattr(da360_runner, "depth_mode", "da360-relative"),
             "calibration_id": calibration.get("id") if calibration else None,
+            "planning_authorized": planning_authorized,
+            "planning_reason": planning_reason,
             "latency_ms": (time.perf_counter() - started) * 1000.0,
             "timings_ms": {
                 "decode_ms": (t_decode - t0) * 1000.0,
@@ -302,7 +397,13 @@ def yopo_plan_full():
                 "reference": [reference_x, reference_y, reference_z],
             },
         }
-        resp_payload.update(_response_identity())
+        if planning_authorized:
+            resp_payload.update({
+                "endstate": endstate.tolist(),
+                "score": float(score),
+                "traj_time": traj_time,
+            })
+        resp_payload.update(identity)
         resp = jsonify(resp_payload)
         t3 = time.perf_counter()
         print(
@@ -310,6 +411,7 @@ def yopo_plan_full():
             f"da360={1000*(t1-t_decode):.0f}ms "
             f"color+jpeg={1000*(t_color-t1):.0f}ms "
             f"yopo={1000*(t2-t_color):.0f}ms "
+            f"authorized={planning_authorized} reason={planning_reason} "
             f"json={1000*(t3-t2):.0f}ms total={1000*(t3-started):.0f}ms",
             flush=True,
         )

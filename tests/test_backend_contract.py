@@ -14,6 +14,16 @@ from unittest.mock import patch
 import numpy as np
 from PIL import Image
 
+try:
+    import flask  # noqa: F401
+except ModuleNotFoundError:
+    import pytest
+
+    pytest.skip(
+        "backend contract tests run in the project image when Flask is unavailable",
+        allow_module_level=True,
+    )
+
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS_DIR = PROJECT_ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
@@ -49,7 +59,7 @@ class FakeDepthRunner:
             self.height, self.width
         )
 
-    def infer_depth(self, image):
+    def infer_depth(self, image, _projection_config=None):
         return self.infer(image)
 
     def infer_raw(self, _image):
@@ -81,12 +91,17 @@ class FakeYopoRunner:
     checkpoint_unexpected_keys = 0
     config_name = "fake.yaml"
     config_sha256 = "ef" * 32
+    base_config_name = "traj_opt.yaml"
+    base_config_sha256 = "12" * 32
+    effective_config_sha256 = "34" * 32
 
     def __init__(self):
         self.lock = threading.Lock()
         self.last_call = None
+        self.infer_calls = 0
 
     def infer(self, **kwargs):
+        self.infer_calls += 1
         self.last_call = kwargs
         return np.arange(9, dtype=np.float32), 0.25, 1.125
 
@@ -98,12 +113,29 @@ def jpeg_bytes(width=16, height=8):
 
 
 class BackendContractTests(unittest.TestCase):
+    def test_yopo_overlay_is_selected_before_global_config_import(self):
+        source = (SCRIPTS_DIR / "yopo_bridge.py").read_text(encoding="utf-8")
+        self.assertLess(
+            source.index('os.environ.setdefault("YOPO_CONFIG", DEFAULT_CONFIG_NAME)'),
+            source.index("from config.config import cfg"),
+        )
+        self.assertIn("loaded_config_path != config_path.resolve()", source)
+
     @contextmanager
     def clients(self):
         standalone = create_app(FakeDepthRunner())
         standalone.config.update(TESTING=True)
         old_depth = combined_server.da360_runner
         old_yopo = combined_server.yopo_runner
+        with combined_server._depth_cache_lock:
+            old_cache = dict(combined_server._depth_cache)
+            combined_server._depth_cache.update({
+                "data": None,
+                "ts": 0,
+                "frame_id": None,
+                "depth_mode": None,
+                "calibration_id": None,
+            })
         combined_server.da360_runner = FakeDepthRunner()
         combined_server.yopo_runner = FakeYopoRunner()
         combined_server.app.config.update(TESTING=True)
@@ -115,6 +147,9 @@ class BackendContractTests(unittest.TestCase):
         finally:
             combined_server.da360_runner = old_depth
             combined_server.yopo_runner = old_yopo
+            with combined_server._depth_cache_lock:
+                combined_server._depth_cache.clear()
+                combined_server._depth_cache.update(old_cache)
 
     def test_health_contract_is_shared(self):
         with self.clients() as clients:
@@ -126,7 +161,10 @@ class BackendContractTests(unittest.TestCase):
                     self.assertIs(payload["ok"], True)
                     self.assertEqual(payload["api_version"], 2)
                     self.assertEqual(payload["depth_mode"], "da360-relative")
-                    self.assertEqual(payload["calibration"], {"id": None, "loaded": False})
+                    self.assertIs(payload["calibration"]["loaded"], False)
+                    self.assertIsNone(payload["calibration"]["id"])
+                    self.assertIsNone(payload["calibration"]["request_width"])
+                    self.assertIsNone(payload["calibration"]["request_height"])
                     self.assertEqual(payload["resample"], "bicubic")
                     self.assertIs(payload["channels_last"], False)
 
@@ -158,9 +196,11 @@ class BackendContractTests(unittest.TestCase):
             for name, client in clients.items():
                 with self.subTest(app=name):
                     response = client.post(
-                        "/depth/raw?frame_id=capture-1",
+                        "/depth/raw?frame_id=frame-1&session_id=session-1&"
+                        "capture_id=capture-1&location_id=site-1",
                         data=jpeg_bytes(),
                         content_type="image/jpeg",
+                        headers={"Origin": "http://127.0.0.1:8080"},
                     )
                     self.assertEqual(response.status_code, 200)
                     self.assertEqual(response.content_type, "application/x-npz")
@@ -170,11 +210,40 @@ class BackendContractTests(unittest.TestCase):
                         set(archive.files),
                     )
                     metadata = json.loads(str(archive["metadata_json"]))
-                    self.assertEqual(metadata["frame_id"], "capture-1")
+                    self.assertEqual(metadata["frame_id"], "frame-1")
+                    self.assertEqual(metadata["session_id"], "session-1")
+                    self.assertEqual(metadata["capture_id"], "capture-1")
+                    self.assertEqual(metadata["location_id"], "site-1")
                     self.assertEqual(metadata["api_version"], 2)
                     self.assertEqual(metadata["resample"], "bicubic")
                     self.assertEqual(len(metadata["decoded_rgb_sha256"]), 64)
-                    self.assertEqual(response.headers["X-Frame-ID"], "capture-1")
+                    self.assertEqual(response.headers["X-Frame-ID"], "frame-1")
+                    self.assertEqual(response.headers["X-Session-ID"], "session-1")
+                    self.assertEqual(response.headers["X-Capture-ID"], "capture-1")
+                    self.assertEqual(response.headers["X-Location-ID"], "site-1")
+                    self.assertEqual(
+                        response.headers["Access-Control-Allow-Origin"],
+                        "http://127.0.0.1:8080",
+                    )
+                    exposed = {
+                        item.strip().lower()
+                        for item in response.headers[
+                            "Access-Control-Expose-Headers"
+                        ].split(",")
+                    }
+                    self.assertLessEqual(
+                        {
+                            "x-frame-id",
+                            "x-session-id",
+                            "x-capture-id",
+                            "x-location-id",
+                            "x-da360-model",
+                            "x-da360-width",
+                            "x-da360-height",
+                            "x-da360-latency-ms",
+                        },
+                        exposed,
+                    )
 
     def test_api_cors_is_allowlisted(self):
         with self.clients() as clients:
@@ -187,6 +256,24 @@ class BackendContractTests(unittest.TestCase):
                     self.assertEqual(
                         allowed.headers["Access-Control-Allow-Origin"],
                         "http://127.0.0.1:8080",
+                    )
+                    allowed_headers = {
+                        item.strip().lower()
+                        for item in allowed.headers[
+                            "Access-Control-Allow-Headers"
+                        ].split(",")
+                    }
+                    self.assertLessEqual(
+                        {
+                            "x-frame-id",
+                            "x-session-id",
+                            "x-capture-id",
+                            "x-location-id",
+                            "x-goal-id",
+                            "x-generation",
+                            "x-projection-config",
+                        },
+                        allowed_headers,
                     )
                     denied = client.options(
                         "/depth", headers={"Origin": "https://attacker.invalid"}
@@ -215,11 +302,11 @@ class BackendContractTests(unittest.TestCase):
         self.assertEqual(oversized.status_code, 400)
         self.assertIn("decoded image is too large", oversized.get_json()["error"])
 
-    def test_combined_plan_full_echoes_identity_and_depth_mode(self):
+    def test_relative_plan_full_returns_preview_but_no_applicable_trajectory(self):
         with self.clients() as clients:
             query = (
                 "px=1&py=2&pz=3&rpx=4&rpy=5&rpz=6&"
-                "gx=10&gy=2&gz=4&vx=0&vy=0&vz=0&yaw=0"
+                "gx=10&gy=2&gz=4&vx=0&vy=0&vz=0&ax=0&ay=0&az=0&yaw=0"
                 "&frame_id=f9&goal_id=g4&generation=5"
             )
             response = clients["combined"].post(
@@ -227,13 +314,41 @@ class BackendContractTests(unittest.TestCase):
             )
             self.assertEqual(response.status_code, 200)
             payload = response.get_json()
-            self.assertEqual(len(payload["endstate"]), 9)
             self.assertEqual(payload["frame_id"], "f9")
             self.assertEqual(payload["goal_id"], "g4")
             self.assertEqual(payload["generation"], "5")
             self.assertEqual(payload["depth_mode"], "da360-relative")
+            self.assertTrue(payload["depth_image"].startswith("data:image/jpeg;base64,"))
+            self.assertIs(payload["planning_authorized"], False)
+            self.assertEqual(
+                payload["planning_reason"], "da360-relative-is-preview-only"
+            )
+            self.assertNotIn("endstate", payload)
+            self.assertNotIn("traj_time", payload)
             self.assertEqual(payload["planning_origin"]["actual"], [1.0, 2.0, 3.0])
             self.assertEqual(payload["planning_origin"]["reference"], [4.0, 5.0, 6.0])
+            self.assertEqual(combined_server.yopo_runner.infer_calls, 0)
+            self.assertIsNone(combined_server.yopo_runner.last_call)
+
+    def test_metric_plan_full_authorizes_trajectory_and_preserves_origins(self):
+        with self.clients() as clients:
+            combined_server.da360_runner.depth_mode = "da360-metric"
+            combined_server.da360_runner.calibration = {"id": "calib-1"}
+            query = (
+                "px=1&py=2&pz=3&rpx=4&rpy=5&rpz=6&"
+                "gx=10&gy=2&gz=4&vx=0&vy=0&vz=0&ax=0&ay=0&az=0&yaw=0"
+                "&frame_id=f9&goal_id=g4&generation=5"
+            )
+            response = clients["combined"].post(
+                f"/yopo/plan_full?{query}", data=jpeg_bytes(), content_type="image/jpeg"
+            )
+            self.assertEqual(response.status_code, 200)
+            payload = response.get_json()
+            self.assertIs(payload["planning_authorized"], True)
+            self.assertEqual(payload["planning_reason"], "validated-da360-metric")
+            self.assertEqual(payload["calibration_id"], "calib-1")
+            self.assertEqual(len(payload["endstate"]), 9)
+            self.assertEqual(payload["traj_time"], 1.125)
             call = combined_server.yopo_runner.last_call
             np.testing.assert_array_equal(call["pos"], [1.0, 2.0, 3.0])
             np.testing.assert_array_equal(call["reference_pos"], [4.0, 5.0, 6.0])
@@ -241,10 +356,33 @@ class BackendContractTests(unittest.TestCase):
     def test_combined_plan_full_rejects_incomplete_state(self):
         with self.clients() as clients:
             response = clients["combined"].post(
-                "/yopo/plan_full?px=0", data=jpeg_bytes(), content_type="image/jpeg"
+                "/yopo/plan_full?frame_id=f&goal_id=g&generation=1&px=0",
+                data=jpeg_bytes(), content_type="image/jpeg"
             )
             self.assertEqual(response.status_code, 400)
             self.assertIn("missing planning field", response.get_json()["error"])
+            self.assertEqual(combined_server.da360_runner.infer_calls, 0)
+
+    def test_combined_plan_full_requires_identity_and_acceleration(self):
+        with self.clients() as clients:
+            state = (
+                "px=1&py=2&pz=3&rpx=4&rpy=5&rpz=6&"
+                "gx=10&gy=2&gz=4&vx=0&vy=0&vz=0&ax=0&ay=0&az=0&yaw=0"
+            )
+            missing_identity = clients["combined"].post(
+                f"/yopo/plan_full?{state}", data=jpeg_bytes(), content_type="image/jpeg"
+            )
+            self.assertEqual(missing_identity.status_code, 400)
+            self.assertIn("frame_id", missing_identity.get_json()["error"])
+
+            missing_acceleration = clients["combined"].post(
+                "/yopo/plan_full?px=1&py=2&pz=3&rpx=4&rpy=5&rpz=6&"
+                "gx=10&gy=2&gz=4&vx=0&vy=0&vz=0&yaw=0&"
+                "frame_id=f9&goal_id=g4&generation=5",
+                data=jpeg_bytes(), content_type="image/jpeg",
+            )
+            self.assertEqual(missing_acceleration.status_code, 400)
+            self.assertIn("missing planning field: ax", missing_acceleration.get_json()["error"])
             self.assertEqual(combined_server.da360_runner.infer_calls, 0)
 
     def test_combined_yopo_health_exposes_fingerprints(self):
@@ -256,24 +394,151 @@ class BackendContractTests(unittest.TestCase):
             self.assertEqual(payload["checkpoint_coverage"], 1.0)
             self.assertEqual(payload["config"], "fake.yaml")
             self.assertEqual(payload["config_sha256"], "ef" * 32)
+            self.assertEqual(payload["base_config"], "traj_opt.yaml")
+            self.assertEqual(payload["base_config_sha256"], "12" * 32)
+            self.assertEqual(payload["effective_config_sha256"], "34" * 32)
+            self.assertIs(payload["planning_authorized"], False)
 
-    def test_two_stage_plan_reference_origin_defaults_to_actual(self):
+    def test_relative_two_stage_plan_is_blocked_without_running_yopo(self):
         with self.clients() as clients:
             body = {
                 "depth": np.ones((4, 8), dtype=np.float32).tolist(),
                 "pose": {"x": 1, "y": 2, "z": 3},
                 "goal": {"x": 10, "y": 2, "z": 4},
+                "frame_id": "legacy-frame",
+                "goal_id": "legacy-goal",
+                "generation": "7",
+            }
+            response = clients["combined"].post("/yopo/plan", json=body)
+            self.assertEqual(response.status_code, 409)
+            payload = response.get_json()
+            self.assertIs(payload["planning_authorized"], False)
+            self.assertEqual(
+                payload["planning_reason"], "da360-relative-is-preview-only"
+            )
+            self.assertEqual(payload["frame_id"], "legacy-frame")
+            self.assertNotIn("endstate", payload)
+            self.assertEqual(combined_server.yopo_runner.infer_calls, 0)
+
+    def test_metric_two_stage_plan_uses_matching_server_cache_and_reference(self):
+        with self.clients() as clients:
+            combined_server.da360_runner.depth_mode = "da360-metric"
+            combined_server.da360_runner.calibration = {"id": "calib-legacy"}
+            combined_server._cache_depth(
+                np.ones((4, 8), dtype=np.float32),
+                {"frame_id": "legacy-frame"},
+            )
+            body = {
+                "pose": {"x": 1, "y": 2, "z": 3},
+                "reference_pose": {"x": 4, "y": 5, "z": 6},
+                "goal": {"x": 10, "y": 2, "z": 4},
                 "vel": {"vx": 0, "vy": 0, "vz": 0},
                 "acc": {"ax": 0, "ay": 0, "az": 0},
                 "yaw": 0,
+                "frame_id": "legacy-frame",
+                "goal_id": "legacy-goal",
+                "generation": "7",
             }
             response = clients["combined"].post("/yopo/plan", json=body)
             self.assertEqual(response.status_code, 200)
             payload = response.get_json()
+            self.assertIs(payload["planning_authorized"], True)
+            self.assertEqual(payload["planning_reason"], "validated-da360-metric")
+            self.assertEqual(payload["frame_id"], "legacy-frame")
+            self.assertEqual(payload["goal_id"], "legacy-goal")
+            self.assertEqual(payload["generation"], "7")
             self.assertEqual(payload["planning_origin"]["actual"], [1.0, 2.0, 3.0])
-            self.assertEqual(payload["planning_origin"]["reference"], [1.0, 2.0, 3.0])
+            self.assertEqual(payload["planning_origin"]["reference"], [4.0, 5.0, 6.0])
             call = combined_server.yopo_runner.last_call
-            np.testing.assert_array_equal(call["pos"], call["reference_pos"])
+            np.testing.assert_array_equal(
+                call["depth_arr"], np.ones((4, 8), dtype=np.float32)
+            )
+            np.testing.assert_array_equal(call["pos"], [1.0, 2.0, 3.0])
+            np.testing.assert_array_equal(call["reference_pos"], [4.0, 5.0, 6.0])
+
+    def test_metric_two_stage_plan_rejects_request_body_depth(self):
+        with self.clients() as clients:
+            combined_server.da360_runner.depth_mode = "da360-metric"
+            combined_server.da360_runner.calibration = {"id": "calib-legacy"}
+            body = {
+                "depth": np.ones((4, 8), dtype=np.float32).tolist(),
+                "pose": {"x": 1, "y": 2, "z": 3},
+                "reference_pose": {"x": 4, "y": 5, "z": 6},
+                "goal": {"x": 10, "y": 2, "z": 4},
+                "vel": {"vx": 0, "vy": 0, "vz": 0},
+                "acc": {"ax": 0, "ay": 0, "az": 0},
+                "yaw": 0,
+                "frame_id": "legacy-frame",
+                "goal_id": "legacy-goal",
+                "generation": "7",
+            }
+            response = clients["combined"].post("/yopo/plan", json=body)
+            self.assertEqual(response.status_code, 400)
+            self.assertIn("server-cached depth", response.get_json()["error"])
+            self.assertEqual(combined_server.yopo_runner.infer_calls, 0)
+
+    def test_metric_two_stage_plan_rejects_missing_reference(self):
+        with self.clients() as clients:
+            combined_server.da360_runner.depth_mode = "da360-metric"
+            combined_server.da360_runner.calibration = {"id": "calib-legacy"}
+            combined_server._cache_depth(
+                np.ones((4, 8), dtype=np.float32),
+                {"frame_id": "legacy-frame"},
+            )
+            body = {
+                "pose": {"x": 1, "y": 2, "z": 3},
+                "goal": {"x": 10, "y": 2, "z": 4},
+                "vel": {"vx": 0, "vy": 0, "vz": 0},
+                "acc": {"ax": 0, "ay": 0, "az": 0},
+                "yaw": 0,
+                "frame_id": "legacy-frame",
+                "goal_id": "legacy-goal",
+                "generation": "7",
+            }
+            response = clients["combined"].post("/yopo/plan", json=body)
+            self.assertEqual(response.status_code, 400)
+            self.assertIn("reference_pose or reference_pos", response.get_json()["error"])
+            self.assertEqual(combined_server.yopo_runner.infer_calls, 0)
+
+    def test_metric_two_stage_plan_rejects_cache_identity_mismatch(self):
+        with self.clients() as clients:
+            combined_server.da360_runner.depth_mode = "da360-metric"
+            combined_server.da360_runner.calibration = {"id": "calib-current"}
+            combined_server._cache_depth(
+                np.ones((4, 8), dtype=np.float32),
+                {"frame_id": "cached-frame"},
+            )
+            base_body = {
+                "pose": {"x": 1, "y": 2, "z": 3},
+                "reference_pos": {"x": 4, "y": 5, "z": 6},
+                "goal": {"x": 10, "y": 2, "z": 4},
+                "vel": {"vx": 0, "vy": 0, "vz": 0},
+                "acc": {"ax": 0, "ay": 0, "az": 0},
+                "yaw": 0,
+                "frame_id": "requested-frame",
+                "goal_id": "legacy-goal",
+                "generation": "7",
+            }
+            response = clients["combined"].post("/yopo/plan", json=base_body)
+            self.assertEqual(response.status_code, 409)
+            self.assertIn("frame_id mismatch", response.get_json()["error"])
+            self.assertEqual(combined_server.yopo_runner.infer_calls, 0)
+
+            base_body["frame_id"] = "cached-frame"
+            with combined_server._depth_cache_lock:
+                combined_server._depth_cache["calibration_id"] = "calib-stale"
+            response = clients["combined"].post("/yopo/plan", json=base_body)
+            self.assertEqual(response.status_code, 409)
+            self.assertIn("calibration mismatch", response.get_json()["error"])
+            self.assertEqual(combined_server.yopo_runner.infer_calls, 0)
+
+            with combined_server._depth_cache_lock:
+                combined_server._depth_cache["calibration_id"] = "calib-current"
+                combined_server._depth_cache["depth_mode"] = "da360-relative"
+            response = clients["combined"].post("/yopo/plan", json=base_body)
+            self.assertEqual(response.status_code, 409)
+            self.assertIn("depth mode mismatch", response.get_json()["error"])
+            self.assertEqual(combined_server.yopo_runner.infer_calls, 0)
 
     def test_calibration_is_fail_closed_and_fingerprint_bound(self):
         runner = object.__new__(DA360Runner)
@@ -294,6 +559,31 @@ class BackendContractTests(unittest.TestCase):
             "height": runner.height,
             "resample": runner.resample_name,
             "checkpoint_sha256": runner.checkpoint_sha256,
+            "requestWidth": 16,
+            "requestHeight": 8,
+            "input": {
+                "model": runner.model_name,
+                "width": runner.width,
+                "height": runner.height,
+                "resample": runner.resample_name,
+                "checkpoint_sha256": runner.checkpoint_sha256,
+                "request_width": 16,
+                "request_height": 8,
+            },
+            "projection": {
+                "width": 32,
+                "height": 16,
+                "faceSize": 16,
+                "rgbWidth": 16,
+                "rgbHeight": 8,
+                "verticalFovDeg": 180,
+                "faceFovDeg": 130,
+                "topPoleGuardDeg": 0,
+                "bottomPoleGuardDeg": 0,
+                "jpegQuality": 0.74,
+                "uploadScale": 0.5,
+            },
+            "dataset_fingerprint_sha256": "de" * 32,
             "selected_model": "scale_shift",
             "relation": "inverse_depth_1_per_m = a * pred_disp + b",
             "acceptance": {"passed": True},
@@ -306,6 +596,28 @@ class BackendContractTests(unittest.TestCase):
                 loaded = runner._load_depth_calibration()
             self.assertEqual(loaded["a"], 1.25)
             self.assertEqual(len(loaded["id"]), 16)
+            self.assertEqual((loaded["request_width"], loaded["request_height"]), (16, 8))
+
+            runner.calibration = loaded
+            infer_calls = []
+            runner.infer_raw = lambda image: infer_calls.append(image.size) or {
+                "pred_disp": np.full((runner.height, runner.width), 0.5, dtype=np.float32)
+            }
+            metric = runner.infer_metric(
+                Image.new("RGB", (16, 8)), calibration["projection"]
+            )
+            self.assertTrue(np.all(np.isfinite(metric)))
+            self.assertEqual(infer_calls, [(16, 8)])
+            with self.assertRaisesRegex(ValueError, "input size mismatch"):
+                runner.infer_metric(
+                    Image.new("RGB", (8, 4)), calibration["projection"]
+                )
+            with self.assertRaisesRegex(ValueError, "runtime projection config must be an object"):
+                runner.infer_metric(Image.new("RGB", (16, 8)))
+            changed_projection = dict(calibration["projection"], verticalFovDeg=160)
+            with self.assertRaisesRegex(ValueError, "projection mismatch for verticalFovDeg"):
+                runner.infer_metric(Image.new("RGB", (16, 8)), changed_projection)
+            self.assertEqual(infer_calls, [(16, 8)])
 
             rejected = dict(calibration, accepted=False)
             path.write_text(json.dumps(rejected), encoding="utf-8")

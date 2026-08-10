@@ -6,6 +6,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
 PID_FILE="$SCRIPT_DIR/.dev-web.pid"
+WEB_LOG="$SCRIPT_DIR/.dev-web.log"
 WEB_HOST="${MINDCLOUD_WEB_HOST:-127.0.0.1}"
 WEB_PORT="${MINDCLOUD_WEB_PORT:-8080}"
 API_PORT="${MINDCLOUD_API_PORT:-5688}"
@@ -16,7 +17,9 @@ DA360_MODEL="${DA360_MODEL_PATH_HOST:-$SCRIPT_DIR/third_party/DA360/checkpoints/
 YOPO_MODEL="${YOPO_MODEL_PATH_HOST:-/home/ykx/ros1/YOPO_360_v15/YOPO/saved/YOPO_55/epoch10.pth}"
 YOPO_CONFIG_NAME="${YOPO_CONFIG:-x5_cruise15_18m_a12_mask_wc3.yaml}"
 YOPO_CONFIG_PATH="$SCRIPT_DIR/third_party/YOPO/config/$YOPO_CONFIG_NAME"
+YOPO_BASE_CONFIG_PATH="$SCRIPT_DIR/third_party/YOPO/config/traj_opt.yaml"
 DEPENDENCY_LOCK="$SCRIPT_DIR/dependencies.lock.json"
+IMAGE_RECIPE="$SCRIPT_DIR/Dockerfile.da360-yopo"
 STARTUP_TIMEOUT="${MINDCLOUD_STARTUP_TIMEOUT:-180}"
 DEPTH_MODE="${DA360_DEPTH_MODE:-da360-relative}"
 RESAMPLE="${DA360_RESAMPLE:-bicubic}"
@@ -78,6 +81,7 @@ import sys
 
 host, port = sys.argv[1], int(sys.argv[2])
 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 try:
     sock.bind((host, port))
 except OSError:
@@ -98,7 +102,10 @@ da360_health_ok() {
         "http://127.0.0.1:$API_PORT/health" \
         | python3 -c '
 import json, sys
-p = json.load(sys.stdin)
+try:
+    p = json.load(sys.stdin)
+except (json.JSONDecodeError, OSError, TypeError):
+    raise SystemExit(1)
 expected_sha, expected_mode, expected_resample, expected_channels, expected_scale = sys.argv[1:]
 valid = (
     p.get("ok") is True
@@ -131,15 +138,25 @@ yopo_health_ok() {
         "http://127.0.0.1:$API_PORT/yopo/health" \
         | python3 -c '
 import json, sys
-p = json.load(sys.stdin)
+try:
+    p = json.load(sys.stdin)
+except (json.JSONDecodeError, OSError, TypeError):
+    raise SystemExit(1)
 valid = (
     p.get("ok") is True
     and p.get("api_version") == 2
     and p.get("checkpoint_sha256") == sys.argv[1]
     and p.get("config_sha256") == sys.argv[2]
+    and p.get("base_config_sha256") == sys.argv[3]
+    and p.get("planning_authorized") is (sys.argv[4] == "da360-metric")
 )
 raise SystemExit(0 if valid else 1)
-' "$YOPO_SHA256" "$YOPO_CONFIG_SHA256"
+' "$YOPO_SHA256" "$YOPO_CONFIG_SHA256" "$YOPO_BASE_CONFIG_SHA256" "$DEPTH_MODE"
+}
+
+web_health_ok() {
+    curl --noproxy '*' --fail --silent --show-error --max-time 2 \
+        --output /dev/null "http://$WEB_HOST:$WEB_PORT/"
 }
 
 cleanup_failed_start() {
@@ -167,7 +184,7 @@ echo "========================================="
 
 echo ""
 echo "=== 1/4 预检 ==="
-for command_name in docker curl python3 nvidia-smi sha256sum readlink; do
+for command_name in docker curl python3 nvidia-smi sha256sum readlink nohup setsid; do
     require_command "$command_name"
 done
 [[ "$WEB_PORT" =~ ^[0-9]+$ ]] || die "invalid web port: $WEB_PORT"
@@ -188,6 +205,7 @@ python3 -c 'import sys; value=float(sys.argv[1]); assert 0.2 <= value <= 1.0' "$
 [[ -s "$DA360_MODEL" ]] || die "DA360 checkpoint missing or empty: $DA360_MODEL"
 [[ -s "$YOPO_MODEL" ]] || die "YOPO checkpoint missing or empty: $YOPO_MODEL"
 [[ -s "$YOPO_CONFIG_PATH" ]] || die "YOPO config missing or empty: $YOPO_CONFIG_PATH"
+[[ -s "$YOPO_BASE_CONFIG_PATH" ]] || die "YOPO base config missing or empty: $YOPO_BASE_CONFIG_PATH"
 [[ -s "$DEPENDENCY_LOCK" ]] || die "dependency lock missing or empty: $DEPENDENCY_LOCK"
 CALIBRATION_FILE=""
 if [[ -n "${DA360_DEPTH_CALIB_PATH_HOST:-}" ]]; then
@@ -208,6 +226,9 @@ YOPO_MODEL="$(readlink -f "$YOPO_MODEL")"
 DA360_SHA256="$(sha256sum "$DA360_MODEL" | awk '{print $1}')"
 YOPO_SHA256="$(sha256sum "$YOPO_MODEL" | awk '{print $1}')"
 YOPO_CONFIG_SHA256="$(sha256sum "$YOPO_CONFIG_PATH" | awk '{print $1}')"
+YOPO_BASE_CONFIG_SHA256="$(sha256sum "$YOPO_BASE_CONFIG_PATH" | awk '{print $1}')"
+DEPENDENCY_LOCK_SHA256="$(sha256sum "$DEPENDENCY_LOCK" | awk '{print $1}')"
+IMAGE_RECIPE_SHA256="$(sha256sum "$IMAGE_RECIPE" | awk '{print $1}')"
 python3 "$SCRIPT_DIR/scripts/verify_dependencies.py" --skip-checkpoints \
     || die "browser/source dependency lock verification failed"
 readarray -t LOCKED_SHA256 < <(python3 - "$DEPENDENCY_LOCK" <<'PY'
@@ -217,6 +238,9 @@ with open(sys.argv[1], encoding="utf-8") as stream:
 print(lock["model_checkpoints"]["da360_large"]["sha256"])
 print(lock["model_checkpoints"]["yopo_epoch10"]["sha256"])
 print(lock["runtime_dependencies"]["yopo_config"]["sha256"])
+print(lock["runtime_dependencies"]["yopo_config"]["base_sha256"])
+print(lock["container_images"]["yopo_base"]["reference"])
+print(lock["container_images"]["yopo_base"]["local_image_id"])
 PY
 )
 [[ "$DA360_SHA256" == "${LOCKED_SHA256[0]:-}" ]] \
@@ -225,9 +249,36 @@ PY
     || die "YOPO checkpoint does not match dependencies.lock.json"
 [[ "$YOPO_CONFIG_SHA256" == "${LOCKED_SHA256[2]:-}" ]] \
     || die "YOPO config does not match dependencies.lock.json"
+[[ "$YOPO_BASE_CONFIG_SHA256" == "${LOCKED_SHA256[3]:-}" ]] \
+    || die "YOPO base config does not match dependencies.lock.json"
+IMAGE_BASE_LABEL="$(docker image inspect --format '{{ index .Config.Labels "mindcloud.yopo_base_image" }}' "$API_IMAGE" 2>/dev/null || true)"
+IMAGE_LOCK_LABEL="$(docker image inspect --format '{{ index .Config.Labels "mindcloud.dependencies_lock_sha256" }}' "$API_IMAGE" 2>/dev/null || true)"
+IMAGE_RECIPE_LABEL="$(docker image inspect --format '{{ index .Config.Labels "mindcloud.image_recipe_sha256" }}' "$API_IMAGE" 2>/dev/null || true)"
+[[ -n "$IMAGE_BASE_LABEL" && "$IMAGE_BASE_LABEL" == "${LOCKED_SHA256[4]:-}" ]] \
+    || die "Docker image base label is missing or does not match dependencies.lock.json; rebuild Dockerfile.da360-yopo"
+[[ -n "$IMAGE_LOCK_LABEL" && "$IMAGE_LOCK_LABEL" == "$DEPENDENCY_LOCK_SHA256" ]] \
+    || die "Docker image dependency-lock label is missing or stale; rebuild Dockerfile.da360-yopo"
+[[ -n "$IMAGE_RECIPE_LABEL" && "$IMAGE_RECIPE_LABEL" == "$IMAGE_RECIPE_SHA256" ]] \
+    || die "Docker image recipe label is missing or stale; rebuild Dockerfile.da360-yopo with the documented build args"
+docker image inspect "$API_IMAGE" "${LOCKED_SHA256[4]:-}" | python3 -c '
+import json, sys
+
+images = json.load(sys.stdin)
+if len(images) != 2:
+    raise SystemExit(1)
+candidate, base = images
+if base.get("Id") != sys.argv[1]:
+    raise SystemExit(1)
+candidate_layers = candidate.get("RootFS", {}).get("Layers", [])
+base_layers = base.get("RootFS", {}).get("Layers", [])
+if not base_layers or candidate_layers[:len(base_layers)] != base_layers:
+    raise SystemExit(1)
+' "${LOCKED_SHA256[5]:-}" \
+    || die "Docker image does not descend from the locked local YOPO base image"
 echo "  DA360: $(basename "$DA360_MODEL") sha256=${DA360_SHA256:0:16}..."
 echo "  YOPO:  $(basename "$YOPO_MODEL") sha256=${YOPO_SHA256:0:16}..."
-echo "  config: $YOPO_CONFIG_NAME sha256=${YOPO_CONFIG_SHA256:0:16}..."
+echo "  config: traj_opt.yaml sha256=${YOPO_BASE_CONFIG_SHA256:0:16}... + $YOPO_CONFIG_NAME sha256=${YOPO_CONFIG_SHA256:0:16}..."
+echo "  image:  base=${IMAGE_BASE_LABEL} lock=${IMAGE_LOCK_LABEL:0:16}... recipe=${IMAGE_RECIPE_LABEL:0:16}..."
 
 OWNED_WEB_PIDS=()
 if [[ -f "$PID_FILE" ]]; then
@@ -283,6 +334,7 @@ run_args=(
     -e "YOPO_MODEL_SHA256=$YOPO_SHA256"
     -e "YOPO_CONFIG=$YOPO_CONFIG_NAME"
     -e "YOPO_CONFIG_SHA256=$YOPO_CONFIG_SHA256"
+    -e "YOPO_BASE_CONFIG_SHA256=$YOPO_BASE_CONFIG_SHA256"
     -e "DA360_INPUT_SCALE=$INPUT_SCALE"
     -e "DA360_DEPTH_SCALE=${DA360_DEPTH_SCALE:-2.0}"
     -e "DA360_DEPTH_MODE=$DEPTH_MODE"
@@ -315,12 +367,18 @@ rm -f "$PID_FILE"
 docker rm -f "$LEGACY_WEB_CONTAINER" >/dev/null 2>&1 || true
 port_is_free "$WEB_HOST" "$WEB_PORT" \
     || die "$WEB_HOST:$WEB_PORT is still occupied after stopping the previous project service"
-python3 "$SCRIPT_DIR/scripts/serve.py" "$WEB_PORT" "$WEB_HOST" &
+# Detach from the caller's terminal so closing the launch shell does not take
+# the local Web service down. Runtime output is kept outside Git.
+setsid nohup python3 "$SCRIPT_DIR/scripts/serve.py" "$WEB_PORT" "$WEB_HOST" \
+    </dev/null >>"$WEB_LOG" 2>&1 &
 WEB_PID=$!
 WEB_STARTED=1
 echo "$WEB_PID" > "$PID_FILE"
 sleep 0.3
-is_owned_web_pid "$WEB_PID" || die "Web service failed to start"
+if ! is_owned_web_pid "$WEB_PID"; then
+    tail -n 40 "$WEB_LOG" >&2 || true
+    die "Web service failed to start"
+fi
 echo "  Web 已启动 http://$WEB_HOST:$WEB_PORT (PID $WEB_PID)"
 
 echo ""
@@ -328,18 +386,19 @@ echo "=== 4/4 验证健康状态 ==="
 deadline=$((SECONDS + STARTUP_TIMEOUT))
 ready=0
 while (( SECONDS < deadline )); do
-    if da360_health_ok && yopo_health_ok; then
+    if web_health_ok && da360_health_ok && yopo_health_ok; then
         ready=1
         break
     fi
     sleep 2
 done
 if (( ready == 0 )); then
-    echo "  推理服务在 ${STARTUP_TIMEOUT}s 内未同时通过 DA360/YOPO 健康检查" >&2
+    echo "  服务在 ${STARTUP_TIMEOUT}s 内未同时通过 Web/DA360/YOPO 健康检查" >&2
+    tail -n 80 "$WEB_LOG" >&2 || true
     docker logs --tail 80 "$API_CONTAINER" >&2 || true
     exit 1
 fi
-echo "  DA360 与 YOPO 均已就绪"
+echo "  Web、DA360 与 YOPO 均已就绪"
 
 if [[ "${MINDCLOUD_FIX_CLASH:-0}" == "1" ]]; then
     echo "  MINDCLOUD_FIX_CLASH=1：执行显式 Clash 修复"

@@ -65,8 +65,13 @@ export class FlightLogger {
         if (!this._recording || !metrics) return;
         const item = { ...metrics, recordedAtMs: performance.now() };
         this._perceptionMetrics.push(item);
-        if (item.outcome !== 'applied') {
-            const reason = item.dropReason || item.outcome || 'unknown';
+        const unauthorizedPlanning = item.mode === 'planning'
+            && item.planningAuthorized !== true;
+        if (item.outcome !== 'applied' || unauthorizedPlanning) {
+            const reason = item.dropReason
+                || (unauthorizedPlanning ? 'planning-not-authorized' : null)
+                || item.outcome
+                || 'unknown';
             this._dropReasons[reason] = (this._dropReasons[reason] || 0) + 1;
             return;
         }
@@ -127,7 +132,14 @@ export class FlightLogger {
             const index = Math.min(finite.length - 1, Math.ceil(quantile * finite.length) - 1);
             return Math.round(finite[Math.max(0, index)] * 10) / 10;
         };
-        const metricValues = key => this._perceptionMetrics.map(item => Number(item[key])).filter(Number.isFinite);
+        const authorizedPlanningMetrics = this._perceptionMetrics.filter(item => (
+            item.mode === 'planning'
+            && item.outcome === 'applied'
+            && item.planningAuthorized === true
+        ));
+        const metricValues = key => authorizedPlanningMetrics
+            .map(item => Number(item[key]))
+            .filter(Number.isFinite);
         const planningIntervals = this._planningApplyTimes.slice(1).map(
             (time, index) => time - this._planningApplyTimes[index]
         );

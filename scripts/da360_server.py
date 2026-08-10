@@ -53,6 +53,14 @@ DEFAULT_ALLOWED_ORIGINS = (
     "http://127.0.0.1:8080",
     "http://localhost:8080",
 )
+PROJECTION_CONFIG_HEADER = "X-Projection-Config"
+PROJECTION_INTEGER_FIELDS = (
+    "width", "height", "faceSize", "rgbWidth", "rgbHeight",
+)
+PROJECTION_FLOAT_FIELDS = (
+    "verticalFovDeg", "faceFovDeg", "topPoleGuardDeg",
+    "bottomPoleGuardDeg", "jpegQuality", "uploadScale",
+)
 
 
 def env_bool(name, default=False):
@@ -84,6 +92,50 @@ def _file_sha256(path):
     return digest.hexdigest()
 
 
+def _normalize_projection_config(value, label="projection config"):
+    """Validate and canonicalize the RGB/ERP settings bound to calibration."""
+    if not isinstance(value, dict):
+        raise ValueError(f"{label} must be an object")
+    required = set(PROJECTION_INTEGER_FIELDS + PROJECTION_FLOAT_FIELDS)
+    missing = sorted(required - set(value))
+    if missing:
+        raise ValueError(f"{label} is incomplete: " + ", ".join(missing))
+
+    normalized = {}
+    for field in PROJECTION_INTEGER_FIELDS:
+        raw = value[field]
+        if isinstance(raw, bool):
+            raise ValueError(f"{label}.{field} must be a positive integer")
+        try:
+            parsed = int(raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{label}.{field} must be a positive integer") from exc
+        if parsed <= 0 or float(raw) != parsed:
+            raise ValueError(f"{label}.{field} must be a positive integer")
+        normalized[field] = parsed
+
+    for field in PROJECTION_FLOAT_FIELDS:
+        try:
+            parsed = float(value[field])
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{label}.{field} must be finite") from exc
+        if not math.isfinite(parsed):
+            raise ValueError(f"{label}.{field} must be finite")
+        normalized[field] = parsed
+
+    for field in ("verticalFovDeg", "faceFovDeg"):
+        if not 0 < normalized[field] <= 180:
+            raise ValueError(f"{label}.{field} must be in (0, 180]")
+    for field in ("topPoleGuardDeg", "bottomPoleGuardDeg"):
+        if not 0 <= normalized[field] < 90:
+            raise ValueError(f"{label}.{field} must be in [0, 90)")
+    if not 0 < normalized["jpegQuality"] <= 1:
+        raise ValueError(f"{label}.jpegQuality must be in (0, 1]")
+    if normalized["uploadScale"] <= 0:
+        raise ValueError(f"{label}.uploadScale must be positive")
+    return normalized
+
+
 def _allowed_origins():
     configured = os.environ.get("DA360_ALLOWED_ORIGINS", "")
     if configured.strip():
@@ -97,6 +149,21 @@ def configure_api_security(app):
         "DA360_MAX_CONTENT_LENGTH", DEFAULT_MAX_CONTENT_LENGTH
     )
     allowed = _allowed_origins()
+    identity_headers = (
+        "X-Frame-ID",
+        "X-Session-ID",
+        "X-Capture-ID",
+        "X-Location-ID",
+        "X-Goal-ID",
+        "X-Generation",
+        PROJECTION_CONFIG_HEADER,
+    )
+    exposed_headers = identity_headers + (
+        "X-DA360-Model",
+        "X-DA360-Width",
+        "X-DA360-Height",
+        "X-DA360-Latency-Ms",
+    )
 
     @app.before_request
     def reject_untrusted_origin():
@@ -113,7 +180,10 @@ def configure_api_security(app):
             response.headers.add("Vary", "Origin")
             response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
             response.headers["Access-Control-Allow-Headers"] = (
-                "Content-Type, X-Frame-ID, X-Goal-ID, X-Generation"
+                "Content-Type, " + ", ".join(identity_headers)
+            )
+            response.headers["Access-Control-Expose-Headers"] = ", ".join(
+                exposed_headers
             )
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["Cache-Control"] = "no-store"
@@ -493,7 +563,7 @@ class DA360Runner:
             print(f"  [da360 infer] TOTAL: {1000*(_t[-1]-_t[0]):.0f}ms  ({self.width}x{self.height})", flush=True)
         return depth
 
-    def infer_metric(self, image):
+    def infer_metric(self, image, projection_config=None):
         """Run DA360 inference and convert raw pred_disp to metric depth.
 
         使用启动时验证并冻结的线性标定参数 1/z = a·pred_disp + b，
@@ -504,11 +574,34 @@ class DA360Runner:
         -------
         np.ndarray  float32[H,W]  metric depth (metres), clamped to [min_dis, max_dis]
         """
-        raw = self.infer_raw(image)
-        pred_disp = raw["pred_disp"]
         calib = self.calibration
         if calib is None:
             raise RuntimeError("metric inference requested without a validated calibration")
+        request_size = (int(image.width), int(image.height))
+        calibrated_size = (calib["request_width"], calib["request_height"])
+        if request_size != calibrated_size:
+            raise ValueError(
+                "metric calibration input size mismatch: "
+                f"{request_size[0]}x{request_size[1]} != "
+                f"{calibrated_size[0]}x{calibrated_size[1]}"
+            )
+        runtime_projection = _normalize_projection_config(
+            projection_config, "runtime projection config"
+        )
+        if (runtime_projection["rgbWidth"], runtime_projection["rgbHeight"]) != request_size:
+            raise ValueError("runtime projection RGB dimensions do not match decoded image")
+        for field, expected in calib["projection"].items():
+            actual = runtime_projection[field]
+            matches = actual == expected if field in PROJECTION_INTEGER_FIELDS else math.isclose(
+                actual, expected, rel_tol=0, abs_tol=1e-9
+            )
+            if not matches:
+                raise ValueError(
+                    f"metric calibration projection mismatch for {field}: "
+                    f"{actual!r} != {expected!r}"
+                )
+        raw = self.infer_raw(image)
+        pred_disp = raw["pred_disp"]
         a, b = calib["a"], calib["b"]
         inverse_depth = a * pred_disp + b
         valid = np.isfinite(inverse_depth) & (inverse_depth > 1e-6)
@@ -520,10 +613,10 @@ class DA360Runner:
         )
         return metric.astype(np.float32)
 
-    def infer_depth(self, image):
+    def infer_depth(self, image, projection_config=None):
         """Run the explicitly configured relative or metric depth path."""
         if self.depth_mode == "da360-metric":
-            return self.infer_metric(image)
+            return self.infer_metric(image, projection_config)
         return self.infer(image)
 
     def _load_depth_calibration(self):
@@ -556,6 +649,8 @@ class DA360Runner:
                 raise ValueError("calibration depth range must satisfy 0 < min < max")
 
             context = calib.get("input", {})
+            if not isinstance(context, dict):
+                raise ValueError("calibration input fingerprint must be an object")
             expected = {
                 "model": self.model_name,
                 "width": self.width,
@@ -583,6 +678,31 @@ class DA360Runner:
                         f"calibration {key} mismatch: {actual!r} != {expected_value!r}"
                     )
 
+            request_width = int(calib.get("requestWidth", context.get("request_width", 0)))
+            request_height = int(calib.get("requestHeight", context.get("request_height", 0)))
+            if request_width <= 0 or request_height <= 0:
+                raise ValueError("calibration requestWidth/requestHeight must be positive")
+            if int(context.get("request_width", 0)) != request_width \
+                    or int(context.get("request_height", 0)) != request_height:
+                raise ValueError("calibration request dimensions disagree with input fingerprint")
+
+            projection = _normalize_projection_config(
+                calib.get("projection"), "calibration projection fingerprint"
+            )
+            if int(projection["rgbWidth"]) != request_width \
+                    or int(projection["rgbHeight"]) != request_height:
+                raise ValueError("calibration projection RGB dimensions mismatch")
+            expected_upload_scale = request_width / int(projection["width"])
+            if not math.isclose(
+                    projection["uploadScale"], expected_upload_scale,
+                    rel_tol=0, abs_tol=1e-12):
+                raise ValueError("calibration uploadScale does not match request/panorama width")
+
+            dataset_fingerprint = str(calib.get("dataset_fingerprint_sha256", ""))
+            if len(dataset_fingerprint) != 64 or any(
+                    character not in "0123456789abcdef" for character in dataset_fingerprint.lower()):
+                raise ValueError("calibration dataset fingerprint must be SHA-256")
+
             calibration_sha = _file_sha256(calibration_path)
             return {
                 "a": a,
@@ -591,6 +711,10 @@ class DA360Runner:
                 "depth_max_m": max_depth,
                 "id": calibration_sha[:16],
                 "sha256": calibration_sha,
+                "request_width": request_width,
+                "request_height": request_height,
+                "projection": projection,
+                "dataset_fingerprint_sha256": dataset_fingerprint.lower(),
             }
         except Exception as exc:
             raise RuntimeError(f"invalid DA360 calibration {path}: {exc}") from exc
@@ -678,6 +802,10 @@ def runner_health_payload(runner):
         "calibration": {
             "loaded": calibration is not None,
             "id": _runner_calibration_id(runner),
+            "request_width": calibration.get("request_width") if calibration else None,
+            "request_height": calibration.get("request_height") if calibration else None,
+            "dataset_fingerprint_sha256": calibration.get("dataset_fingerprint_sha256")
+                if calibration else None,
         },
         "checkpoint": {
             "sha256": getattr(runner, "checkpoint_sha256", None),
@@ -690,19 +818,38 @@ def runner_health_payload(runner):
 
 def _request_image_metadata(image):
     rgb = np.asarray(image, dtype=np.uint8)
+    projection_header = request.headers.get(PROJECTION_CONFIG_HEADER)
+    projection_config = None
+    if projection_header is not None:
+        if len(projection_header) > 4096:
+            raise ValueError("runtime projection config header is too large")
+        try:
+            projection_payload = json.loads(projection_header)
+        except json.JSONDecodeError as exc:
+            raise ValueError("runtime projection config must be valid JSON") from exc
+        projection_config = _normalize_projection_config(
+            projection_payload, "runtime projection config"
+        )
     return {
         "frame_id": request.args.get("frame_id") or request.headers.get("X-Frame-ID"),
+        "session_id": request.args.get("session_id") or request.headers.get("X-Session-ID"),
+        "capture_id": request.args.get("capture_id") or request.headers.get("X-Capture-ID"),
+        "location_id": request.args.get("location_id") or request.headers.get("X-Location-ID"),
         "goal_id": request.args.get("goal_id") or request.headers.get("X-Goal-ID"),
         "generation": request.args.get("generation") or request.headers.get("X-Generation"),
         "request_width": image.width,
         "request_height": image.height,
         "decoded_rgb_sha256": hashlib.sha256(rgb.tobytes()).hexdigest(),
+        "projection_config": projection_config,
     }
 
 
-def _infer_configured_depth(runner, image):
+def _infer_configured_depth(runner, image, request_metadata=None):
     infer_depth = getattr(runner, "infer_depth", None)
-    return infer_depth(image) if infer_depth is not None else runner.infer(image)
+    if infer_depth is None:
+        return runner.infer(image)
+    projection_config = (request_metadata or {}).get("projection_config")
+    return infer_depth(image, projection_config)
 
 
 def register_depth_routes(app, runner_provider, on_depth=None, endpoint_prefix="da360"):
@@ -757,6 +904,12 @@ def register_depth_routes(app, runner_provider, on_depth=None, endpoint_prefix="
                 character if character.isalnum() or character in {"-", "_"} else "_"
                 for character in frame_token[:80]
             )
+            def response_token(field):
+                value = str(request_metadata[field] or "")[:128]
+                return "".join(
+                    character if character.isalnum() or character in {"-", "_", "."} else "_"
+                    for character in value
+                )
             filename = f"depth_raw_{frame_token}.npz"
             return app.response_class(
                 buf.getvalue(),
@@ -769,6 +922,9 @@ def register_depth_routes(app, runner_provider, on_depth=None, endpoint_prefix="
                     "X-DA360-Height": str(metadata["height"]),
                     "X-DA360-Latency-Ms": str(latency_ms),
                     "X-Frame-ID": frame_token if request_metadata["frame_id"] else "",
+                    "X-Session-ID": response_token("session_id"),
+                    "X-Capture-ID": response_token("capture_id"),
+                    "X-Location-ID": response_token("location_id"),
                 },
             )
         except ValueError as exc:
@@ -793,7 +949,7 @@ def register_depth_routes(app, runner_provider, on_depth=None, endpoint_prefix="
             request_metadata = _request_image_metadata(image)
             timings["decode_ms"] = (time.perf_counter() - mark) * 1000.0
             mark = time.perf_counter()
-            pred_depth = _infer_configured_depth(runner, image)
+            pred_depth = _infer_configured_depth(runner, image, request_metadata)
             timings["infer_ms"] = (time.perf_counter() - mark) * 1000.0
             if on_depth is not None:
                 on_depth(pred_depth, request_metadata)

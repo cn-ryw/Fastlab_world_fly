@@ -329,6 +329,10 @@ export class Drone {
 
     /** Set ideal goal (point-to-point, no YOPO trajectory). */
     setIdealGoal(goal) {
+        // A goal change starts a new navigation generation.  Never keep
+        // tracking a polynomial or decay reference generated for the prior
+        // goal while the next perception response is still in flight.
+        this._clearYopoMotionState();
         this._idealGoal = goal ? { x: goal.x, y: goal.y, z: goal.z, yaw: goal.yaw } : null;
         this._so3AltitudeRef = goal ? goal.y : null;  // lock altitude
         this._navigationState = goal ? 'active' : 'idle';
@@ -337,15 +341,20 @@ export class Drone {
 
     clearIdealGoal() { this._idealGoal = null; }
 
+    _clearYopoMotionState() {
+        this._yopoPlanTriggered = false;
+        this._yopoPolyX = this._yopoPolyY = this._yopoPolyZ = null;
+        this._yopoTrajTime = 0;
+        this._yopoTrackerTime = 0;
+        this._yopoDecayRef = null;
+        this._yopoDecayTimer = 0;
+    }
+
     /** Cancel current waypoint — clear goal + YOPO trajectory + decay + stop */
     cancelWaypoint() {
         this._idealGoal = null;
         this._so3AltitudeRef = null;
-        this._yopoPlanTriggered = false;
-        this._yopoPolyX = this._yopoPolyY = this._yopoPolyZ = null;
-        this._yopoDecayRef = null;
-        this._yopoDecayTimer = 0;
-        this._yopoTrackerTime = 0;
+        this._clearYopoMotionState();
         this._navigationState = 'cancelled';
         this._navigationTransitionReason = 'cancelled';
         // Set current position as hold reference so drone stops immediately

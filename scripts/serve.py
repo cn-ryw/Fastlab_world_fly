@@ -173,9 +173,75 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             self.send_header('Expires', '0')
         super().end_headers()
 
+    def _allowed_hosts(self):
+        """Return the fixed loopback Host allowlist for this listener."""
+        listen_port = int(self.server.server_address[1])
+        return {("127.0.0.1", listen_port), ("localhost", listen_port)}
+
+    def _request_host(self):
+        raw_host = self.headers.get('Host', '').strip()
+        if not raw_host or any(character in raw_host for character in '\r\n/?#@'):
+            return None
+        try:
+            parsed = urlsplit(f'//{raw_host}')
+            hostname = (parsed.hostname or '').lower()
+            port = parsed.port
+        except ValueError:
+            return None
+        if port is None:
+            port = int(self.server.server_address[1])
+        return hostname, port
+
+    def _host_allowed(self):
+        return self._request_host() in self._allowed_hosts()
+
+    def _reject_untrusted_host(self):
+        # Do not derive trust from a caller-controlled Host header.  A fixed
+        # loopback allowlist prevents DNS rebinding from turning an attacker
+        # origin into a same-origin gate-path API client.
+        if not self._host_allowed():
+            self._send_plain(403, 'untrusted Host header')
+            return True
+        return False
+
     def _origin_allowed(self, origin):
-        host = self.headers.get('Host', '')
-        return origin in {f'http://{host}', f'https://{host}'}
+        if not self._host_allowed():
+            return False
+        if (
+            not isinstance(origin, str)
+            or not origin
+            or origin != origin.strip()
+            or any(ord(character) < 0x21 or ord(character) == 0x7f
+                   for character in origin)
+        ):
+            return False
+        try:
+            parsed = urlsplit(origin)
+            hostname = (parsed.hostname or '').lower()
+            port = parsed.port
+            username = parsed.username
+            password = parsed.password
+        except (TypeError, ValueError):
+            return False
+
+        # A browser Origin is a serialized origin, not an arbitrary URL: it
+        # has no credentials, path, query or fragment.  This server is plain
+        # HTTP even when configured to listen on port 443, so HTTPS origins
+        # must not be treated as equivalent.
+        if (
+            parsed.scheme.lower() != 'http'
+            or not parsed.netloc
+            or username is not None
+            or password is not None
+            or parsed.path
+            or parsed.query
+            or parsed.fragment
+            or parsed.netloc.endswith(':')
+        ):
+            return False
+
+        normalized_port = 80 if port is None else port
+        return (hostname, normalized_port) in self._allowed_hosts()
 
     def _reject_cross_origin_api(self):
         origin = self.headers.get('Origin')
@@ -220,6 +286,8 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_OPTIONS(self):
+        if self._reject_untrusted_host():
+            return
         # CORS pre-flight for PUT/DELETE issued by the browser.
         if self.path.startswith('/api/path/'):
             if self._reject_cross_origin_api():
@@ -230,6 +298,8 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         self._send_plain(405, 'method not allowed')
 
     def do_GET(self):
+        if self._reject_untrusted_host():
+            return
         if self.path.startswith('/api/path/'):
             if self._reject_cross_origin_api():
                 return
@@ -254,12 +324,16 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         self._serve_static()
 
     def do_HEAD(self):
+        if self._reject_untrusted_host():
+            return
         if self.path.startswith('/api/path/'):
             self._send_plain(405, 'method not allowed')
             return
         self._serve_static(head_only=True)
 
     def do_PUT(self):
+        if self._reject_untrusted_host():
+            return
         if not self.path.startswith('/api/path/'):
             self._send_plain(405, 'PUT only allowed on /api/path/')
             return
@@ -309,6 +383,8 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         self.end_headers()
 
     def do_DELETE(self):
+        if self._reject_untrusted_host():
+            return
         if not self.path.startswith('/api/path/'):
             self._send_plain(405, 'DELETE only allowed on /api/path/')
             return

@@ -1,5 +1,6 @@
 /** Navigation safety contract: 4 m arrival, leveled yaw, and YOPO envelopes. */
 import { createRequire } from 'node:module';
+import { readFile } from 'node:fs/promises';
 
 const pc = createRequire(import.meta.url)('../asset/vendor/playcanvas.min.js');
 globalThis.pc = pc;
@@ -24,6 +25,31 @@ function close(actual, expected, message, epsilon = 1e-9) {
 }
 
 assert(ARRIVAL_DISTANCE_M === 4, 'arrival radius is the authoritative 4 m');
+
+const mainSource = await readFile(new URL('../src/main.js', import.meta.url), 'utf8');
+assert(
+    /async function enterPlacementMode[\s\S]*?finishNavigationSession\('mode-exit', \{ cancelDrone: true/.test(mainSource),
+    'leaving flight for placement terminates and cancels the navigation session',
+);
+
+// Replacing a goal must clear the prior generation's trajectory immediately;
+// the vehicle hovers until the new frame-safe response arrives.
+{
+    const drone = new Drone();
+    drone.x = 0; drone.y = 10; drone.z = 0;
+    drone.setIdealGoal({ x: 20, y: 10, z: 0 });
+    assert(drone.setYopoTrajectory(
+        [5, 0, 0, 10, 0, 0, 0, 0, 0],
+        1.125,
+    ) === true, 'test precondition: old trajectory accepted');
+    assert(drone._yopoPolyX, 'test precondition: old trajectory installed');
+    drone.setIdealGoal({ x: -20, y: 10, z: 0 });
+    assert(drone._yopoPolyX === null, 'new goal clears old X trajectory');
+    assert(drone._yopoPolyY === null, 'new goal clears old Y trajectory');
+    assert(drone._yopoPolyZ === null, 'new goal clears old Z trajectory');
+    assert(drone._yopoDecayRef === null, 'new goal clears old decay reference');
+    assert(drone._yopoPlanTriggered === false, 'arrival waits for the new generation trajectory');
+}
 
 for (const [distance, shouldArrive] of [[3.9, true], [4.1, false], [8.9, false]]) {
     const drone = new Drone();

@@ -1,13 +1,18 @@
 """Verify the existing /depth endpoint is unchanged after adding /depth/raw."""
 import io, os, sys
+import pytest
 import requests
 from PIL import Image
 
+pytestmark = pytest.mark.integration
+
 DA360_URL = os.environ.get("DA360_URL", "http://127.0.0.1:5688")
+SESSION = requests.Session()
+SESSION.trust_env = False
 
 
 def _post_depth(image_bytes):
-    return requests.post(f"{DA360_URL}/depth",
+    return SESSION.post(f"{DA360_URL}/depth",
                          data=image_bytes,
                          headers={"Content-Type": "image/jpeg"},
                          timeout=60)
@@ -58,20 +63,20 @@ def test_depth_accepts_multiple_content_types():
     r1 = _post_depth(jpg)
     assert r1.status_code == 200
     # multipart
-    r2 = requests.post(f"{DA360_URL}/depth",
+    r2 = SESSION.post(f"{DA360_URL}/depth",
                        files={"image": ("test.jpg", jpg, "image/jpeg")}, timeout=60)
     assert r2.status_code == 200
     # JSON-wrapped base64
     import base64
     b64 = base64.b64encode(jpg).decode()
-    r3 = requests.post(f"{DA360_URL}/depth",
+    r3 = SESSION.post(f"{DA360_URL}/depth",
                        json={"image": f"data:image/jpeg;base64,{b64}"}, timeout=60)
     assert r3.status_code == 200
 
 
 def test_health_endpoint():
     """/health returns ok=True with model and device info."""
-    resp = requests.get(f"{DA360_URL}/health", timeout=10)
+    resp = SESSION.get(f"{DA360_URL}/health", timeout=10)
     assert resp.status_code == 200
     data = resp.json()
     assert data["ok"] is True

@@ -35,6 +35,12 @@ from scipy.spatial.transform import Rotation as R
 YOPO_ROOT = Path(os.environ.get("YOPO_ROOT", "/opt/YOPO_360")).resolve()
 sys.path.insert(0, str(YOPO_ROOT / "YOPO"))
 
+# config.config materializes its global ``cfg`` at import time. Establish the
+# overlay first so the standalone bridge cannot hash one YAML while actually
+# running with the base-only configuration.
+DEFAULT_CONFIG_NAME = "x5_cruise15_18m_a12_mask_wc3.yaml"
+os.environ.setdefault("YOPO_CONFIG", DEFAULT_CONFIG_NAME)
+
 from config.config import cfg  # noqa: E402
 from policy.yopo_network import YopoNetwork  # noqa: E402
 from policy.depth_mask import fill_invalid_depth, valid_depth_mask  # noqa: E402
@@ -42,7 +48,8 @@ from policy.state_transform import StateTransform  # noqa: E402
 from policy.poly_solver import Poly5Solver  # noqa: E402
 
 DEFAULT_MODEL = os.environ.get("YOPO_MODEL_PATH", str(YOPO_ROOT / "YOPO/saved/YOPO_55/epoch10.pth"))
-DEFAULT_CONFIG = os.environ.get("YOPO_CONFIG", "x5_cruise15_18m_a12_mask_wc3.yaml")
+DEFAULT_CONFIG = os.environ["YOPO_CONFIG"]
+BASE_CONFIG = "traj_opt.yaml"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
@@ -129,6 +136,9 @@ def health():
         "checkpoint_coverage": runner.checkpoint_coverage,
         "config": runner.config_name,
         "config_sha256": runner.config_sha256,
+        "base_config": runner.base_config_name,
+        "base_config_sha256": runner.base_config_sha256,
+        "effective_config_sha256": runner.effective_config_sha256,
     })
 
 
@@ -199,6 +209,12 @@ class YopoRunner:
         config_path = YOPO_ROOT / "YOPO" / "config" / self.config_name
         if not config_path.is_file():
             raise FileNotFoundError(f"YOPO config missing: {config_path}")
+        loaded_config_path = Path(cfg.config_path).resolve()
+        if loaded_config_path != config_path.resolve():
+            raise RuntimeError(
+                "YOPO runtime config mismatch: imported "
+                f"{loaded_config_path} but expected {config_path.resolve()}"
+            )
         self.config_sha256 = _sha256_file(config_path)
         expected_config_sha = os.environ.get("YOPO_CONFIG_SHA256", "").strip().lower()
         if expected_config_sha and self.config_sha256 != expected_config_sha:
@@ -206,6 +222,25 @@ class YopoRunner:
                 "YOPO config fingerprint mismatch: "
                 f"{self.config_sha256} != {expected_config_sha}"
             )
+        self.base_config_name = BASE_CONFIG
+        base_config_path = YOPO_ROOT / "YOPO" / "config" / self.base_config_name
+        if not base_config_path.is_file():
+            raise FileNotFoundError(f"YOPO base config missing: {base_config_path}")
+        self.base_config_sha256 = _sha256_file(base_config_path)
+        expected_base_config_sha = os.environ.get(
+            "YOPO_BASE_CONFIG_SHA256", ""
+        ).strip().lower()
+        if (
+            expected_base_config_sha
+            and self.base_config_sha256 != expected_base_config_sha
+        ):
+            raise RuntimeError(
+                "YOPO base config fingerprint mismatch: "
+                f"{self.base_config_sha256} != {expected_base_config_sha}"
+            )
+        self.effective_config_sha256 = hashlib.sha256(
+            f"{self.base_config_sha256}:{self.config_sha256}".encode("ascii")
+        ).hexdigest()
         # channels_last 在 RTX 5070 Ti + PyTorch 2.8 + Flask 主进程中有 200x 减速 bug，
         # 症状同 DA360_CHANNELS_LAST。默认禁用，换 GPU/PyTorch 版本可重新启用。
         self.use_amp = device == "cuda" and os.environ.get("YOPO_AMP", "1") != "0"
@@ -365,7 +400,6 @@ def parse_args():
 def main():
     global runner
     args = parse_args()
-    os.environ.setdefault("YOPO_CONFIG", DEFAULT_CONFIG)
     runner = YopoRunner(args.model_path)
     print(f"[yopo-bridge] model loaded: {runner.model_path}, device={runner.device}")
     app.run(host=args.host, port=args.port, debug=args.debug, threaded=False)

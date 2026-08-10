@@ -1,161 +1,248 @@
-# Google 3D Tiles Flight
+# MindCloud World Fly
 
-浏览器中的 Google Photorealistic 3D Tiles 穿越机驾驶器。进入页面后选择城市、放置出生点，然后用键盘、手柄或 RC 遥控器飞行。右下角可显示机头 360 ERP 全景 RGB 和 DA360 深度。
+浏览器内的 Google Photorealistic 3D Tiles 无人机仿真器。目标导航链路为：Cesium 六面渲染生成 384×192 ERP RGB，DA360 估计米制深度，YOPO 输出 Poly5 轨迹，浏览器内 SO3 控制器跟踪轨迹。当前默认 `da360-relative` 只用于预览和标定采集，不授权 YOPO 轨迹。
 
-## 环境要求
+本项目正在做 YOPO_360 的 sim-to-sim 迁移。权威参考是 `/home/ykx/ros1/YOPO_360_v15`；除深度来源和控制下发方式外，其余行为应与参考实现一致。
 
-- Docker Engine
-- Chrome / Chromium
-- 浏览器可以访问 Cesium Ion 和 Google 3D Tiles
-- 本地开发模式需要 Python 3
-- DA360 深度推理需要 NVIDIA GPU、NVIDIA Container Toolkit、Python 3 + pip，以及可访问模型下载地址的网络
+## 运行要求
 
-## 启动主进程
-默认
+- NVIDIA GPU、驱动和 NVIDIA Container Toolkit
+- Docker Engine、Python 3、curl
+- 宿主无 GPU 测试需 pytest、NumPy、SciPy 和 Pillow；缺少 Flask 时 backend contract 模块会整体 skip，可改用 combined 镜像执行该 contract
+- Firefox；当前机器上 Chrome/Chromium 与 PRIME offload 的 WebGL 组合不稳定
+- 可访问 Cesium Ion 和 Google Photorealistic 3D Tiles
+- DA360 large 与 YOPO epoch10 checkpoint，具体哈希见 `dependencies.lock.json`
+
+## 推荐启动方式
+
 ```bash
-./launch.sh
+# 首次或 Dockerfile/third_party 变化后构建
+lock_sha="$(sha256sum dependencies.lock.json | awk '{print $1}')"
+recipe_sha="$(sha256sum Dockerfile.da360-yopo | awk '{print $1}')"
+docker build \
+  --build-arg "MINDCLOUD_DEPENDENCY_LOCK_SHA256=$lock_sha" \
+  --build-arg "MINDCLOUD_IMAGE_RECIPE_SHA256=$recipe_sha" \
+  -f Dockerfile.da360-yopo -t mindcloud-da360-yopo:latest .
+
+# 启动 combined API 与本地 Web
+./start-all.sh
+
+# 打开启用 NVIDIA offload 的 Firefox
+./launch-firefox-gpu.sh
+
+# 停止本项目服务
+./stop-all.sh
 ```
 
-打开：
+`start-all.sh` 的实际拓扑只有两个本机监听端点：
 
 ```text
-http://127.0.0.1:8080
+Firefox ── http://127.0.0.1:8080 ── scripts/serve.py（直接读取工作树）
+   │
+   └───── http://127.0.0.1:5688 ── Docker combined_server.py
+                                      ├─ DA360
+                                      └─ YOPO
 ```
 
-可选常用方式：
+- 8080 不是 Docker Web 容器；修改 `src/*.js` 或 `index.html` 后刷新即可。
+- 5688 是单进程、单端口的 DA360+YOPO 服务，只发布到 loopback。
+- 启动检查显式绕过代理，并要求 `/health` 与 `/yopo/health` 同时通过；失败会非零退出。
+- Clash 配置不会再被默认修改；只有设置 `MINDCLOUD_FIX_CLASH=1` 才执行修复脚本。
 
-```bash
-# 端口被占用时
-PORT=18081 ./launch.sh
-
-# 只启动服务，不自动打开浏览器
-./launch.sh --no-open
-
-# Docker 后台运行
-./launch.sh --detach
-
-# 停止后台容器
-docker rm -f google-tiles-flight
-
-# 本地开发模式
-./launch.sh --local
-```
-
-## 启动副进程（DA360 深度估计）
-
-首次使用前下载模型并启动推理服务：
-
-```bash
-python3 -m pip install --user gdown
-./scripts/download_da360_model.sh
-./scripts/start_da360_api.sh
-
-# 心跳包自检：curl http://127.0.0.1:5688/health
-```
-
-停止感知的推理服务，只保留主进程飞飞机的功能的话就关掉这个docker就行了：
-
-```bash
-docker rm -f mindcloud-da360-api
-```
-
-注意，默认使用 `DA360_large`。`start_da360_api.sh` 以实时优先的 `DA360_INPUT_SCALE=0.65` 推理；本项目的一键脚本 `start-all.sh` 走 DA360+YOPO 合并容器，用的是 `DA360_INPUT_SCALE=0.5`。右下角 RGB 全景仍保持原始显示尺寸；只有发送给 DA360 的深度请求会单独缩小，前端默认按 `da360UploadScale=0.35` 上传约 `134x67` 的 JPEG，再由服务端 resize 到模型输入尺寸。前端默认 `depthMs=33`，推理未完成时不会堆积请求。
-
-默认不建议换模型；实验中 `DA360_large` 的 fast 档比 `DA360_small` 保留了更好的深度排序和边缘一致性。只有显存、功耗或部署体积受限时，再自行覆盖模型名：
-
-```bash
-DA360_MODEL=<large|base|small> ./scripts/download_da360_model.sh
-DA360_MODEL=<large|base|small> ./scripts/start_da360_api.sh
-```
-
-如需主动调整 DA360 服务端模型输入尺寸，可设置推理 scale 或指定模型输入宽高；过低的 `DA360_INPUT_SCALE` 可能让 large 模型输出条带化深度，不建议低于 `0.46`。服务端 resize 默认使用 `DA360_RESAMPLE=bicubic`，与 DA360 原项目的输入缩放方式保持一致：
-
-```bash
-DA360_INPUT_SCALE=1.0 ./scripts/start_da360_api.sh
-DA360_INPUT_SCALE=0.46 ./scripts/start_da360_api.sh
-DA360_INPUT_WIDTH=476 ./scripts/start_da360_api.sh
-DA360_INPUT_WIDTH=672 DA360_INPUT_HEIGHT=336 ./scripts/start_da360_api.sh
-DA360_RESAMPLE=bilinear ./scripts/start_da360_api.sh
-```
-
-推理服务不在本机时：
+默认 checkpoint 路径：
 
 ```text
-http://127.0.0.1:8080/?da360Url=http://<host>:5688/depth
+third_party/DA360/checkpoints/DA360_large.pth
+/home/ykx/ros1/YOPO_360_v15/YOPO/saved/YOPO_55/epoch10.pth
 ```
 
-## 使用流程说明
+可分别用 `DA360_MODEL_PATH_HOST` 和 `YOPO_MODEL_PATH_HOST` 覆盖。
 
-1. 点击 **Start Google 3D Tiles Flight**。
-2. 等页面进入 **PLACEMENT MODE**。
-3. 用 Cesium 搜索框搜索城市或地点。
-4. 按住 `I` 并点击建筑、道路或地面设置出生点。
-5. 用 `W/A/S/D` 微调水平位置，`Shift` 加快微调。
-6. 设置 **SPAWN ALTITUDE (m)**。
-7. 按 `O` 确认出生点。
-8. 选择 **First Person** 或 **Third Person** 开始飞行。
+## 使用方式
 
-常用按键：
+1. 打开 `http://127.0.0.1:8080`，进入 Google 3D Tiles 模式。
+2. 在 placement 模式按住 `I` 点击地面或建筑，设置出生点。
+3. 用 `W/A/S/D` 微调，设置出生高度，按 `O` 确认。
+4. 选择视角并进入飞行。
+5. SO3 模式下按住 `G` 点击场景或雷达设置目标；`G`+滚轮修改目标高度；`C` 取消。
+
+到达阈值为 **4.0m**，来自权威 YOPO `traj_opt.yaml`。`radio_range` 不是到达距离。
+
+## DA360 深度状态
+
+右下角只有一个可见 depth canvas。服务返回的 JPEG 完成异步解码并成功绘制后，前端才设置 `hasDepth=true`。
+
+状态含义：
+
+| 状态 | 含义 |
+|---|---|
+| `offline` | API 不可达或请求超时 |
+| `preview` | 无活动目标，调用 `/depth` 持续预览 DA360 深度 |
+| `planning` | 有活动目标，下一完整帧调用 `/yopo/plan_full`；只有合格 metric 模式才安装轨迹 |
+| `error` | 服务可达，但响应、解码或契约校验失败 |
+| `preview/planning · stale` | 响应属于旧 frame、goal 或 generation，已丢弃 |
+| `planning · blocked` | 深度画面已更新，但当前 relative 模式不授权轨迹 |
+
+到达或取消后出现 `preview` 是正常行为，不表示 DA360 离线。若设置目标后已经产生新的完整 RGB 帧，状态仍不进入 `planning`，才属于目标/帧状态故障。
+
+## 在线 API
+
+combined 服务与 standalone DA360 服务共享 API v2 深度契约：
+
+| 路径 | 用途 |
+|---|---|
+| `GET /health` | DA360 模型、输入尺寸、resample、depth mode、标定和 checkpoint 指纹 |
+| `POST /depth` | JPEG → 深度预览 JPEG 与轻量 metadata |
+| `POST /depth/raw` | JPEG → raw `pred_disp`、相对深度、valid mask 和 metadata 的 NPZ |
+| `GET /yopo/health` | YOPO 模型、配置和 checkpoint 指纹 |
+| `POST /yopo/plan_full` | JPEG + 完整状态 → 深度 JPEG 和 identity；仅授权模式返回 YOPO endstate |
+| `POST /yopo/plan` | 兼容/离线调试路径；relative 模式返回 409，不能绕过授权 |
+
+`/yopo/plan_full` 使用 `frame_id/goal_id/generation` 防止旧响应覆盖新会话。前端 `PerceptionFrame` 将 RGB、采集 transform、实际状态、参考状态、yaw 和投影配置绑定为不可变快照，避免把旧 RGB 与新位姿配对。所有 JPEG 深度请求还会用 `X-Projection-Config` 发送该帧的 ERP、上传尺寸和 JPEG 指纹；metric 模式在 GPU 推理前逐字段与 accepted calibration 核对。
+
+## 当前默认值
+
+代码默认值是唯一真相；下表对应当前 `src/panorama-sensor.js` 与 `start-all.sh`：
+
+| 参数 | 默认值 |
+|---|---:|
+| ERP 输出 | 384×192 |
+| `panoFace` | 96 |
+| `panoFacesPerSlice` | 2 |
+| `panoMs` | 20ms |
+| `depthMs` | 20ms |
+| `panoFrameDelayMs` | 0ms |
+| `da360UploadScale` | 0.35 |
+| `DA360_INPUT_SCALE` | 0.46（约 476×238） |
+| `DA360_RESAMPLE` | bicubic |
+| `DA360_CHANNELS_LAST` | 0 |
+| `DA360_DEPTH_MODE` | da360-relative |
+| 到达距离 | 4.0m |
+| 碰撞半径 | 0.6m |
+
+URL 参数示例：
 
 ```text
-↑ / ↓       前进 / 后退
-← / →       左右平移
-W / S       上升 / 下降
-A / D       左右偏航
-Shift       加速
-R           重置
-V           切换视角
-P           返回放置模式
-Tab         设置面板
-```
-
-键盘可直接使用，也支持手柄（但需要自己优化映射），手柄通常会被 Chrome 的 Gamepad API 自动识别。RC 遥控器或 WebHID 设备可在设置面板中连接；如需检查 Linux 输入权限：
-
-```bash
-./launch.sh --input-status
-./launch.sh --setup-input
-```
-
-![](asset/display/screenshot-20260703-011815.png)
-![](asset/display/20260703-005006.jpg)
-![](asset/display/20260703-005023.jpg)
-
-## 全景相机实现原理
-
-全景 RGB 默认从机头 360 相机位置采集，输出 `384x192` ERP 图（刻意对齐 YOPO 的训练分辨率，改动前先读 `YOPO/config/traj_opt.yaml` 的 `image_width/image_height` 约束）。实现方式是对 Cesium/Google Tiles 渲染结果进行 6 个方向采样，然后在 GPU 中按 ERP 射线模型重投影：
-
-```text
-yaw   = pi - (u + 0.5) / W * 2pi
-pitch = vfov / 2 - (v + 0.5) / H * vfov
-```
-
-这保证投影模型与 YOPO_360 的 ERP 相机一致；区别是数据来源为 Cesium 渲染视图，而不是仿真栅格的直接 raycast。放置阶段会后台创建全景采样 viewer；确认出生点后会在用户可控前预采样一张全景首帧。飞行中默认 `panoMs=33`、`panoFace=144`、`panoFrameDelayMs=0`，并最多等待 `panoFaceTileTimeoutMs=400` 让当前方向 tiles idle；首帧预加载使用 `panoPreloadFrameDelayMs=96`、`panoPreloadFaceTileTimeoutMs=6000` 和 `panoPreloadTimeoutMs=60000`。默认 `panoPreloadRequired=0`（配合默认开启的 `panoCaptureAnyway=1`，首帧不完整也允许进入飞行，实时采样继续重试）；设 `panoPreloadRequired=1` 可要求拿到完整 6 面首帧才可控。为了避免 Google Tiles 天空/极区采样在 ERP 顶部形成海市蜃楼状伪影，默认对顶部 10 度和底部 2 度做极区 guard；guard 区域保持 ERP 坐标，只向上下极点采样淡出，不会把整张图压缩到 guard 边界。可用 `panoTopPoleGuard` / `panoBottomPoleGuard` 调整或设为 0 关闭。
-
-进入可控飞行前，主 Cesium 视图会预加载出生点周围区域，并分别等待第一人称和第三人称初始视角 tiles idle。默认 `flightPreloadStrict=0`，主视图只要目标区域覆盖率达标就继续；全景首帧预加载独立检查隐藏 viewer 的 6 个方向 tiles idle。只有显式设置 `?panoPreloadRequired=0` 时，才会允许全景首帧失败后进入飞行并让实时采样继续重试。
-
-常用参数：
-
-```text
-# 更高输出分辨率（注意：偏离 384x192 会脱离 YOPO 训练分辨率，仅用于看图，不要用于闭环）
-http://127.0.0.1:8080/?panoWidth=1036&panoFace=768
-
-# 调整采样视图等待时间
-http://127.0.0.1:8080/?panoFrameDelayMs=16&panoPreloadFrameDelayMs=120
-
-# 调整首帧全景预加载超时；或允许首帧失败后继续进入飞行
-http://127.0.0.1:8080/?panoPreloadTimeoutMs=90000&panoPreloadFaceTileTimeoutMs=9000
-http://127.0.0.1:8080/?panoPreloadRequired=0
-
-# 调整起飞前主视图预加载范围和覆盖率门槛
-http://127.0.0.1:8080/?flightPreloadRadius=600&flightPreloadMinCoverage=0.98
-
-# 调整 RGB / 深度更新间隔
-http://127.0.0.1:8080/?panoMs=1000&depthMs=1200
-
-# 调整 ERP 极区 guard
+http://127.0.0.1:8080/?panoMs=40&depthMs=40&panoFace=96
+http://127.0.0.1:8080/?da360UploadScale=1
 http://127.0.0.1:8080/?panoTopPoleGuard=0&panoBottomPoleGuard=0
-
-# 调整仅用于 DA360 的上传尺寸或缩放，不影响 RGB 全景显示
-http://127.0.0.1:8080/?da360UploadScale=0.35
-http://127.0.0.1:8080/?da360UploadWidth=672
 ```
+
+## 米制标定状态
+
+**DA360 metric 尚未验收；默认 `da360-relative` 是 preview/采集模式，正式闭环当前 fail closed。** 当前已实现：
+
+- combined 与 standalone 的 `/depth/raw`
+- canonical ERP anchor 方向与 capture transform 旋转
+- 不同分辨率间的像素中心映射、水平 wrap 双线性采样
+- `1/z = a·pred_disp+b` 的单次 Huber 拟合、留出验证和 fail-closed 标定加载
+- `PerceptionFrame` 原子绑定 RGB 与采集/规划上下文
+- `window.__captureMetricCalibration(locationId, options)` 从同一冻结帧导出同一 `captureId` 的 RGB、anchors、manifest 和 raw NPZ
+
+当前 `../experiment_data/depth_calibration.json` 的 `a/b` 仍为 null，没有任何标定通过验收。原子导出已实现，但 4 地点×3 静止姿态的实际采集、leave-one-location-out 报告和 accepted calibration 仍待完成。
+
+标定采集应显式使用 `panoCaptureAnyway=0`，让六个 cubemap 面逐面等待 tiles ready；同时把所有会进入 projection fingerprint 的参数写在 URL 中。例如当前 smoke 配置：
+
+```bash
+./launch-firefox-gpu.sh \
+'http://127.0.0.1:8080/?panoPreloadRequired=0&panoWidth=384&panoHeight=192&panoFace=96&panoVfov=180&panoJpeg=0.74&da360UploadScale=0.35&panoCaptureAnyway=0&panoFaceTileTimeoutMs=6000&panoFaceTileQuietMs=650'
+```
+
+在无人机静止、没有活动目标且已有完整 `PerceptionFrame` 时，可从 Firefox 控制台一次导出四个同 ID 文件。逐面等瓦片可能让一次 capture 超过 1 秒，因此显式给出只用于静态标定的 freshness 窗口：
+
+```js
+await window.__captureMetricCalibration('site-a', {
+  captureId: 'site-a-01',
+  maxFrameAgeMs: 60000
+});
+// site-a-01-rgb.jpg / site-a-01-anchors.json /
+// site-a-01-manifest.json / site-a-01-raw.npz
+```
+
+`manifest.json` 记录 session/frame/capture/location ID、RGB/raw/anchors SHA、pose、capture transform、ERP/JPEG/上传尺寸配置和模型 metadata。默认会触发四次下载；传入 `{ download: false }` 可只返回内存中的 artifacts。同一帧和同一 capture ID 不能重复消费，fitter 还会拒绝重复 RGB、raw 和近重复姿态。
+
+拟合示例（从每个地点的三个不同静止姿态各采一次，共 4 地点×3 capture；
+下面命令会把 12 组四件套完整展开）：
+
+```bash
+fit_args=()
+for site in a b c d; do
+  for pose in 01 02 03; do
+    prefix="site-${site}-${pose}"
+    fit_args+=(
+      --raw "${prefix}-raw.npz"
+      --anchors "${prefix}-anchors.json"
+      --manifest "${prefix}-manifest.json"
+      --rgb "${prefix}-rgb.jpg"
+    )
+  done
+done
+python3 scripts/fit_da360_metric.py "${fit_args[@]}" \
+  --output experiment_data/metric_fit-v2
+```
+
+只有 `fit_report.json` 同时通过留出误差、有效 anchor、至少 4 地点和至少 12 次采集门禁，才会生成可用于在线模式的 `depth_calibration.json`。启动 metric 模式示例：
+
+```bash
+DA360_DEPTH_MODE=da360-metric \
+DA360_DEPTH_CALIB_PATH_HOST=/absolute/path/to/depth_calibration.json \
+./start-all.sh
+```
+
+标定缺失、未通过或模型/模型输入尺寸/请求 RGB 尺寸/runtime projection/JPEG/resample/checkpoint 指纹不匹配时，metric 模式会在进入 GPU 前拒绝启动或请求，不会静默伪装成米制深度。Anchor 还要求六个 cubemap 面在各自像素被复制时均已报告 tiles ready；仅在导出时看到 tiles idle 不算合格。
+
+## 测试与当前门禁
+
+```bash
+# 无浏览器/GPU的 JS 测试
+for test_file in tests/*.js; do node "$test_file" || break; done
+
+# 无 GPU 的静态服务与拟合单元测试
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest -q \
+  tests/test_fit_da360_metric.py \
+  tests/test_serve_security.py \
+  tests/test_evaluation_gates.py
+
+# 宿主没装 Flask 时，在已有 combined 镜像中跑 API contract
+docker run --rm --entrypoint /bin/bash -v "$PWD:/workspace:ro" \
+  mindcloud-da360-yopo:latest \
+  -lc 'cd /workspace && python3 tests/test_backend_contract.py'
+
+# 需要实际运行服务的 19 项集成测试必须显式选择
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
+  python3 -m pytest -o addopts='' -m integration tests/ -v
+```
+
+也可以在装齐测试依赖的宿主环境中运行 backend contract。宿主缺少 Flask 时，`tests/test_backend_contract.py` 会在 module level 标记 skip，而不是 collection 失败；要获得 contract 通过证据，必须在 combined 镜像中运行或先安装 Flask，并将 skip 与 pass 分开报告。
+
+2026-08-10 当前收口证据：15 个 JS 测试文件通过；默认 Python 为 50 passed、1 skipped、19 deselected；镜像内 backend contract 18/18；真实 CUDA 服务的 19 项 integration 全部通过。Firefox 已加载完整仿真 URL，但尚未人工完成出生点后的 depth canvas 与导航状态验收。
+
+真实 flight log 和同场景质量数据生成后，使用已实现的门禁工具出报告：
+
+```bash
+python3 scripts/evaluate_closed_loop.py flight-log.json --output closed-loop-report.json
+python3 scripts/evaluate_perception_quality.py \
+  --baseline baseline.npz \
+  --candidate 6x96-sse512=candidate-96.npz \
+  --candidate 6x80-sse768=candidate-80.npz \
+  --candidate 6x64-sse1024=candidate-64.npz \
+  --output perception-quality-report.json
+```
+
+六面 capture 已改为每两面向浏览器调度器让出一次，并记录 render/project/scheduler/network/DA360/YOPO/capture-to-apply 等分段指标；这只证明调度机制存在，不证明吞吐已达标。2026-08-09 修复前日志只有约 3.1Hz depth、2.9Hz YOPO；当前实现尚未在真实 Firefox+GPU+城市 tiles 上证明 15Hz，也尚未完成 DA360 metric 或低空闭环门禁。详见 `docs/implementation-status-v2.md`。
+
+## Git 与依赖
+
+- `origin`：`cn-ryw/MindCloud_World_Fly`，只用于本项目分支
+- `upstream`：`superboySB/MindCloud_World_Fly`，只拉取参考，不向其 push
+- 当前实现分支：`feat/da360-metric-depth-v2`
+- 原型归档：`archive/da360-prototype-c0b82d5-20260809` 和 tag `archive-c0b82d5-20260809`
+- 依赖版本与模型哈希：`dependencies.lock.json`
+
+启动前也可单独核对本地 bundle、配置和 checkpoint：
+
+```bash
+python3 scripts/verify_dependencies.py
+```
+
+不要提交 PID、checkpoint、raw NPZ/NPY 或实验数据大文件。

@@ -119,6 +119,14 @@ function safeArtifactId(value, fallback) {
     return normalized.slice(0, 80) || fallback;
 }
 
+function createCalibrationSessionId() {
+    if (typeof globalThis.crypto?.randomUUID === 'function') {
+        return safeArtifactId(globalThis.crypto.randomUUID(), 'calibration-session');
+    }
+    const random = Math.random().toString(36).slice(2, 12);
+    return safeArtifactId(`session-${Date.now().toString(36)}-${random}`, 'calibration-session');
+}
+
 function downloadBlob(blob, filename) {
     const url = URL.createObjectURL(blob);
     const anchor = document.createElement('a');
@@ -224,6 +232,7 @@ export class PanoramaSensor {
         this.active = false;
         this.capturing = false;
         this._captureAbortController = null;
+        this._captureIdlePromise = null;
         this._captureSequence = 0;
         this.depthPending = false;
         this.lastCaptureStartTime = 0;
@@ -262,6 +271,12 @@ export class PanoramaSensor {
         this._nextPlanningState = null;
         this._rgbFrameContext = null;
         this._perceptionFrame = null;
+        this._calibrationSessionId = createCalibrationSessionId();
+        this._calibrationCapturePending = false;
+        this._calibrationAbortController = null;
+        this._calibrationGeneration = 0;
+        this._consumedCalibrationFrames = new Set();
+        this._consumedCalibrationCaptureIds = new Set();
         this.onYopoResult = null;    // main.js: YOPO endstate → drone trajectory
         this.onDepthResult = null;   // main.js: depth latency → flight logger perf
         this.onYopoLatency = null;   // main.js: YOPO latency → flight logger perf
@@ -279,7 +294,10 @@ export class PanoramaSensor {
 
     setActive(active) {
         this.active = !!active;
-        if (!this.active) this._abortActiveCapture('sensor-inactive');
+        if (!this.active) {
+            this._abortActiveCapture('sensor-inactive');
+            this._abortCalibrationCapture('sensor-inactive');
+        }
         this._applyVisibility();
     }
 
@@ -288,10 +306,17 @@ export class PanoramaSensor {
         if (controller && !controller.signal.aborted) controller.abort(reason);
     }
 
+    _abortCalibrationCapture(reason) {
+        const controller = this._calibrationAbortController;
+        if (controller && !controller.signal.aborted) controller.abort(reason);
+    }
+
     reset() {
         const retainedDepth = this.hasDepth;
         this._abortActiveCapture('sensor-reset');
         this._abortActiveDepthRequest('sensor-reset');
+        this._calibrationGeneration++;
+        this._abortCalibrationCapture('sensor-reset');
         this.capturing = false;
         this.lastCaptureStartTime = 0;
         this.lastCaptureTime = 0;
@@ -307,6 +332,9 @@ export class PanoramaSensor {
         this._nextPlanningState = null;
         this._rgbFrameContext = null;
         this._perceptionFrame = null;
+        this._calibrationSessionId = createCalibrationSessionId();
+        this._consumedCalibrationFrames.clear();
+        this._consumedCalibrationCaptureIds.clear();
         this._yopoPending = false;
         this._rgbFrameId = 0;
         this._lastRequestedFrameId = -1;
@@ -336,6 +364,8 @@ export class PanoramaSensor {
             faceFovDeg: PANORAMA_FACE_FOV,
             topPoleGuardDeg: PANORAMA_TOP_POLE_GUARD,
             bottomPoleGuardDeg: PANORAMA_BOTTOM_POLE_GUARD,
+            jpegQuality: PANORAMA_JPEG_QUALITY,
+            uploadScale: DA360_UPLOAD_SCALE,
             frameDelayMs: preload ? PANORAMA_PRELOAD_FRAME_DELAY_MS : PANORAMA_FRAME_DELAY_MS,
             tileTimeoutMs: preload ? PANORAMA_PRELOAD_FACE_TILE_TIMEOUT_MS : PANORAMA_FACE_TILE_TIMEOUT_MS,
             tileQuietMs: preload ? PANORAMA_PRELOAD_FACE_TILE_QUIET_MS : PANORAMA_FACE_TILE_QUIET_MS,
@@ -366,7 +396,12 @@ export class PanoramaSensor {
         const ctx = snapshot.getContext('2d', { alpha: false });
         ctx.drawImage(upload, 0, 0, snapshot.width, snapshot.height);
         const blob = await this._canvasToJpegBlob(snapshot);
-        return { blob, jpegMs: performance.now() - startedAt };
+        return {
+            blob,
+            width: snapshot.width,
+            height: snapshot.height,
+            jpegMs: performance.now() - startedAt,
+        };
     }
 
     _makeRgbFrameContext(frameId, capturedAt, transform, planningState, canvas, captureTimings = null) {
@@ -403,7 +438,13 @@ export class PanoramaSensor {
             actualState: planningState.actualState,
             referenceState: planningState.referenceState,
             yaw: planningState.yaw,
-            projectionConfig: context.projectionConfig,
+            projectionConfig: {
+                ...context.projectionConfig,
+                rgbWidth: encoded.width,
+                rgbHeight: encoded.height,
+                jpegQuality: PANORAMA_JPEG_QUALITY,
+                uploadScale: encoded.width / context.projectionConfig.width,
+            },
         });
         return { frame, jpegMs: encoded.jpegMs };
     }
@@ -454,6 +495,10 @@ export class PanoramaSensor {
             }
             return;
         }
+        // A calibration bundle must see the exact viewer/tileset state that
+        // produced its frozen RGB. Do not begin the next six-face capture until
+        // anchors and raw output have both been bound to that frame.
+        if (this._calibrationCapturePending) return;
         if (now - this.lastCaptureStartTime < CAPTURE_INTERVAL_MS) return;
         this._capture(world, transform);
     }
@@ -585,6 +630,7 @@ export class PanoramaSensor {
 
         let label = normalized;
         if (outcome === 'stale') label = `${normalized} · stale`;
+        else if (outcome === 'blocked') label = `${normalized} · blocked`;
         else if (normalized === 'error' && reason) label = `error · ${shortError(reason)}`;
         else if (Number.isFinite(latencyMs)) label = `${normalized} ${Math.round(latencyMs)}ms`;
 
@@ -711,6 +757,9 @@ export class PanoramaSensor {
 
     async _capture(world, transform) {
         this.capturing = true;
+        let resolveCaptureIdle;
+        const captureIdlePromise = new Promise(resolve => { resolveCaptureIdle = resolve; });
+        this._captureIdlePromise = captureIdlePromise;
         const captureId = ++this._captureSequence;
         const captureController = new AbortController();
         this._captureAbortController = captureController;
@@ -792,6 +841,10 @@ export class PanoramaSensor {
                 this._captureAbortController = null;
                 this.capturing = false;
             }
+            if (this._captureIdlePromise === captureIdlePromise) {
+                this._captureIdlePromise = null;
+            }
+            resolveCaptureIdle();
         }
     }
 
@@ -916,6 +969,7 @@ export class PanoramaSensor {
             }, DA360_TIMEOUT_MS);
 
             let url, body, headers;
+            const projectionHeader = JSON.stringify(frame.projectionConfig);
             if (request.mode === 'planning') {
                 // 一次调用：DA360 → YOPO → 返回 endstate + depth_image
                 const observation = frame.planningObservation(request.goal);
@@ -935,11 +989,17 @@ export class PanoramaSensor {
                     generation: String(request.generation),
                 }).toString();
                 url = `${getYopoEndpoint()}?${qs}`;  // /yopo/plan_full
-                headers = { 'Content-Type': 'image/jpeg' };
+                headers = {
+                    'Content-Type': 'image/jpeg',
+                    'X-Projection-Config': projectionHeader,
+                };
                 body = blob;
             } else {
                 url = this.endpoint;  // /depth
-                headers = { 'Content-Type': blob.type || 'image/jpeg' };
+                headers = {
+                    'Content-Type': blob.type || 'image/jpeg',
+                    'X-Projection-Config': projectionHeader,
+                };
                 body = blob;
             }
 
@@ -964,10 +1024,23 @@ export class PanoramaSensor {
             this._depthLatency = Number.isFinite(Number(payload.latency_ms))
                 ? `${Math.round(Number(payload.latency_ms))}ms`
                 : '';
-            this._setDepthState(request.mode, 'depth-ready', { latencyMs: Number(payload.latency_ms) });
+            const planningAuthorized = request.mode !== 'planning'
+                || payload.planning_authorized === true;
+            const planningReason = request.mode === 'planning' && !planningAuthorized
+                ? String(payload.planning_reason || 'planning-not-authorized')
+                : null;
+            const outcome = planningAuthorized ? 'applied' : 'blocked';
+            this._setDepthState(
+                request.mode,
+                planningReason ? `blocked:${planningReason}` : 'depth-ready',
+                { outcome, latencyMs: Number(payload.latency_ms) },
+            );
 
             if (request.mode === 'planning') {
-                if (payload.endstate && this.onYopoResult) {
+                if (planningAuthorized && !payload.endstate) {
+                    throw new Error('authorized planning response missing endstate');
+                }
+                if (planningAuthorized && payload.endstate && this.onYopoResult) {
                     const context = Object.freeze({
                         mode: request.mode,
                         goalId: request.goalId,
@@ -976,6 +1049,8 @@ export class PanoramaSensor {
                         requestId: request.requestId,
                         depthMode: payload.depth_mode || null,
                         calibrationId: payload.calibration_id || null,
+                        planningAuthorized: true,
+                        planningReason: payload.planning_reason || null,
                         timings: payload.timings_ms || null,
                     });
                     this.onYopoResult(payload.endstate, payload.traj_time, context);
@@ -992,7 +1067,8 @@ export class PanoramaSensor {
                 const avgCycle = this._depthCycleSum / Math.max(1, this._depthFpsCount);
                 console.log(
                     `[depth] ${fps.toFixed(1)}Hz mode=${request.mode} goalId=${request.goalId || '-'} ` +
-                    `frameId=${request.frameId} generation=${request.generation} reason=ok ` +
+                    `frameId=${request.frameId} generation=${request.generation} ` +
+                    `reason=${planningReason ? `blocked:${planningReason}` : 'ok'} ` +
                     `capture=${Math.round(frameContext.captureTimings?.total || 0)}ms ` +
                     `render=${Math.round(frameContext.captureTimings?.render || 0)}ms ` +
                     `project=${Math.round(frameContext.captureTimings?.project || 0)}ms ` +
@@ -1012,7 +1088,9 @@ export class PanoramaSensor {
                 goalId: request.goalId,
                 generation: request.generation,
                 mode: request.mode,
-                outcome: 'applied',
+                outcome,
+                planningAuthorized: request.mode === 'planning' ? planningAuthorized : null,
+                dropReason: planningReason,
                 calibrationId: payload.calibration_id || null,
                 captureMs: Number(frameContext.captureTimings?.total || 0),
                 renderMs: Number(frameContext.captureTimings?.render || 0),
@@ -1133,97 +1211,205 @@ export class PanoramaSensor {
      * navigating: calibration captures are defined as static poses.
      */
     async captureCalibrationSample(world, options = {}) {
-        const frame = this._perceptionFrame;
-        if (!frame || frame.frameId !== this._rgbFrameId) {
-            throw new Error('wait for a current complete perception frame before calibration capture');
+        if (this._calibrationCapturePending) {
+            throw new Error('a calibration capture is already in progress');
         }
-        if (this._yopoGoal) throw new Error('cancel the active navigation goal before calibration capture');
-        const velocity = frame.actualState.velocity;
-        const speed = Math.hypot(velocity.x, velocity.y, velocity.z);
-        const maxStaticSpeed = Number.isFinite(options.maxStaticSpeedMps)
-            ? Math.max(0, Number(options.maxStaticSpeedMps))
-            : 0.2;
-        if (speed > maxStaticSpeed) {
-            throw new Error(`vehicle must be static for calibration (${speed.toFixed(2)}m/s > ${maxStaticSpeed}m/s)`);
-        }
-        if (!world || typeof world.sampleMetricDepthAnchors !== 'function') {
-            throw new Error('metric anchor sampler unavailable');
-        }
+        // Acquire the lock before the first await so update() cannot schedule a
+        // new capture between selecting a frame and ray-casting its anchors.
+        this._calibrationCapturePending = true;
+        const calibrationGeneration = this._calibrationGeneration;
+        const calibrationController = new AbortController();
+        this._calibrationAbortController = calibrationController;
+        const assertCalibrationCurrent = () => {
+            if (
+                calibrationController.signal.aborted
+                || calibrationGeneration !== this._calibrationGeneration
+            ) {
+                const error = new Error(String(
+                    calibrationController.signal.reason || 'calibration session changed'
+                ));
+                error.name = 'AbortError';
+                throw error;
+            }
+        };
+        try {
+            const activeCapture = this._captureIdlePromise;
+            if (activeCapture) await activeCapture;
+            assertCalibrationCurrent();
+            if (this.capturing) {
+                throw new Error('panorama capture did not reach an idle state');
+            }
+            const latestContext = this._rgbFrameContext;
+            const currentFrameMatches = latestContext && this._perceptionFrame
+                && String(this._perceptionFrame.frameId) === String(latestContext.frameId);
+            const materialized = latestContext && !currentFrameMatches
+                ? await this._materializePerceptionFrame(latestContext)
+                : null;
+            assertCalibrationCurrent();
+            const frame = currentFrameMatches ? this._perceptionFrame
+                : materialized?.frame || this._perceptionFrame;
+            if (!frame) {
+                throw new Error('wait for a complete perception frame before calibration capture');
+            }
+            this._perceptionFrame = frame;
+            const maxFrameAgeMs = Number(options.maxFrameAgeMs ?? 1000);
+            const frameAgeMs = performance.now() - frame.capturedAt;
+            if (!Number.isFinite(maxFrameAgeMs) || maxFrameAgeMs <= 0) {
+                throw new TypeError('maxFrameAgeMs must be positive and finite');
+            }
+            if (!Number.isFinite(frameAgeMs) || frameAgeMs < 0 || frameAgeMs > maxFrameAgeMs) {
+                throw new Error(
+                    `calibration frame is stale (${Math.max(0, Math.round(frameAgeMs))}ms > ${maxFrameAgeMs}ms)`,
+                );
+            }
+            if (this._yopoGoal) throw new Error('cancel the active navigation goal before calibration capture');
+            const velocity = frame.actualState.velocity;
+            const speed = Math.hypot(velocity.x, velocity.y, velocity.z);
+            const maxStaticSpeed = Number.isFinite(options.maxStaticSpeedMps)
+                ? Math.max(0, Number(options.maxStaticSpeedMps))
+                : 0.2;
+            if (speed > maxStaticSpeed) {
+                throw new Error(`vehicle must be static for calibration (${speed.toFixed(2)}m/s > ${maxStaticSpeed}m/s)`);
+            }
+            if (!world || typeof world.sampleMetricDepthAnchors !== 'function') {
+                throw new Error('metric anchor sampler unavailable');
+            }
 
-        const locationId = safeArtifactId(options.locationId, '');
-        if (!locationId) throw new Error('locationId is required for leave-one-location-out validation');
-        const captureId = safeArtifactId(
-            options.captureId,
-            `capture-${new Date().toISOString().replace(/[:.]/g, '-')}`,
-        );
-        const frameId = String(frame.frameId);
-        const anchors = world.sampleMetricDepthAnchors(frame.transform, {
-            ...options.anchorOptions,
-            imageWidth: frame.projectionConfig.width,
-            imageHeight: frame.projectionConfig.height,
-            verticalFovDeg: frame.projectionConfig.verticalFovDeg,
-            locationId,
-            captureId,
-            frameId,
-        });
+            const locationId = safeArtifactId(options.locationId, '');
+            if (!locationId) throw new Error('locationId is required for leave-one-location-out validation');
+            const sessionId = this._calibrationSessionId;
+            const frameId = String(frame.frameId);
+            const frameIdentity = `${sessionId}:${frameId}`;
+            if (this._consumedCalibrationFrames.has(frameIdentity)) {
+                throw new Error(`perception frame ${frameId} was already exported for calibration`);
+            }
+            const captureId = safeArtifactId(
+                options.captureId,
+                `${sessionId}-frame-${frameId}`,
+            );
+            if (this._consumedCalibrationCaptureIds.has(captureId)) {
+                throw new Error(`captureId ${captureId} was already exported in this calibration session`);
+            }
+            const anchors = world.sampleMetricDepthAnchors(frame.transform, {
+                ...options.anchorOptions,
+                imageWidth: frame.projectionConfig.rgbWidth,
+                imageHeight: frame.projectionConfig.rgbHeight,
+                verticalFovDeg: frame.projectionConfig.verticalFovDeg,
+                sessionId,
+                locationId,
+                captureId,
+                frameId,
+            });
+            assertCalibrationCurrent();
 
-        const rawResponse = await fetch(getDA360RawEndpoint(), {
-            method: 'POST',
-            headers: {
-                'Content-Type': frame.rgb.type || 'image/jpeg',
-                'X-Frame-ID': frameId,
-            },
-            body: frame.rgb,
-        });
-        if (!rawResponse.ok) throw new Error(`DA360 raw capture failed: HTTP ${rawResponse.status}`);
-        const echoedFrameId = rawResponse.headers.get('X-Frame-ID');
-        if (echoedFrameId && echoedFrameId !== frameId) {
-            throw new Error(`DA360 raw frame mismatch: ${echoedFrameId} != ${frameId}`);
+            const rawUrl = new URL(getDA360RawEndpoint());
+            rawUrl.searchParams.set('frame_id', frameId);
+            rawUrl.searchParams.set('session_id', sessionId);
+            rawUrl.searchParams.set('capture_id', captureId);
+            rawUrl.searchParams.set('location_id', locationId);
+            const rawResponse = await fetch(rawUrl.toString(), {
+                method: 'POST',
+                headers: {
+                    'Content-Type': frame.rgb.type || 'image/jpeg',
+                    'X-Frame-ID': frameId,
+                    'X-Projection-Config': JSON.stringify(frame.projectionConfig),
+                },
+                body: frame.rgb,
+                signal: calibrationController.signal,
+            });
+            assertCalibrationCurrent();
+            if (!rawResponse.ok) throw new Error(`DA360 raw capture failed: HTTP ${rawResponse.status}`);
+            const echoedFrameId = rawResponse.headers.get('X-Frame-ID');
+            if (echoedFrameId !== frameId) {
+                throw new Error(`DA360 raw frame mismatch: ${echoedFrameId || 'missing'} != ${frameId}`);
+            }
+            for (const [header, expected] of [
+                ['X-Session-ID', sessionId],
+                ['X-Capture-ID', captureId],
+                ['X-Location-ID', locationId],
+            ]) {
+                const actual = rawResponse.headers.get(header);
+                if (actual !== expected) {
+                    throw new Error(`DA360 raw ${header} mismatch: ${actual || 'missing'} != ${expected}`);
+                }
+            }
+            const rawBytes = await rawResponse.arrayBuffer();
+            assertCalibrationCurrent();
+            const rawBlob = new Blob([rawBytes], { type: 'application/x-npz' });
+
+            const anchorsBlob = new Blob([JSON.stringify(anchors, null, 2)], { type: 'application/json' });
+            const [rgbSha256, rawSha256, anchorsSha256] = await Promise.all([
+                sha256Blob(frame.rgb),
+                sha256Blob(rawBlob),
+                sha256Blob(anchorsBlob),
+            ]);
+            assertCalibrationCurrent();
+            if (!rgbSha256 || !rawSha256 || !anchorsSha256) {
+                throw new Error('SHA-256 is required for calibration bundle export');
+            }
+
+            const filenames = Object.freeze({
+                rgb: `${captureId}-rgb.jpg`,
+                anchors: `${captureId}-anchors.json`,
+                manifest: `${captureId}-manifest.json`,
+                raw: `${captureId}-raw.npz`,
+            });
+            const manifest = Object.freeze({
+                schemaVersion: 2,
+                sessionId,
+                captureId,
+                locationId,
+                frameId,
+                capturedAt: frame.capturedAt,
+                exportedAt: new Date().toISOString(),
+                rgbWidth: frame.projectionConfig.rgbWidth,
+                rgbHeight: frame.projectionConfig.rgbHeight,
+                rgbSha256,
+                rawSha256,
+                anchorsSha256,
+                files: Object.freeze({
+                    rgb: Object.freeze({ name: filenames.rgb, sha256: rgbSha256 }),
+                    anchors: Object.freeze({ name: filenames.anchors, sha256: anchorsSha256 }),
+                    raw: Object.freeze({ name: filenames.raw, sha256: rawSha256 }),
+                }),
+                rawModel: rawResponse.headers.get('X-DA360-Model'),
+                rawWidth: Number(rawResponse.headers.get('X-DA360-Width')) || null,
+                rawHeight: Number(rawResponse.headers.get('X-DA360-Height')) || null,
+                rawLatencyMs: Number(rawResponse.headers.get('X-DA360-Latency-Ms')) || null,
+                transform: frame.transform,
+                actualState: frame.actualState,
+                referenceState: frame.referenceState,
+                yaw: frame.yaw,
+                projectionConfig: frame.projectionConfig,
+                validAnchors: anchors.metadata?.validAnchors ?? anchors.anchors?.length ?? 0,
+                failedAnchors: anchors.metadata?.failureCount ?? anchors.failures?.length ?? 0,
+            });
+            const manifestBlob = new Blob([JSON.stringify(manifest, null, 2)], { type: 'application/json' });
+            const artifacts = Object.freeze({
+                sessionId,
+                captureId,
+                locationId,
+                frame,
+                anchors,
+                manifest,
+                files: Object.freeze({
+                    [filenames.rgb]: frame.rgb,
+                    [filenames.anchors]: anchorsBlob,
+                    [filenames.manifest]: manifestBlob,
+                    [filenames.raw]: rawBlob,
+                }),
+            });
+            this._consumedCalibrationFrames.add(frameIdentity);
+            this._consumedCalibrationCaptureIds.add(captureId);
+            if (options.download !== false) {
+                for (const [filename, blob] of Object.entries(artifacts.files)) downloadBlob(blob, filename);
+            }
+            return artifacts;
+        } finally {
+            if (this._calibrationAbortController === calibrationController) {
+                this._calibrationAbortController = null;
+            }
+            this._calibrationCapturePending = false;
         }
-        const rawBlob = new Blob([await rawResponse.arrayBuffer()], { type: 'application/x-npz' });
-        const [rgbSha256, rawSha256] = await Promise.all([
-            sha256Blob(frame.rgb),
-            sha256Blob(rawBlob),
-        ]);
-        const manifest = Object.freeze({
-            schemaVersion: 1,
-            captureId,
-            locationId,
-            frameId,
-            capturedAt: frame.capturedAt,
-            exportedAt: new Date().toISOString(),
-            rgbSha256,
-            rawSha256,
-            rawModel: rawResponse.headers.get('X-DA360-Model'),
-            rawWidth: Number(rawResponse.headers.get('X-DA360-Width')) || null,
-            rawHeight: Number(rawResponse.headers.get('X-DA360-Height')) || null,
-            rawLatencyMs: Number(rawResponse.headers.get('X-DA360-Latency-Ms')) || null,
-            transform: frame.transform,
-            actualState: frame.actualState,
-            referenceState: frame.referenceState,
-            yaw: frame.yaw,
-            projectionConfig: frame.projectionConfig,
-            validAnchors: anchors.metadata?.validAnchors ?? anchors.anchors?.length ?? 0,
-            failedAnchors: anchors.metadata?.failureCount ?? anchors.failures?.length ?? 0,
-        });
-        const anchorsBlob = new Blob([JSON.stringify(anchors, null, 2)], { type: 'application/json' });
-        const manifestBlob = new Blob([JSON.stringify(manifest, null, 2)], { type: 'application/json' });
-        const artifacts = Object.freeze({
-            captureId,
-            locationId,
-            frame,
-            anchors,
-            manifest,
-            files: Object.freeze({
-                [`${captureId}-rgb.jpg`]: frame.rgb,
-                [`${captureId}-anchors.json`]: anchorsBlob,
-                [`${captureId}-manifest.json`]: manifestBlob,
-                [`${captureId}-raw.npz`]: rawBlob,
-            }),
-        });
-        if (options.download !== false) {
-            for (const [filename, blob] of Object.entries(artifacts.files)) downloadBlob(blob, filename);
-        }
-        return artifacts;
     }
 }

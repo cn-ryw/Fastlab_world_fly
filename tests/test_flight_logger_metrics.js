@@ -15,12 +15,19 @@ const logger = new FlightLogger();
 logger.start({ x: 10, y: 20, z: 30 }, 20);
 logger.recordPerception({
     frameId: 1, mode: 'planning', outcome: 'applied', captureMs: 20,
+    planningAuthorized: true,
     renderMs: 10, projectMs: 2, jpegMs: 3, networkMs: 30,
     serverMs: 25, da360Ms: 18, yopoMs: 4, applyMs: 1, captureToApplyMs: 60,
     frameAgeMs: 60, calibrationId: 'cal-1',
 });
-logger.recordPerception({ frameId: 1, mode: 'planning', outcome: 'applied', frameAgeMs: 62 });
+logger.recordPerception({
+    frameId: 1, mode: 'planning', outcome: 'applied', planningAuthorized: true, frameAgeMs: 62,
+});
 logger.recordPerception({ frameId: 2, mode: 'planning', outcome: 'stale', dropReason: 'old-frame' });
+logger.recordPerception({
+    frameId: 3, mode: 'planning', outcome: 'applied', planningAuthorized: false,
+    dropReason: 'da360-relative-is-preview-only',
+});
 const drone = {
     x: 0, y: 20, z: 0, vx: 0, vy: 0, vz: 0,
     yaw: 0, pitch: 0, roll: 0, pitchRate: 0, rollRate: 0, yawRate: 0,
@@ -34,10 +41,11 @@ logger.stop(false);
 const log = JSON.parse(await downloadedBlob.text());
 assert.equal(log.perf.uniquePlanningFrames, 1, 'duplicate applies for one frame count once');
 assert.equal(log.perf.droppedByReason['old-frame'], 1);
+assert.equal(log.perf.droppedByReason['da360-relative-is-preview-only'], 1);
 assert.equal(log.perf.captureToApplyP95Ms, 60);
 assert.deepEqual(log.perf.calibrationIds, ['cal-1']);
 assert.ok(log.perf.physicsUpdateIntervalP95Ms >= 0);
-assert.equal(log.perception.length, 3);
+assert.equal(log.perception.length, 4);
 
 URL.createObjectURL = originalCreateObjectURL;
 URL.revokeObjectURL = originalRevokeObjectURL;
