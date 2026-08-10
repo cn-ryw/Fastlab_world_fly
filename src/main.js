@@ -221,6 +221,14 @@ function initSubsystems() {
     osd = new OSD('osd-canvas');
     panoramaSensor = new PanoramaSensor();
     window.__getPerceptionFrame = () => panoramaSensor?.getLatestPerceptionFrame?.() || null;
+    window.__setPanoramaCaptureProfile = (profile) => {
+        if (!panoramaSensor) throw new Error('panorama sensor is not ready');
+        return panoramaSensor.setCaptureProfile(profile, 'console');
+    };
+    window.__getPanoramaCaptureProfile = () => {
+        if (!panoramaSensor) throw new Error('panorama sensor is not ready');
+        return panoramaSensor.getCaptureProfile();
+    };
     window.__captureMetricCalibration = (locationId, options = {}) => {
         if (!panoramaSensor || !world) throw new Error('flight world is not ready');
         return panoramaSensor.captureCalibrationSample(world, { ...options, locationId });
@@ -329,6 +337,7 @@ async function preloadPanoramaBeforeFlight() {
             capturedAt: started,
             transform,
             planningState: drone.getYopoPlanningState ? drone.getYopoPlanningState() : null,
+            captureProfile: options.profile,
         });
         if (!ready && (PANORAMA_PRELOAD_REQUIRED || FLIGHT_PRELOAD_STRICT)) {
             throw new Error('360 panorama preload did not produce a complete frame.');
@@ -472,11 +481,7 @@ function setupFlightGoalClickHandler() {
         const altY = goalAltitudeOverride != null ? goalAltitudeOverride : drone.y;
         console.log('[goal] SET:', local.x.toFixed(1), altY.toFixed(1), local.z.toFixed(1),
             goalAltitudeOverride != null ? '(高度已手动指定)' : '(沿用当前高度)');
-        drone.setIdealGoal({ x: local.x, y: altY, z: local.z });
-        world.showGoalMarker({ x: local.x, y: altY, z: local.z });
-        // 目标高度即 YOPO 的高度平面，服务端会把轨迹末端拉到该平面
-        panoramaSensor?.setYopoGoal({ x: local.x, y: altY, z: local.z });
-        flightLogger?.start({ x: local.x, y: altY, z: local.z }, spawnAltitudeMeters);
+        beginNavigationSession({ x: local.x, y: altY, z: local.z });
     };
 
     // Track G key state
@@ -508,10 +513,7 @@ function setupFlightGoalClickHandler() {
             const goalZ = drone.z + rz;
             const altY = goalAltitudeOverride != null ? goalAltitudeOverride : drone.y;
             console.log('[radar goal] SET:', goalX.toFixed(1), altY.toFixed(1), goalZ.toFixed(1));
-            drone.setIdealGoal({ x: goalX, y: altY, z: goalZ });
-            world.showGoalMarker({ x: goalX, y: altY, z: goalZ });
-            panoramaSensor?.setYopoGoal({ x: goalX, y: altY, z: goalZ });
-            flightLogger?.start({ x: goalX, y: altY, z: goalZ }, spawnAltitudeMeters);
+            beginNavigationSession({ x: goalX, y: altY, z: goalZ });
         });
     }
 
@@ -532,9 +534,32 @@ function setupFlightGoalClickHandler() {
 
     // Store for cleanup
     flightGoalHandler = { destroy: () => {
-        canvas.removeEventListener('mousedown', onMouseDown, true);
+        canvas.removeEventListener('pointerdown', onMouseDown, true);
         canvas.removeEventListener('wheel', onWheel, { capture: true });
     }};
+}
+
+function beginNavigationSession(goal) {
+    if (!goal || !drone || !panoramaSensor) return null;
+    if (flightLogger?.recording || panoramaSensor.getDepthState().goalId) {
+        finishNavigationSession('goal-changed', {
+            // Retargeting closes the old request/log generation, but must not
+            // teleport a moving vehicle to zero velocity. setIdealGoal() below
+            // clears the old polynomial synchronously while preserving state.
+            cancelDrone: false,
+            arrived: false,
+        });
+    }
+    drone.setIdealGoal(goal);
+    world?.showGoalMarker(goal);
+    // 目标高度即 YOPO 的高度平面，服务端会把轨迹末端拉到该平面。
+    const goalId = panoramaSensor.setYopoGoal(goal);
+    const navigation = panoramaSensor.getDepthState();
+    flightLogger?.start(goal, spawnAltitudeMeters, {
+        goalId,
+        generation: navigation.generation,
+    });
+    return goalId;
 }
 
 async function enterPlacementMode(autoPick = false) {
@@ -736,11 +761,13 @@ function startFlight(viewMode = 'first') {
                     `[YOPO] stale apply rejected goalId=${context.goalId} frameId=${context.frameId} ` +
                     `generation=${context.generation}`
                 );
-                return;
+                return false;
             }
             if (!drone?.setYopoTrajectory(endstate, trajTime)) {
                 console.warn(`[YOPO] invalid response rejected frameId=${context?.frameId ?? '-'}`);
+                return false;
             }
+            return true;
         };
         panoramaSensor.onDepthResult = (latencyMs) => { flightLogger?.recordDepth(latencyMs); };
         panoramaSensor.onYopoLatency = (latencyMs) => { flightLogger?.recordYopo(latencyMs); };

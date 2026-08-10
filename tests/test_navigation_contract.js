@@ -31,12 +31,17 @@ assert(
     /async function enterPlacementMode[\s\S]*?finishNavigationSession\('mode-exit', \{ cancelDrone: true/.test(mainSource),
     'leaving flight for placement terminates and cancels the navigation session',
 );
+assert(
+    /finishNavigationSession\('goal-changed',[\s\S]{0,300}?cancelDrone: false/.test(mainSource),
+    'replacing a goal closes the old session without zeroing physical velocity',
+);
 
 // Replacing a goal must clear the prior generation's trajectory immediately;
-// the vehicle hovers until the new frame-safe response arrives.
+// physical velocity remains continuous while the new frame-safe response arrives.
 {
     const drone = new Drone();
     drone.x = 0; drone.y = 10; drone.z = 0;
+    drone.vx = 7; drone.vy = -1; drone.vz = 3;
     drone.setIdealGoal({ x: 20, y: 10, z: 0 });
     assert(drone.setYopoTrajectory(
         [5, 0, 0, 10, 0, 0, 0, 0, 0],
@@ -49,6 +54,8 @@ assert(
     assert(drone._yopoPolyZ === null, 'new goal clears old Z trajectory');
     assert(drone._yopoDecayRef === null, 'new goal clears old decay reference');
     assert(drone._yopoPlanTriggered === false, 'arrival waits for the new generation trajectory');
+    assert(drone.vx === 7 && drone.vy === -1 && drone.vz === 3,
+        'retargeting preserves the actual velocity state');
 }
 
 for (const [distance, shouldArrive] of [[3.9, true], [4.1, false], [8.9, false]]) {

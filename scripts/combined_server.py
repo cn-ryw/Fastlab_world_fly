@@ -10,6 +10,8 @@ explicitly authorized for planning (currently an accepted metric calibration).
 """
 
 import argparse
+import hashlib
+import json
 import math
 import os
 import sys
@@ -97,7 +99,31 @@ def _planning_authorization():
         return False, "metric-calibration-not-loaded"
     if yopo_runner is None:
         return False, "yopo-not-initialized"
+    if _service_fingerprint() is None:
+        return False, "service-fingerprint-unavailable"
     return True, "validated-da360-metric"
+
+
+def _service_fingerprint():
+    """Hash the model/config identity that produced a planning response."""
+    if da360_runner is None or yopo_runner is None:
+        return None
+    identity = {
+        "api_version": API_VERSION,
+        "da360_checkpoint_sha256": getattr(
+            da360_runner, "checkpoint_sha256", None
+        ),
+        "yopo_checkpoint_sha256": getattr(yopo_runner, "checkpoint_sha256", None),
+        "yopo_effective_config_sha256": getattr(
+            yopo_runner, "effective_config_sha256", None
+        ),
+    }
+    if not all(identity.values()):
+        return None
+    canonical = json.dumps(
+        identity, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("ascii")
+    return hashlib.sha256(canonical).hexdigest()
 
 
 # ── YOPO endpoints ───────────────────────────────────────────────────────
@@ -123,6 +149,7 @@ def yopo_health():
         "effective_config_sha256": getattr(
             yopo_runner, "effective_config_sha256", None
         ),
+        "service_fingerprint": _service_fingerprint(),
         "planning_authorized": planning_authorized,
         "planning_reason": planning_reason,
     })
@@ -217,6 +244,7 @@ def yopo_plan():
             "calibration_id": calibration.get("id") if calibration else None,
             "planning_authorized": planning_authorized,
             "planning_reason": planning_reason,
+            "service_fingerprint": _service_fingerprint(),
         }
         identity = _response_identity(data, required=planning_authorized)
         planning_metadata.update(identity)
@@ -385,6 +413,7 @@ def yopo_plan_full():
             "calibration_id": calibration.get("id") if calibration else None,
             "planning_authorized": planning_authorized,
             "planning_reason": planning_reason,
+            "service_fingerprint": _service_fingerprint(),
             "latency_ms": (time.perf_counter() - started) * 1000.0,
             "timings_ms": {
                 "decode_ms": (t_decode - t0) * 1000.0,

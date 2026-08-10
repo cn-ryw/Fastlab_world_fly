@@ -23,6 +23,7 @@ const frame = new PerceptionFrame({
         orientation: { x: 0, y: 0, z: 0, w: 1 },
     },
     rgb: Object.freeze({ type: 'image/jpeg', size: 42 }),
+    captureProfile: 'calibration',
     ...planning,
     projectionConfig: { width: 384, height: 192 },
 });
@@ -32,9 +33,19 @@ assert.deepEqual(observation.actualPosition, { x: 1, y: 2, z: 3 }, 'trajectory e
 assert.deepEqual(observation.referencePosition, { x: 10, y: 20, z: 30 }, 'goal delta origin uses reference position');
 assert.deepEqual(observation.velocity, { x: 4, y: 5, z: 6 }, 'observation keeps actual velocity');
 assert.deepEqual(observation.acceleration, { x: 0.1, y: 0.2, z: 0.3 }, 'observation uses reference acceleration');
+assert.equal(frame.captureProfile, 'calibration', 'capture profile is frozen with RGB provenance');
 assert(Object.isFrozen(frame) && Object.isFrozen(frame.transform) && Object.isFrozen(frame.actualState));
+
+assert.throws(() => new PerceptionFrame({
+    frameId: 8,
+    capturedAt: 124,
+    transform: { position: { x: 0, y: 0, z: 0 } },
+    rgb: Object.freeze({ type: 'image/jpeg', size: 1 }),
+    ...planning,
+    captureProfile: 'unknown',
+}), /captureProfile/);
 
 const legacy = normalizePlanningState({ x: 1, y: 2, z: 3, vx: 4, vy: 5, vz: 6 }, 20);
 assert.deepEqual(legacy.referenceState.position, { x: 1, y: 2, z: 3 }, 'legacy flat pose remains compatible');
 
-console.log('\nPerceptionFrame contract: 6 passed, 0 failed');
+console.log('\nPerceptionFrame contract: all passed');

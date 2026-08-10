@@ -38,10 +38,41 @@ function cloneCaptureTransform(transform, fallbackPosition = { x: 0, y: 0, z: 0 
     return clone;
 }
 
-// 全景采集间隔：plan_full 已降至 ~35ms，采集对齐即可达 20+ Hz
+const PANORAMA_CAPTURE_PROFILES = new Set(['flight', 'calibration']);
+
+function normalizeCaptureProfile(value, fallback = null) {
+    const normalized = String(value || '').trim().toLowerCase();
+    if (PANORAMA_CAPTURE_PROFILES.has(normalized)) return normalized;
+    if (fallback !== null) return fallback;
+    throw new RangeError('panorama capture profile must be "flight" or "calibration"');
+}
+
+function initialCaptureProfile() {
+    const params = new URLSearchParams(window.location.search);
+    const explicit = params.get('panoProfile') || params.get('panoCaptureProfile');
+    if (explicit) return normalizeCaptureProfile(explicit, 'flight');
+
+    // Backward compatibility for the strict static-calibration URL documented
+    // before profiles existed. Flight is the fail-safe default for every other
+    // URL so a tile quiet period cannot silently throttle the live loop.
+    const legacyCaptureAnyway = params.get('panoCaptureAnyway');
+    const legacyCaptureAnywayNumber = Number(legacyCaptureAnyway);
+    if (legacyCaptureAnyway !== null
+        && legacyCaptureAnyway !== ''
+        && Number.isFinite(legacyCaptureAnywayNumber)
+        && legacyCaptureAnywayNumber < 0.5) {
+        return 'calibration';
+    }
+    return 'flight';
+}
+
+// 名义调度间隔；真实吞吐由完整六面 capture、单个在途请求及验收门禁决定。
 const CAPTURE_INTERVAL_MS = urlNumber('panoMs', 20, 16, 10000);
 // 深度请求间隔：50Hz 名义，由 _depthGate 非阻塞漏桶调节实际吞吐
 const DEPTH_INTERVAL_MS = urlNumber('depthMs', 20, 16, 10000);
+// A response may legitimately arrive after the next RGB capture completes,
+// but never apply a trajectory from an arbitrarily old frozen observation.
+const YOPO_MAX_FRAME_AGE_MS = urlNumber('yopoMaxFrameAgeMs', 250, 50, 250);
 // DA360 超时：含冷启动首次推理裕度
 const DA360_TIMEOUT_MS = urlNumber('da360TimeoutMs', 20000, 2000, 60000);
 const DA360_UPLOAD_SCALE = urlNumber('da360UploadScale', 0.35, 0.05, 1);
@@ -58,9 +89,8 @@ const PANORAMA_FACE_FOV = urlNumber('panoFaceFov', 130, 90, 170);
 const PANORAMA_TOP_POLE_GUARD = urlNumber('panoTopPoleGuard', 10, 0, 45);
 const PANORAMA_BOTTOM_POLE_GUARD = urlNumber('panoBottomPoleGuard', 2, 0, 45);
 const PANORAMA_FRAME_DELAY_MS = urlNumber('panoFrameDelayMs', 0, 0, 1000);
-const PANORAMA_FACE_TILE_TIMEOUT_MS = urlNumber('panoFaceTileTimeoutMs', 400, 0, 10000);
-const PANORAMA_FACE_TILE_QUIET_MS = urlNumber('panoFaceTileQuietMs', 0, 0, 5000);
-const PANORAMA_CAPTURE_ANYWAY = urlNumber('panoCaptureAnyway', 1, 0, 1) >= 0.5;
+const PANORAMA_FACE_TILE_TIMEOUT_MS = urlNumber('panoFaceTileTimeoutMs', 6000, 0, 10000);
+const PANORAMA_FACE_TILE_QUIET_MS = urlNumber('panoFaceTileQuietMs', 650, 0, 5000);
 const PANORAMA_FACES_PER_SLICE = Math.round(urlNumber('panoFacesPerSlice', 2, 1, 6));
 const PANORAMA_PRELOAD_FRAME_DELAY_MS = urlNumber(
     'panoPreloadFrameDelayMs',
@@ -68,8 +98,18 @@ const PANORAMA_PRELOAD_FRAME_DELAY_MS = urlNumber(
     0,
     1000
 );
-const PANORAMA_PRELOAD_FACE_TILE_TIMEOUT_MS = urlNumber('panoPreloadFaceTileTimeoutMs', 6000, 500, 30000);
-const PANORAMA_PRELOAD_FACE_TILE_QUIET_MS = urlNumber('panoPreloadFaceTileQuietMs', 650, 0, 5000);
+const PANORAMA_PRELOAD_FACE_TILE_TIMEOUT_MS = urlNumber(
+    'panoPreloadFaceTileTimeoutMs',
+    PANORAMA_FACE_TILE_TIMEOUT_MS,
+    0,
+    30000
+);
+const PANORAMA_PRELOAD_FACE_TILE_QUIET_MS = urlNumber(
+    'panoPreloadFaceTileQuietMs',
+    PANORAMA_FACE_TILE_QUIET_MS,
+    0,
+    5000
+);
 const PANORAMA_PRELOAD_TIMEOUT_MS = urlNumber('panoPreloadTimeoutMs', 60000, 500, 120000);
 
 function getDA360Endpoint() {
@@ -231,6 +271,7 @@ export class PanoramaSensor {
         this.endpoint = getDA360Endpoint();
         this.active = false;
         this.capturing = false;
+        this._captureProfile = initialCaptureProfile();
         this._captureAbortController = null;
         this._captureIdlePromise = null;
         this._captureSequence = 0;
@@ -301,6 +342,29 @@ export class PanoramaSensor {
         this._applyVisibility();
     }
 
+    setCaptureProfile(profile, reason = 'profile-changed') {
+        const normalized = normalizeCaptureProfile(profile);
+        if (normalized === 'calibration' && this._yopoGoal) {
+            throw new Error('cannot enter calibration capture profile while navigation is active');
+        }
+        if (normalized === this._captureProfile) return normalized;
+        const transitionReason = `${reason}:${this._captureProfile}->${normalized}`;
+        this._abortActiveCapture(transitionReason);
+        if (this._captureProfile === 'calibration' && normalized !== 'calibration') {
+            // A raw/anchor bundle is valid only while the sensor remains in the
+            // calibration profile. Generation invalidates non-abort-aware
+            // awaits; the signal cancels the in-flight /depth/raw request.
+            this._calibrationGeneration++;
+            this._abortCalibrationCapture(transitionReason);
+        }
+        this._captureProfile = normalized;
+        return normalized;
+    }
+
+    getCaptureProfile() {
+        return this._captureProfile;
+    }
+
     _abortActiveCapture(reason) {
         const controller = this._captureAbortController;
         if (controller && !controller.signal.aborted) controller.abort(reason);
@@ -356,7 +420,10 @@ export class PanoramaSensor {
 
     getCaptureOptions(options = {}) {
         const preload = !!options.preload;
+        const profile = normalizeCaptureProfile(options.profile, this._captureProfile);
+        const calibration = profile === 'calibration';
         return {
+            profile,
             width: PANORAMA_WIDTH,
             height: PANORAMA_HEIGHT,
             faceSize: PANORAMA_FACE_SIZE,
@@ -366,10 +433,16 @@ export class PanoramaSensor {
             bottomPoleGuardDeg: PANORAMA_BOTTOM_POLE_GUARD,
             jpegQuality: PANORAMA_JPEG_QUALITY,
             uploadScale: DA360_UPLOAD_SCALE,
-            frameDelayMs: preload ? PANORAMA_PRELOAD_FRAME_DELAY_MS : PANORAMA_FRAME_DELAY_MS,
-            tileTimeoutMs: preload ? PANORAMA_PRELOAD_FACE_TILE_TIMEOUT_MS : PANORAMA_FACE_TILE_TIMEOUT_MS,
-            tileQuietMs: preload ? PANORAMA_PRELOAD_FACE_TILE_QUIET_MS : PANORAMA_FACE_TILE_QUIET_MS,
-            captureAnyway: PANORAMA_CAPTURE_ANYWAY,  // Always captureAnyway: skip tile-wait for preload too, else face 1/6 times out
+            frameDelayMs: calibration
+                ? (preload ? PANORAMA_PRELOAD_FRAME_DELAY_MS : PANORAMA_FRAME_DELAY_MS)
+                : 0,
+            tileTimeoutMs: calibration
+                ? (preload ? PANORAMA_PRELOAD_FACE_TILE_TIMEOUT_MS : PANORAMA_FACE_TILE_TIMEOUT_MS)
+                : 0,
+            tileQuietMs: calibration
+                ? (preload ? PANORAMA_PRELOAD_FACE_TILE_QUIET_MS : PANORAMA_FACE_TILE_QUIET_MS)
+                : 0,
+            captureAnyway: !calibration,
             facesPerSlice: PANORAMA_FACES_PER_SLICE,
             timeoutMs: preload ? PANORAMA_PRELOAD_TIMEOUT_MS : 0,
         };
@@ -404,7 +477,15 @@ export class PanoramaSensor {
         };
     }
 
-    _makeRgbFrameContext(frameId, capturedAt, transform, planningState, canvas, captureTimings = null) {
+    _makeRgbFrameContext(
+        frameId,
+        capturedAt,
+        transform,
+        planningState,
+        canvas,
+        captureTimings = null,
+        captureProfile = this._captureProfile,
+    ) {
         const fallbackPosition = planningState?.actualState?.position || { x: 0, y: 0, z: 0 };
         const fallbackState = planningState || normalizePlanningState({
             x: fallbackPosition.x,
@@ -419,6 +500,7 @@ export class PanoramaSensor {
             capturedAt,
             transform: cloneCaptureTransform(transform, fallbackPosition),
             planningState: fallbackState,
+            captureProfile: normalizeCaptureProfile(captureProfile),
             projectionConfig: Object.freeze(this._projectionConfig()),
             captureTimings: Object.freeze({ ...(captureTimings || {}) }),
             rgbPromise: this._snapshotRgbBlob(canvas),
@@ -438,6 +520,7 @@ export class PanoramaSensor {
             actualState: planningState.actualState,
             referenceState: planningState.referenceState,
             yaw: planningState.yaw,
+            captureProfile: context.captureProfile,
             projectionConfig: {
                 ...context.projectionConfig,
                 rgbWidth: encoded.width,
@@ -470,6 +553,8 @@ export class PanoramaSensor {
             context.transform,
             planningState,
             this.rgbCanvas,
+            result?.timings_ms || { total: captureMs },
+            context.captureProfile ?? this._captureProfile,
         );
         this.hasRgb = true;
         this._setRgbStatus(`preloaded ${Math.round(captureMs)}ms`);
@@ -481,16 +566,15 @@ export class PanoramaSensor {
         this._applyVisibility();
         if (!this._shouldRun()) return;
 
-        // 深度请求与全景采集解耦——用自己的定时器，不依赖采集状态。
-        // 每帧检查，服务器 35ms 下理论可达 ~28Hz，gate 防止堆积。
+        // 深度请求与下一次全景采集可流水化，但只保留一个在途请求，
+        // 并且每个完整 RGB frame 最多请求一次，避免排队和时空拼接。
         if (this._shouldRequestDepth(now)) {
             this._requestDepth(this.rgbCanvas);
         }
 
         // 全景采集：catch stuck captures, skip if busy
         if (this.capturing) {
-            const stuckMs = PANORAMA_FACE_TILE_TIMEOUT_MS * 6 + 500;
-            if (PANORAMA_CAPTURE_ANYWAY && now - this.lastCaptureStartTime > stuckMs) {
+            if (this._captureProfile === 'flight' && now - this.lastCaptureStartTime > 3000) {
                 this._abortActiveCapture('capture-timeout');
             }
             return;
@@ -631,6 +715,7 @@ export class PanoramaSensor {
         let label = normalized;
         if (outcome === 'stale') label = `${normalized} · stale`;
         else if (outcome === 'blocked') label = `${normalized} · blocked`;
+        else if (outcome === 'rejected') label = `${normalized} · rejected`;
         else if (normalized === 'error' && reason) label = `error · ${shortError(reason)}`;
         else if (Number.isFinite(latencyMs)) label = `${normalized} ${Math.round(latencyMs)}ms`;
 
@@ -678,13 +763,28 @@ export class PanoramaSensor {
         return this._forceNextDepthRequest || now - this.lastDepthTime >= DEPTH_INTERVAL_MS;
     }
 
-    _isRequestSessionCurrent(request) {
+    _isRequestNavigationCurrent(request) {
         if (!request) return false;
+        if (this._activeDepthRequest !== request) return false;
         if (request.generation !== this._yopoGeneration) return false;
         if (request.goalId !== this._goalId) return false;
         if (request.mode !== this._desiredDepthMode()) return false;
-        if (request.frameId !== this._rgbFrameId) return false;
+        return true;
+    }
+
+    _isRequestSessionCurrent(request) {
+        if (!this._isRequestNavigationCurrent(request)) return false;
         return request.requestId >= this._lastRenderedRequestId;
+    }
+
+    _isRequestSourceCurrent(request) {
+        return this._isRequestSessionCurrent(request)
+            && request.frameId === this._rgbFrameId;
+    }
+
+    _canCommitDepthPreview(request) {
+        return this._isRequestNavigationCurrent(request)
+            && request.requestId > this._lastRenderedRequestId;
     }
 
     _planningResponseMatchesRequest(payload, request) {
@@ -761,6 +861,7 @@ export class PanoramaSensor {
         const captureIdlePromise = new Promise(resolve => { resolveCaptureIdle = resolve; });
         this._captureIdlePromise = captureIdlePromise;
         const captureId = ++this._captureSequence;
+        const captureProfile = this._captureProfile;
         const captureController = new AbortController();
         this._captureAbortController = captureController;
         this.lastCaptureStartTime = performance.now();
@@ -779,7 +880,7 @@ export class PanoramaSensor {
                 ? world.capturePanoramaAsync.bind(world)
                 : world.capturePanorama.bind(world);
             const result = await capture(transform, {
-                ...this.getCaptureOptions(),
+                ...this.getCaptureOptions({ profile: captureProfile }),
                 signal: captureController.signal,
             });
             const structuredResult = result && typeof result === 'object' && 'complete' in result;
@@ -812,6 +913,7 @@ export class PanoramaSensor {
                 capturePlanningState,
                 this.rgbCanvas,
                 result?.timings_ms || { total: captureMs },
+                captureProfile,
             );
             this.hasRgb = true;
             const rgbStatus = `${Math.round(captureMs)}ms`;
@@ -827,7 +929,10 @@ export class PanoramaSensor {
                     captureId,
                     outcome: 'stale',
                     dropReason: String(captureController.signal.reason || 'capture-aborted'),
-                    mode: this._desiredDepthMode(),
+                    mode: 'capture',
+                    intendedDepthMode: this._desiredDepthMode(),
+                    goalId: this._goalId,
+                    generation: this._yopoGeneration,
                 });
                 return;
             }
@@ -889,11 +994,16 @@ export class PanoramaSensor {
         });
     }
 
-    async _decodeAndCommitDepthImage(source, request) {
+    async _decodeAndCommitDepthImage(source, request, { markStale = true } = {}) {
         const decoded = await decodeDepthImageSource(source, globalThis);
         try {
-            if (!this._isRequestSessionCurrent(request)) {
-                this._markStale(request, 'image-decoded-after-session-change');
+            if (!this._canCommitDepthPreview(request)) {
+                if (markStale) {
+                    const reason = this._isRequestNavigationCurrent(request)
+                        ? 'depth-preview-superseded'
+                        : 'image-decoded-after-session-change';
+                    this._markStale(request, reason);
+                }
                 return false;
             }
             if (!this.depthCanvas) throw new Error('depth canvas unavailable');
@@ -955,7 +1065,7 @@ export class PanoramaSensor {
             this._perceptionFrame = frame;
             const blob = frame.rgb;
             tB = performance.now();
-            if (!this._isRequestSessionCurrent(request)) {
+            if (!this._isRequestSourceCurrent(request)) {
                 this._markStale(request, 'session-changed-before-fetch');
                 return false;
             }
@@ -1005,10 +1115,14 @@ export class PanoramaSensor {
 
             const fetchStartedAt = performance.now();
             const response = await fetch(url, { method: 'POST', headers, body, signal: controller.signal });
-            const responseAt = performance.now();
+            const responseHeadersAt = performance.now();
             if (!response.ok) throw new Error(`HTTP ${response.status}`);
             const payload = await response.json();
-            if (!this._isRequestSessionCurrent(request)) {
+            const payloadParsedAt = performance.now();
+            const responseSessionCurrent = request.mode === 'planning'
+                ? this._isRequestNavigationCurrent(request)
+                : this._isRequestSessionCurrent(request);
+            if (!responseSessionCurrent) {
                 this._markStale(request, 'response-after-session-change');
                 return false;
             }
@@ -1017,30 +1131,42 @@ export class PanoramaSensor {
                 return false;
             }
             if (!payload.depth_image) throw new Error('response missing depth_image');
-            const applyStartedAt = performance.now();
-            if (!await this._decodeAndCommitDepthImage(payload.depth_image, request)) return false;
-            const appliedAt = performance.now();
 
             this._depthLatency = Number.isFinite(Number(payload.latency_ms))
                 ? `${Math.round(Number(payload.latency_ms))}ms`
                 : '';
             const planningAuthorized = request.mode !== 'planning'
                 || payload.planning_authorized === true;
+            if (request.mode === 'planning' && planningAuthorized) {
+                const trustedDepthMode = payload.depth_mode === 'da360-metric'
+                    || payload.depth_mode === 'cesium-truth';
+                if (!trustedDepthMode) {
+                    throw new Error(`authorized planning used untrusted depth mode: ${payload.depth_mode || 'missing'}`);
+                }
+                if (!String(payload.calibration_id || '').trim()) {
+                    throw new Error('authorized planning response missing calibration_id');
+                }
+                if (!String(payload.service_fingerprint || '').trim()) {
+                    throw new Error('authorized planning response missing service_fingerprint');
+                }
+            }
             const planningReason = request.mode === 'planning' && !planningAuthorized
                 ? String(payload.planning_reason || 'planning-not-authorized')
                 : null;
-            const outcome = planningAuthorized ? 'applied' : 'blocked';
-            this._setDepthState(
-                request.mode,
-                planningReason ? `blocked:${planningReason}` : 'depth-ready',
-                { outcome, latencyMs: Number(payload.latency_ms) },
-            );
+            let finalReason = planningReason;
+            let trajectoryApplied = request.mode === 'planning' ? false : null;
+            let trajectoryAppliedAt = null;
+            let trajectoryApplyMs = 0;
 
             if (request.mode === 'planning') {
                 if (planningAuthorized && !payload.endstate) {
                     throw new Error('authorized planning response missing endstate');
                 }
-                if (planningAuthorized && payload.endstate && this.onYopoResult) {
+                if (planningAuthorized && payload.endstate) {
+                    if (performance.now() - frame.capturedAt > YOPO_MAX_FRAME_AGE_MS) {
+                        this._markStale(request, 'planning-frame-too-old');
+                        return false;
+                    }
                     const context = Object.freeze({
                         mode: request.mode,
                         goalId: request.goalId,
@@ -1049,14 +1175,151 @@ export class PanoramaSensor {
                         requestId: request.requestId,
                         depthMode: payload.depth_mode || null,
                         calibrationId: payload.calibration_id || null,
+                        serviceFingerprint: payload.service_fingerprint || null,
                         planningAuthorized: true,
                         planningReason: payload.planning_reason || null,
                         timings: payload.timings_ms || null,
                     });
-                    this.onYopoResult(payload.endstate, payload.traj_time, context);
-                    if (this.onYopoLatency) this.onYopoLatency(payload.latency_ms);
+                    const trajectoryApplyStartedAt = performance.now();
+                    trajectoryApplied = this.onYopoResult
+                        ? this.onYopoResult(payload.endstate, payload.traj_time, context) === true
+                        : false;
+                    trajectoryAppliedAt = performance.now();
+                    trajectoryApplyMs = trajectoryAppliedAt - trajectoryApplyStartedAt;
+                    if (trajectoryApplied) {
+                        if (this.onYopoLatency) this.onYopoLatency(payload.latency_ms);
+                    } else {
+                        finalReason = this.onYopoResult
+                            ? 'trajectory-apply-rejected'
+                            : 'trajectory-handler-unavailable';
+                    }
                 }
             }
+
+            const makeMetrics = ({
+                outcome,
+                depthPreviewError = null,
+                depthPreviewCommitted = null,
+                depthCommittedAt = null,
+                depthCommitStartedAt = null,
+            }) => {
+                const metricAppliedAt = trajectoryAppliedAt
+                    || depthCommittedAt
+                    || performance.now();
+                const depthCommitMs = depthCommittedAt != null
+                    && depthCommitStartedAt != null
+                    ? depthCommittedAt - depthCommitStartedAt
+                    : null;
+                return Object.freeze({
+                    frameId: request.frameId,
+                    goalId: request.goalId,
+                    generation: request.generation,
+                    mode: request.mode,
+                    outcome,
+                    planningAuthorized: request.mode === 'planning' ? planningAuthorized : null,
+                    trajectoryApplied,
+                    trajectoryAppliedAtMs: trajectoryApplied ? trajectoryAppliedAt : null,
+                    dropReason: finalReason,
+                    depthMode: payload.depth_mode || null,
+                    calibrationId: payload.calibration_id || null,
+                    serviceFingerprint: payload.service_fingerprint || null,
+                    depthPreviewError,
+                    depthPreviewCommitted,
+                    depthPreviewLagFrames: Math.max(
+                        0,
+                        this._rgbFrameId - request.frameId,
+                    ),
+                    depthPreviewAgeMs: metricAppliedAt - frame.capturedAt,
+                    captureProfile: frameContext.captureProfile,
+                    captureMs: Number(frameContext.captureTimings?.total || 0),
+                    renderMs: Number(frameContext.captureTimings?.render || 0),
+                    sceneRenderMs: Number(frameContext.captureTimings?.scene_render || 0),
+                    tileWaitMs: Number(frameContext.captureTimings?.tile_wait || 0),
+                    waitRerenderMs: Number(frameContext.captureTimings?.wait_rerender || 0),
+                    faceUploadMs: Number(frameContext.captureTimings?.face_upload || 0),
+                    projectMs: Number(frameContext.captureTimings?.project || 0),
+                    schedulerYieldMs: Number(
+                        frameContext.captureTimings?.scheduler
+                        ?? frameContext.captureTimings?.scheduler_yield
+                        ?? 0
+                    ),
+                    jpegMs: Number(materialized.jpegMs || 0),
+                    responseHeadersMs: responseHeadersAt - fetchStartedAt,
+                    httpBodyMs: payloadParsedAt - responseHeadersAt,
+                    networkMs: payloadParsedAt - fetchStartedAt,
+                    serverMs: Number(payload.latency_ms || 0),
+                    da360Ms: Number(
+                        payload.timings_ms?.da360_ms
+                        ?? payload.timings_ms?.infer_ms
+                        ?? 0
+                    ),
+                    yopoMs: Number(payload.timings_ms?.yopo_ms || 0),
+                    depthCommitMs,
+                    trajectoryApplyMs,
+                    applyMs: trajectoryApplied ? trajectoryApplyMs : depthCommitMs,
+                    captureToApplyMs: metricAppliedAt - frame.capturedAt,
+                    frameAgeMs: metricAppliedAt - frame.capturedAt,
+                    serverTimings: payload.timings_ms || null,
+                });
+            };
+            const outcome = request.mode !== 'planning'
+                ? 'applied'
+                : !planningAuthorized
+                ? 'blocked'
+                : trajectoryApplied
+                ? 'applied'
+                : 'rejected';
+            // Emit every planning control outcome synchronously. Optional JPEG
+            // decoding may yield to a goal change; it is a separate display
+            // diagnostic and must not move/replace this navigation event.
+            const planningControlMetricsEmitted = request.mode === 'planning';
+            if (planningControlMetricsEmitted) {
+                this.onPerceptionMetrics?.(makeMetrics({ outcome }));
+            }
+
+            // Depth preview is useful UI, but it must not define planning
+            // success or delay the trajectory-application timestamp.
+            const depthCommitStartedAt = performance.now();
+            let depthPreviewError = null;
+            let depthPreviewCommitted = false;
+            try {
+                depthPreviewCommitted = await this._decodeAndCommitDepthImage(
+                    payload.depth_image,
+                    request,
+                    { markStale: request.mode !== 'planning' },
+                );
+                if (!depthPreviewCommitted) {
+                    if (request.mode !== 'planning') return false;
+                    depthPreviewError = 'stale:image-decoded-after-session-change';
+                }
+            } catch (error) {
+                if (request.mode !== 'planning') throw error;
+                depthPreviewError = shortError(error);
+                reportUserError('Planning depth preview decode failed', error, {
+                    key: 'planning-depth-preview', intervalMs: 3000,
+                });
+            }
+            const depthCommittedAt = performance.now();
+            const depthPreviewLagFrames = Math.max(0, this._rgbFrameId - request.frameId);
+            // A new frame/goal may arrive while the optional JPEG is decoding.
+            // Never let the old preview overwrite the new session's UI state,
+            // but retain the already completed trajectory-install evidence.
+            if (this._isRequestSessionCurrent(request)) {
+                this._setDepthState(
+                    request.mode,
+                    finalReason
+                        ? `${outcome}:${finalReason}`
+                        : trajectoryApplied
+                        ? (depthPreviewError
+                            ? 'trajectory-ready:depth-preview-error'
+                            : depthPreviewLagFrames > 0
+                            ? `trajectory-ready:depth-lag-${depthPreviewLagFrames}-frames`
+                            : 'trajectory-ready')
+                        : 'depth-ready',
+                    { outcome, latencyMs: Number(payload.latency_ms) },
+                );
+            }
+            const appliedAt = trajectoryAppliedAt || depthCommittedAt;
 
             // 帧率打点 + 限速诊断
             const now = performance.now();
@@ -1068,48 +1331,75 @@ export class PanoramaSensor {
                 console.log(
                     `[depth] ${fps.toFixed(1)}Hz mode=${request.mode} goalId=${request.goalId || '-'} ` +
                     `frameId=${request.frameId} generation=${request.generation} ` +
-                    `reason=${planningReason ? `blocked:${planningReason}` : 'ok'} ` +
+                    `depthLag=${depthPreviewLagFrames}f ` +
+                    `reason=${finalReason ? `${outcome}:${finalReason}` : 'ok'} ` +
                     `capture=${Math.round(frameContext.captureTimings?.total || 0)}ms ` +
                     `render=${Math.round(frameContext.captureTimings?.render || 0)}ms ` +
+                    `scene=${Math.round(frameContext.captureTimings?.scene_render || 0)}ms ` +
+                    `tileWait=${Math.round(frameContext.captureTimings?.tile_wait || 0)}ms ` +
+                    `waitRender=${Math.round(frameContext.captureTimings?.wait_rerender || 0)}ms ` +
+                    `upload=${Math.round(frameContext.captureTimings?.face_upload || 0)}ms ` +
                     `project=${Math.round(frameContext.captureTimings?.project || 0)}ms ` +
                     `jpeg=${Math.round(materialized.jpegMs || tB - tA)}ms ` +
-                    `network=${Math.round(responseAt - fetchStartedAt)}ms ` +
+                    `headers=${Math.round(responseHeadersAt - fetchStartedAt)}ms ` +
+                    `body=${Math.round(payloadParsedAt - responseHeadersAt)}ms ` +
                     `da360=${Math.round(payload.timings_ms?.da360_ms ?? payload.timings_ms?.infer_ms ?? 0)}ms ` +
                     `yopo=${Math.round(payload.timings_ms?.yopo_ms || 0)}ms ` +
-                    `apply=${Math.round(appliedAt - applyStartedAt)}ms age=${Math.round(appliedAt - frame.capturedAt)}ms ` +
+                    `apply=${Math.round(trajectoryApplied ? trajectoryApplyMs : depthCommittedAt - depthCommitStartedAt)}ms ` +
+                    `age=${Math.round(appliedAt - frame.capturedAt)}ms ` +
                     `avgCycle=${avgCycle.toFixed(0)}ms`
                 );
                 this._depthFpsTimer = now; this._depthFpsCount = 0; this._depthCycleSum = 0;
             }
-            this.lastDepthTime = performance.now();
-            if (this.onDepthResult) this.onDepthResult(payload.latency_ms);
-            const metrics = Object.freeze({
-                frameId: request.frameId,
-                goalId: request.goalId,
-                generation: request.generation,
-                mode: request.mode,
-                outcome,
-                planningAuthorized: request.mode === 'planning' ? planningAuthorized : null,
-                dropReason: planningReason,
-                calibrationId: payload.calibration_id || null,
-                captureMs: Number(frameContext.captureTimings?.total || 0),
-                renderMs: Number(frameContext.captureTimings?.render || 0),
-                projectMs: Number(frameContext.captureTimings?.project || 0),
-                schedulerYieldMs: Number(frameContext.captureTimings?.scheduler_yield || 0),
-                jpegMs: Number(materialized.jpegMs || 0),
-                networkMs: responseAt - fetchStartedAt,
-                serverMs: Number(payload.latency_ms || 0),
-                da360Ms: Number(payload.timings_ms?.da360_ms ?? payload.timings_ms?.infer_ms ?? 0),
-                yopoMs: Number(payload.timings_ms?.yopo_ms || 0),
-                applyMs: appliedAt - applyStartedAt,
-                captureToApplyMs: appliedAt - frame.capturedAt,
-                frameAgeMs: appliedAt - frame.capturedAt,
-                serverTimings: payload.timings_ms || null,
-            });
-            this.onPerceptionMetrics?.(metrics);
+            const requestStillOwned = request.mode === 'planning'
+                ? this._isRequestNavigationCurrent(request)
+                : this._isRequestSessionCurrent(request);
+            if (requestStillOwned) {
+                this.lastDepthTime = performance.now();
+                if (depthPreviewCommitted && this.onDepthResult) {
+                    this.onDepthResult(payload.latency_ms);
+                }
+            }
+            if (!planningControlMetricsEmitted) {
+                this.onPerceptionMetrics?.(makeMetrics({
+                    outcome,
+                    depthPreviewError,
+                    depthPreviewCommitted,
+                    depthCommittedAt,
+                    depthCommitStartedAt,
+                }));
+            } else {
+                const displayOutcome = depthPreviewCommitted
+                    ? 'applied'
+                    : depthPreviewError?.startsWith('stale:')
+                    ? 'stale'
+                    : 'error';
+                const displayMetrics = makeMetrics({
+                    outcome: displayOutcome,
+                    depthPreviewError,
+                    depthPreviewCommitted,
+                    depthCommittedAt,
+                    depthCommitStartedAt,
+                });
+                this.onPerceptionMetrics?.(Object.freeze({
+                    ...displayMetrics,
+                    mode: 'depth-preview',
+                    outcome: displayOutcome,
+                    planningAuthorized: null,
+                    trajectoryApplied: null,
+                    trajectoryAppliedAtMs: null,
+                    dropReason: depthPreviewError,
+                    applyMs: displayMetrics.depthCommitMs,
+                    captureToApplyMs: depthCommittedAt - frame.capturedAt,
+                    frameAgeMs: depthCommittedAt - frame.capturedAt,
+                    depthPreviewAgeMs: depthCommittedAt - frame.capturedAt,
+                }));
+            }
             return true;
         } catch (error) {
-            const sessionChanged = !this._isRequestSessionCurrent(request);
+            const sessionChanged = request.mode === 'planning'
+                ? !this._isRequestNavigationCurrent(request)
+                : !this._isRequestSessionCurrent(request);
             const transitionAbort = request.abortReason && request.abortReason !== 'timeout';
             if (sessionChanged || transitionAbort) {
                 this._markStale(request, request.abortReason || 'session-changed');
@@ -1150,6 +1440,7 @@ export class PanoramaSensor {
             this.resetYopoGoal('empty-goal');
             return null;
         }
+        this.setCaptureProfile('flight', 'yopo-goal');
         this._abortActiveDepthRequest('goal-changed');
         this._abortActiveCapture('goal-changed');
         this._yopoGeneration++;
@@ -1211,6 +1502,11 @@ export class PanoramaSensor {
      * navigating: calibration captures are defined as static poses.
      */
     async captureCalibrationSample(world, options = {}) {
+        if (this._captureProfile !== 'calibration') {
+            throw new Error(
+                'metric calibration requires the "calibration" panorama capture profile'
+            );
+        }
         if (this._calibrationCapturePending) {
             throw new Error('a calibration capture is already in progress');
         }
@@ -1240,6 +1536,11 @@ export class PanoramaSensor {
                 throw new Error('panorama capture did not reach an idle state');
             }
             const latestContext = this._rgbFrameContext;
+            if (latestContext?.captureProfile !== 'calibration') {
+                throw new Error(
+                    'wait for a complete calibration-profile panorama frame before export'
+                );
+            }
             const currentFrameMatches = latestContext && this._perceptionFrame
                 && String(this._perceptionFrame.frameId) === String(latestContext.frameId);
             const materialized = latestContext && !currentFrameMatches
@@ -1250,6 +1551,9 @@ export class PanoramaSensor {
                 : materialized?.frame || this._perceptionFrame;
             if (!frame) {
                 throw new Error('wait for a complete perception frame before calibration capture');
+            }
+            if (frame.captureProfile !== 'calibration') {
+                throw new Error('calibration export rejected a non-calibration panorama frame');
             }
             this._perceptionFrame = frame;
             const maxFrameAgeMs = Number(options.maxFrameAgeMs ?? 1000);
@@ -1380,6 +1684,7 @@ export class PanoramaSensor {
                 actualState: frame.actualState,
                 referenceState: frame.referenceState,
                 yaw: frame.yaw,
+                captureProfile: frame.captureProfile,
                 projectionConfig: frame.projectionConfig,
                 validAnchors: anchors.metadata?.validAnchors ?? anchors.anchors?.length ?? 0,
                 failedAnchors: anchors.metadata?.failureCount ?? anchors.failures?.length ?? 0,

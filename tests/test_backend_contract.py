@@ -1,6 +1,7 @@
 """GPU-free contract tests for standalone and combined DA360 Flask apps."""
 
 import io
+import hashlib
 import json
 import os
 import sys
@@ -113,6 +114,19 @@ def jpeg_bytes(width=16, height=8):
 
 
 class BackendContractTests(unittest.TestCase):
+    @staticmethod
+    def expected_service_fingerprint():
+        identity = {
+            "api_version": 2,
+            "da360_checkpoint_sha256": "ab" * 32,
+            "yopo_checkpoint_sha256": "cd" * 32,
+            "yopo_effective_config_sha256": "34" * 32,
+        }
+        canonical = json.dumps(
+            identity, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+        ).encode("ascii")
+        return hashlib.sha256(canonical).hexdigest()
+
     def test_yopo_overlay_is_selected_before_global_config_import(self):
         source = (SCRIPTS_DIR / "yopo_bridge.py").read_text(encoding="utf-8")
         self.assertLess(
@@ -321,6 +335,9 @@ class BackendContractTests(unittest.TestCase):
             self.assertTrue(payload["depth_image"].startswith("data:image/jpeg;base64,"))
             self.assertIs(payload["planning_authorized"], False)
             self.assertEqual(
+                payload["service_fingerprint"], self.expected_service_fingerprint()
+            )
+            self.assertEqual(
                 payload["planning_reason"], "da360-relative-is-preview-only"
             )
             self.assertNotIn("endstate", payload)
@@ -347,11 +364,37 @@ class BackendContractTests(unittest.TestCase):
             self.assertIs(payload["planning_authorized"], True)
             self.assertEqual(payload["planning_reason"], "validated-da360-metric")
             self.assertEqual(payload["calibration_id"], "calib-1")
+            self.assertEqual(
+                payload["service_fingerprint"], self.expected_service_fingerprint()
+            )
             self.assertEqual(len(payload["endstate"]), 9)
             self.assertEqual(payload["traj_time"], 1.125)
             call = combined_server.yopo_runner.last_call
             np.testing.assert_array_equal(call["pos"], [1.0, 2.0, 3.0])
             np.testing.assert_array_equal(call["reference_pos"], [4.0, 5.0, 6.0])
+
+    def test_metric_planning_is_blocked_without_complete_service_fingerprint(self):
+        with self.clients() as clients:
+            combined_server.da360_runner.depth_mode = "da360-metric"
+            combined_server.da360_runner.calibration = {"id": "calib-1"}
+            combined_server.yopo_runner.effective_config_sha256 = None
+            query = (
+                "px=1&py=2&pz=3&rpx=4&rpy=5&rpz=6&"
+                "gx=10&gy=2&gz=4&vx=0&vy=0&vz=0&ax=0&ay=0&az=0&yaw=0"
+                "&frame_id=f9&goal_id=g4&generation=5"
+            )
+            response = clients["combined"].post(
+                f"/yopo/plan_full?{query}", data=jpeg_bytes(), content_type="image/jpeg"
+            )
+            self.assertEqual(response.status_code, 200)
+            payload = response.get_json()
+            self.assertIs(payload["planning_authorized"], False)
+            self.assertEqual(
+                payload["planning_reason"], "service-fingerprint-unavailable"
+            )
+            self.assertIsNone(payload["service_fingerprint"])
+            self.assertNotIn("endstate", payload)
+            self.assertEqual(combined_server.yopo_runner.infer_calls, 0)
 
     def test_combined_plan_full_rejects_incomplete_state(self):
         with self.clients() as clients:

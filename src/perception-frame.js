@@ -58,6 +58,7 @@ export class PerceptionFrame {
         actualState,
         referenceState,
         yaw,
+        captureProfile = 'flight',
         projectionConfig = {},
     }) {
         const id = Number(frameId);
@@ -71,6 +72,10 @@ export class PerceptionFrame {
         this.actualState = freezeState(actualState, 'actualState');
         this.referenceState = freezeState(referenceState, 'referenceState', true);
         this.yaw = finiteNumber(yaw, 'yaw');
+        if (captureProfile !== 'flight' && captureProfile !== 'calibration') {
+            throw new TypeError('captureProfile must be "flight" or "calibration"');
+        }
+        this.captureProfile = captureProfile;
         this.projectionConfig = Object.freeze({ ...projectionConfig });
         Object.freeze(this);
     }

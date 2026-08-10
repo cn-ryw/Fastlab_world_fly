@@ -156,6 +156,7 @@ class PanoramaEquirectProjector {
         this.readyFaces = new Set();
         this.faceNames = ['front', 'right', 'back', 'left', 'up', 'down'];
         this.textures = new Map();
+        this.textureSizes = new Map();
 
         this.program = createPanoramaProgram(gl, `
             attribute vec2 a_position;
@@ -298,7 +299,20 @@ class PanoramaEquirectProjector {
         if (!texture || !sourceCanvas || !sourceCanvas.width || !sourceCanvas.height) return;
         gl.bindTexture(gl.TEXTURE_2D, texture);
         gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
-        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, sourceCanvas);
+        const allocated = this.textureSizes.get(name);
+        if (allocated?.width === sourceCanvas.width && allocated?.height === sourceCanvas.height) {
+            gl.texSubImage2D(
+                gl.TEXTURE_2D, 0, 0, 0, gl.RGBA, gl.UNSIGNED_BYTE, sourceCanvas
+            );
+        } else {
+            gl.texImage2D(
+                gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, sourceCanvas
+            );
+            this.textureSizes.set(name, {
+                width: sourceCanvas.width,
+                height: sourceCanvas.height,
+            });
+        }
         this.readyFaces.add(name);
     }
 
@@ -716,7 +730,15 @@ export class CesiumWorld {
         };
     }
 
-    waitForTilesIdle(timeoutMs = 1600, quietMs = 180, tileset = null, loadState = null, renderViewer = null) {
+    waitForTilesIdle(
+        timeoutMs = 1600,
+        quietMs = 180,
+        tileset = null,
+        loadState = null,
+        renderViewer = null,
+        renderTimings = null,
+        signal = null
+    ) {
         const targetTileset = tileset || this.tileset;
         if (!targetTileset) return Promise.resolve(true);
 
@@ -733,12 +755,19 @@ export class CesiumWorld {
 
             const tick = () => {
                 if (done) return;
-                if (
-                    renderViewer &&
-                    (!renderViewer.isDestroyed || !renderViewer.isDestroyed()) &&
-                    renderViewer.scene
-                ) {
+                if (signal?.aborted) return finish(false);
+                const renderViewerDestroyed = renderViewer
+                    && typeof renderViewer.isDestroyed === 'function'
+                    && renderViewer.isDestroyed();
+                if (renderViewer && !renderViewerDestroyed && renderViewer.scene) {
                     renderViewer.scene.requestRender();
+                    const renderStartedAt = performance.now();
+                    this._renderViewerNow(renderViewer);
+                    if (renderTimings && typeof renderTimings === 'object') {
+                        renderTimings.renderMs = (Number(renderTimings.renderMs) || 0)
+                            + performance.now() - renderStartedAt;
+                        renderTimings.renderCount = (Number(renderTimings.renderCount) || 0) + 1;
+                    }
                 }
                 const now = performance.now();
                 const pending = loadState ? loadState.pending : this._tileLoadPending;
@@ -1715,8 +1744,25 @@ export class CesiumWorld {
             error.name = 'AbortError';
             throw error;
         };
-        let renderMs = 0;
-        let yieldMs = 0;
+        let sceneRenderMs = 0;
+        let tileWaitMs = 0;
+        let waitRerenderMs = 0;
+        let faceUploadMs = 0;
+        let projectMs = 0;
+        let schedulerMs = 0;
+        const captureTimings = () => ({
+            scene_render: sceneRenderMs,
+            tile_wait: tileWaitMs,
+            wait_rerender: waitRerenderMs,
+            face_upload: faceUploadMs,
+            project: projectMs,
+            scheduler: schedulerMs,
+            // Backward-compatible aggregate fields. `render` deliberately
+            // excludes tile quiet time, scheduler waits and texture uploads.
+            render: sceneRenderMs + waitRerenderMs,
+            scheduler_yield: schedulerMs,
+            total: performance.now() - totalStartedAt,
+        });
         const faceTileReadiness = [];
         const captureRevision = Number.isSafeInteger(this._panoramaCaptureRevision)
             ? this._panoramaCaptureRevision + 1
@@ -1736,7 +1782,6 @@ export class CesiumWorld {
                 throwIfAborted();
                 const faceDef = PANORAMA_FACE_DEFS[faceIndex];
                 if (progressCb) progressCb(`face ${faceIndex + 1}/${PANORAMA_FACE_DEFS.length} ${faceDef.name}`);
-                const renderStartedAt = performance.now();
                 camera.setView({
                     destination,
                     orientation: {
@@ -1745,11 +1790,16 @@ export class CesiumWorld {
                     },
                 });
                 viewer.scene.requestRender();
+                let sceneRenderStartedAt = performance.now();
                 this._renderViewerNow(viewer);
+                sceneRenderMs += performance.now() - sceneRenderStartedAt;
                 if (frameDelayMs > 0) {
                     await sleep(frameDelayMs);
+                    throwIfAborted();
                     viewer.scene.requestRender();
+                    sceneRenderStartedAt = performance.now();
                     this._renderViewerNow(viewer);
+                    sceneRenderMs += performance.now() - sceneRenderStartedAt;
                 }
                 let faceTilesReady = false;
                 if (captureAnyway) {
@@ -1764,13 +1814,22 @@ export class CesiumWorld {
                         && captureTileset.tilesLoaded === true
                         && queueIdle;
                 } else if (tileTimeoutMs > 0) {
+                    const tileWaitStartedAt = performance.now();
+                    const waitRenderTimings = { renderMs: 0, renderCount: 0 };
                     faceTilesReady = await this.waitForTilesIdle(
                         tileTimeoutMs,
                         tileQuietMs,
                         this._panoramaTileset,
                         this._panoramaTileLoadState,
-                        viewer
+                        viewer,
+                        waitRenderTimings,
+                        signal
                     );
+                    const waitElapsedMs = performance.now() - tileWaitStartedAt;
+                    const waitRenderElapsedMs = Math.max(0, Number(waitRenderTimings.renderMs) || 0);
+                    waitRerenderMs += waitRenderElapsedMs;
+                    tileWaitMs += Math.max(0, waitElapsedMs - waitRenderElapsedMs);
+                    throwIfAborted();
                     if (!faceTilesReady) {
                         return {
                             canvas: null,
@@ -1779,29 +1838,31 @@ export class CesiumWorld {
                             loadingTiles: true,
                             faceIndex,
                             faces: PANORAMA_FACE_DEFS.length,
+                            timings_ms: captureTimings(),
                         };
                     }
                 } else {
                     faceTilesReady = !!captureTileset && captureTileset.tilesLoaded === true;
                 }
+                const faceUploadStartedAt = performance.now();
                 projector.updateFace(faceDef.name, viewer.scene.canvas);
+                faceUploadMs += performance.now() - faceUploadStartedAt;
                 faceTileReadiness.push(Object.freeze({
                     face: faceDef.name,
                     readyWhenCopied: faceTilesReady,
                 }));
-                renderMs += performance.now() - renderStartedAt;
 
                 if ((faceIndex + 1) % facesPerSlice === 0 && faceIndex + 1 < PANORAMA_FACE_DEFS.length) {
                     const yieldStartedAt = performance.now();
                     await yieldFrame();
-                    yieldMs += performance.now() - yieldStartedAt;
+                    schedulerMs += performance.now() - yieldStartedAt;
                 }
             }
 
             throwIfAborted();
             const projectStartedAt = performance.now();
             const canvas = projector.render(width, height, verticalFovDeg, faceFovDeg, topPoleGuardDeg, bottomPoleGuardDeg);
-            const projectMs = performance.now() - projectStartedAt;
+            projectMs = performance.now() - projectStartedAt;
             if (canvas && viewer === this._panoramaViewer && captureTileset === this._panoramaTileset
                 && captureRevision > (this._lastCompletedPanoramaCapture?.revision || 0)) {
                 this._lastCompletedPanoramaCapture = Object.freeze({
@@ -1829,12 +1890,7 @@ export class CesiumWorld {
                 allFacesTileReady: faceTileReadiness.length === PANORAMA_FACE_DEFS.length
                     && faceTileReadiness.every(face => face.readyWhenCopied),
                 faces: PANORAMA_FACE_DEFS.length,
-                timings_ms: {
-                    render: renderMs,
-                    project: projectMs,
-                    scheduler_yield: yieldMs,
-                    total: performance.now() - totalStartedAt,
-                },
+                timings_ms: captureTimings(),
             };
         } finally {
             this._panoramaCaptureActiveCount = Math.max(0, this._panoramaCaptureActiveCount - 1);

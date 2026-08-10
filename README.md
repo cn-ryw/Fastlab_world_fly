@@ -98,7 +98,7 @@ combined 服务与 standalone DA360 服务共享 API v2 深度契约：
 | `POST /yopo/plan_full` | JPEG + 完整状态 → 深度 JPEG 和 identity；仅授权模式返回 YOPO endstate |
 | `POST /yopo/plan` | 兼容/离线调试路径；relative 模式返回 409，不能绕过授权 |
 
-`/yopo/plan_full` 使用 `frame_id/goal_id/generation` 防止旧响应覆盖新会话。前端 `PerceptionFrame` 将 RGB、采集 transform、实际状态、参考状态、yaw 和投影配置绑定为不可变快照，避免把旧 RGB 与新位姿配对。所有 JPEG 深度请求还会用 `X-Projection-Config` 发送该帧的 ERP、上传尺寸和 JPEG 指纹；metric 模式在 GPU 推理前逐字段与 accepted calibration 核对。
+`/yopo/plan_full` 使用 `frame_id/goal_id/generation` 防止旧响应覆盖新会话。前端 `PerceptionFrame` 将 RGB、采集 transform、实际状态、参考状态、yaw、capture profile 和投影配置绑定为不可变快照，避免把旧 RGB 与新位姿配对。所有 JPEG 深度请求还会用 `X-Projection-Config` 发送该帧的 ERP、上传尺寸和 JPEG 指纹；metric 模式在 GPU 推理前逐字段与 accepted calibration 核对。
 
 ## 当前默认值
 
@@ -106,11 +106,13 @@ combined 服务与 standalone DA360 服务共享 API v2 深度契约：
 
 | 参数 | 默认值 |
 |---|---:|
+| `panoProfile` | `flight` |
 | ERP 输出 | 384×192 |
 | `panoFace` | 96 |
 | `panoFacesPerSlice` | 2 |
 | `panoMs` | 20ms |
 | `depthMs` | 20ms |
+| `yopoMaxFrameAgeMs` | 250ms（轨迹应用硬上限） |
 | `panoFrameDelayMs` | 0ms |
 | `da360UploadScale` | 0.35 |
 | `DA360_INPUT_SCALE` | 0.46（约 476×238） |
@@ -138,17 +140,29 @@ http://127.0.0.1:8080/?panoTopPoleGuard=0&panoBottomPoleGuard=0
 - `1/z = a·pred_disp+b` 的单次 Huber 拟合、留出验证和 fail-closed 标定加载
 - `PerceptionFrame` 原子绑定 RGB 与采集/规划上下文
 - `window.__captureMetricCalibration(locationId, options)` 从同一冻结帧导出同一 `captureId` 的 RGB、anchors、manifest 和 raw NPZ
+- `flight`/`calibration` 两套 capture profile；标定导出只接受 `calibration`，设置飞行目标会强制切回 `flight`
 
-当前 `../experiment_data/depth_calibration.json` 的 `a/b` 仍为 null，没有任何标定通过验收。原子导出已实现，但 4 地点×3 静止姿态的实际采集、leave-one-location-out 报告和 accepted calibration 仍待完成。
+2026-08-10 已完成 4 地点×3 静止姿态、共 12 captures 的原子采集和 leave-one-location-out 拟合。证据在 `../experiment_data/metric_fit-lolo-20260810-12capture/fit_report.json`；样本为 site-a `try-03/04/05`、site-b `try-01/02/03`、site-c `try-02/03/04`、site-d `try-02/04/05`。四件套、地点覆盖、指纹和 LOLO 完整性均通过：1536 个 anchors 中 1140 个有效（74.22%），其中 833 个在 0.5–20m 范围。
 
-标定采集应显式使用 `panoCaptureAnyway=0`，让六个 cubemap 面逐面等待 tiles ready；同时把所有会进入 projection fingerprint 的参数写在 URL 中。例如当前 smoke 配置：
+不过，**拟合结果未通过精度门禁**。报告中的 `success=true` 只表示 fitter 正常完成，不等于 calibration accepted；最终 acceptance 为 false：
+
+| 留出地点 | median AbsRel | p90 AbsRel | 10m 内 p90 绝对误差 |
+|---|---:|---:|---:|
+| site-a | 0.399 | 0.544 | 3.326m |
+| site-b | 0.366 | 2.125 | 5.959m |
+| site-c | 0.383 | 0.443 | 3.545m |
+| site-d | 0.313 | 0.982 | 4.051m |
+
+对应门禁分别为 ≤0.15、≤0.30、≤1m，四个 LOLO fold 均失败。全量 scale-only 候选为 `a=0.0011892812185910185,b=0`，全量 median AbsRel=0.376、p90 AbsRel=1.507、10m 内 p90 绝对误差=4.054m；它只能保留作诊断候选，不能安装。`../experiment_data/depth_calibration.json` 仍为 `a/b=null`，在线模式继续保持 `da360-relative` 并拒绝应用轨迹。
+
+标定采集必须显式使用 `panoProfile=calibration`，让六个 cubemap 面逐面等待 tiles ready；同时把所有会进入 projection fingerprint 的参数写在 URL 中。旧参数 `panoCaptureAnyway=0` 仅保留为向后兼容映射，不应再作为新命令的主入口。例如：
 
 ```bash
 ./launch-firefox-gpu.sh \
-'http://127.0.0.1:8080/?panoPreloadRequired=0&panoWidth=384&panoHeight=192&panoFace=96&panoVfov=180&panoJpeg=0.74&da360UploadScale=0.35&panoCaptureAnyway=0&panoFaceTileTimeoutMs=6000&panoFaceTileQuietMs=650'
+'http://127.0.0.1:8080/?panoProfile=calibration&panoPreloadRequired=0&panoWidth=384&panoHeight=192&panoFace=96&panoVfov=180&panoJpeg=0.74&da360UploadScale=0.35&panoFaceTileTimeoutMs=6000&panoFaceTileQuietMs=650'
 ```
 
-在无人机静止、没有活动目标且已有完整 `PerceptionFrame` 时，可从 Firefox 控制台一次导出四个同 ID 文件。逐面等瓦片可能让一次 capture 超过 1 秒，因此显式给出只用于静态标定的 freshness 窗口：
+在无人机静止、没有活动目标且已有完整 `PerceptionFrame` 时，可从 Firefox 控制台一次导出四个同 ID 文件。上述标定 URL 对每个面设置 650ms tile quiet，六面理论静默等待就是 3.9s；加上渲染、复制和投影后，实测约 4.2s/capture。旧日志把等待时间合并进 `render`，不能据此断言 GPU 渲染本身耗时 4.1s。该等待只用于静态标定，因此显式给出较宽的 freshness 窗口：
 
 ```js
 await window.__captureMetricCalibration('site-a', {
@@ -161,8 +175,7 @@ await window.__captureMetricCalibration('site-a', {
 
 `manifest.json` 记录 session/frame/capture/location ID、RGB/raw/anchors SHA、pose、capture transform、ERP/JPEG/上传尺寸配置和模型 metadata。默认会触发四次下载；传入 `{ download: false }` 可只返回内存中的 artifacts。同一帧和同一 capture ID 不能重复消费，fitter 还会拒绝重复 RGB、raw 和近重复姿态。
 
-拟合示例（从每个地点的三个不同静止姿态各采一次，共 4 地点×3 capture；
-下面命令会把 12 组四件套完整展开）：
+若重采或复现实验，拟合命令仍要求每个地点三个不同静止姿态、共 4 地点×3 capture；下面是通用展开模板，不代表上述已归档样本的实际 ID：
 
 ```bash
 fit_args=()
@@ -191,6 +204,10 @@ DA360_DEPTH_CALIB_PATH_HOST=/absolute/path/to/depth_calibration.json \
 
 标定缺失、未通过或模型/模型输入尺寸/请求 RGB 尺寸/runtime projection/JPEG/resample/checkpoint 指纹不匹配时，metric 模式会在进入 GPU 前拒绝启动或请求，不会静默伪装成米制深度。Anchor 还要求六个 cubemap 面在各自像素被复制时均已报告 tiles ready；仅在导出时看到 tiles idle 不算合格。
 
+### DA360 输入分辨率 pilot
+
+2026-08-10 的 native-resolution pilot 使用同一张解码后仅 134×67 的 JPEG，分别送入 476×238 和 1036×518 模型输入。同步推理从 25.6ms 增至 151.9ms（5.94×）。site-d 指标仅小幅混合变化，而 site-a 明显恶化：median AbsRel 0.276→0.569、p90 0.544→2.468、10m 内 p90 误差 2.666→19.945m。由于上游 JPEG 没有新增空间信息，**不要把 live `DA360_INPUT_SCALE` 从约 476×238 改到 1036×518**；该 pilot 否决了升分辨率候选，不构成 metric 验收。
+
 ## 测试与当前门禁
 
 ```bash
@@ -215,12 +232,17 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
 
 也可以在装齐测试依赖的宿主环境中运行 backend contract。宿主缺少 Flask 时，`tests/test_backend_contract.py` 会在 module level 标记 skip，而不是 collection 失败；要获得 contract 通过证据，必须在 combined 镜像中运行或先安装 Flask，并将 skip 与 pass 分开报告。
 
-2026-08-10 当前收口证据：15 个 JS 测试文件通过；默认 Python 为 50 passed、1 skipped、19 deselected；镜像内 backend contract 18/18；真实 CUDA 服务的 19 项 integration 全部通过。Firefox 已加载完整仿真 URL，但尚未人工完成出生点后的 depth canvas 与导航状态验收。
+当前工作树的自动测试已复验通过；精确的 passed/skipped/deselected 计数以最终 test sweep 保存的原始输出为准，不在这里绑定。真实 Firefox+GPU、live 服务加载当前工作树后的端到端链路和可信 15Hz 仍未验收；旧 CUDA integration 或旧镜像结果不能替代这些 live 证据。
 
 真实 flight log 和同场景质量数据生成后，使用已实现的门禁工具出报告：
 
 ```bash
-python3 scripts/evaluate_closed_loop.py flight-log.json --output closed-loop-report.json
+python3 scripts/evaluate_closed_loop.py flight-log.json \
+  --warmup-frames 30 \
+  --min-duration-s 60 \
+  --min-planning-frames 900 \
+  --min-physics-coverage 0.95 \
+  --output closed-loop-report.json
 python3 scripts/evaluate_perception_quality.py \
   --baseline baseline.npz \
   --candidate 6x96-sse512=candidate-96.npz \
@@ -229,7 +251,34 @@ python3 scripts/evaluate_perception_quality.py \
   --output perception-quality-report.json
 ```
 
-六面 capture 已改为每两面向浏览器调度器让出一次，并记录 render/project/scheduler/network/DA360/YOPO/capture-to-apply 等分段指标；这只证明调度机制存在，不证明吞吐已达标。2026-08-09 修复前日志只有约 3.1Hz depth、2.9Hz YOPO；当前实现尚未在真实 Firefox+GPU+城市 tiles 上证明 15Hz，也尚未完成 DA360 metric 或低空闭环门禁。详见 `docs/implementation-status-v2.md`。
+evaluator v2 会先丢弃 30 个合法唯一 planning frames，再要求至少 60s、900 个计量 frames。每份日志必须声明且只包含一个 `navigationSession(goalId,generation)`，其中 generation 必须是非负 JavaScript-safe integer；日志还需提供有限的 `monotonicStartMs` 和正数 `duration_s`。所有合法 apply 时间都必须落在声明的 session 起点至终点内（终点只容许 5.1ms 的日志取整余量）；第一次和最后一次合法 apply 距相应 session 边界都不得超过 `250+5.1ms`，避免用中段高频规划掩盖目标刚设置后或结束前的停摆。每帧必须有浏览器实际轨迹安装回执 `trajectoryApplied=true`、完整 goal/generation/frame identity、允许的 `da360-metric` 或 `cesium-truth`、稳定且非空的 calibration ID 与 service fingerprint，以及严格递增的 apply/physics 时间。任何声称 applied 或 `trajectoryApplied=true` 的 planning 事件，都必须同时满足 `outcome=applied`、`planningAuthorized=true` 和 `trajectoryApplied=true`；blocked/rejected/unauthorized 事件不得声称轨迹已安装。日志中的 `resolvedUrl` 只接受本机 `127.0.0.1|localhost` 的 `/|/index.html` 入口，采用已审查的全景/性能参数正向白名单，并保留实际影响预加载/cache 状态的 5 个 `flightPreload*` 数值参数；userinfo、fragment、端点 URL、未知参数及 token/secret/password/API key/auth/credential 等查询项均不记录。evaluator 会再次独立校验该 URL，缺失、解析失败、非本机/非法路径或重复参数均 fail closed。
+
+物理时间戳还必须覆盖至少 95% 的 planning 计量窗口，并满足最小帧数 `ceil(measurementDurationMs × 0.95 / 33.3ms) + 1`；窗口恰为 60s 时至少需要 1713 个 physics frames，不能用首尾两个时间戳伪造 p95。`da360-relative`、只收到服务响应、重复帧、矛盾回执、session 越界或指纹漂移都会 fail closed；因此当前 relative 模式不可能被误报成 15Hz 通过。
+
+六面 capture 仍是六次 Cesium scene render，并按 `panoFacesPerSlice=2` 向浏览器调度器 yield；projector texture 在尺寸不变时改用 `texSubImage2D` 复用。timing 现拆为 `scene_render`、`tile_wait`、`wait_rerender`、`face_upload`、`project`、`scheduler`、HTTP body/header、DA360、YOPO 和 trajectory/depth apply。它们只提供归因证据，不证明吞吐达标。2026-08-09 修复前日志只有约 3.1Hz depth、2.9Hz YOPO；当前实现尚未在真实 Firefox+GPU+城市 tiles 上证明 15Hz，也尚未完成 DA360 metric 或低空闭环门禁。
+
+流水化不会再因 RGB N+1 先完成就丢弃仍新鲜的规划响应 N：轨迹应用只核对 goal/generation/mode 和 250ms 硬龄限；canvas 则按递增 request ID 显示最新可用 depth。因此画面允许比当前 RGB 落后一帧，日志用 `depthPreviewLagFrames/depthPreviewAgeMs` 明示，而旧会话或已被更新 depth 超越的结果仍 fail closed。规划 control outcome 在 JPEG 解码前同步记录且每请求唯一；随后画面成功、失败或 stale 只产生 `mode=depth-preview` diagnostic，不进入 15Hz 规划计数。
+
+2026-08-11 的最小 live performance smoke 应显式使用 flight profile，避免把标定的 6×650ms tile quiet 带入飞行链路：
+
+```bash
+./launch-firefox-gpu.sh \
+'http://127.0.0.1:8080/?panoProfile=flight&panoPreloadRequired=0&panoWidth=384&panoHeight=192&panoFace=96&panoFacesPerSlice=2&panoVfov=180&panoJpeg=0.74&da360UploadScale=0.35&panoMs=20&depthMs=20&panoramaTileSse=512'
+```
+
+如果当前地址仍含旧 `panoCaptureAnyway=0`，单独执行 `location.reload()` 会原样保留查询参数，页面仍会进入 `calibration`。最稳妥的做法是直接打开上面的显式 `panoProfile=flight` URL；也可在当前 Firefox 控制台执行下列命令，删除 legacy/别名参数、写入显式 flight profile 后跳转：
+
+```js
+(() => {
+  const url = new URL(location.href);
+  url.searchParams.delete('panoCaptureAnyway');
+  url.searchParams.delete('panoCaptureProfile');
+  url.searchParams.set('panoProfile', 'flight');
+  location.assign(url.href);
+})();
+```
+
+页面重新就绪后用 `window.__getPanoramaCaptureProfile()` 核对返回值为 `flight`。`window.__setPanoramaCaptureProfile('flight')` 只切换当前页面运行态并取消在途 capture；若地址仍含 legacy 参数，下一次 reload 仍会按 URL 恢复为 calibration。设置目标也会自动强制 flight。本次 smoke 先保存 timing 拆分和原始 log；只有 evaluator v2 对授权 metric/truth 的实际轨迹回执报告通过，才能称为 15Hz。`cesium-truth` dense depth 目前只有 PostProcessStage depthTexture→eye-space ray range→RGB24/ERP→单次 readback→anchor parity 的设计，尚未实现或 live smoke，`/yopo/plan_depth` 二进制路由也不存在。详见 `docs/implementation-status-v2.md`。
 
 ## Git 与依赖
 

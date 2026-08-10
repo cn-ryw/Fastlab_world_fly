@@ -1,22 +1,22 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "selectionPolicy": "first passing candidate in highest-quality order",
   "baseline": {
     "label": "6x144-sse96",
-    "query": "panoFace=144&panoramaTileSse=96"
+    "query": "panoProfile=flight&panoFace=144&panoramaTileSse=96"
   },
   "candidates": [
     {
       "label": "6x96-sse512",
-      "query": "panoFace=96&panoramaTileSse=512"
+      "query": "panoProfile=flight&panoFace=96&panoramaTileSse=512"
     },
     {
       "label": "6x80-sse768",
-      "query": "panoFace=80&panoramaTileSse=768"
+      "query": "panoProfile=flight&panoFace=80&panoramaTileSse=768"
     },
     {
       "label": "6x64-sse1024",
-      "query": "panoFace=64&panoramaTileSse=1024"
+      "query": "panoProfile=flight&panoFace=64&panoramaTileSse=1024"
     }
   ],
   "qualityGates": {
@@ -31,5 +31,36 @@
     "captureToApplyP95MsMax": 150.0,
     "physicsUpdateIntervalP95MsMax": 33.3,
     "warmServerP95MsMax": 50.0
+  },
+  "closedLoopEvidence": {
+    "flightLogSchemaVersionMin": 2,
+    "warmupLegalPlanningFrames": 30,
+    "measuredDurationSMin": 60.0,
+    "measuredPlanningFramesMin": 900,
+    "planningObservationHardAgeMsMax": 250.0,
+    "physicsMeasurementCoverageMin": 0.95,
+    "physicsFramesRequiredFormula": "ceil(measuredDurationS*1000*physicsMeasurementCoverageMin/physicsUpdateIntervalP95MsMax)+1",
+    "physicsFramesMinAt60S": 1713,
+    "allowedDepthModes": [
+      "da360-metric",
+      "cesium-truth"
+    ],
+    "requireTrajectoryApplied": true,
+    "requireNoContradictoryPlanningEvents": true,
+    "requireStableCalibrationId": true,
+    "requireStableServiceFingerprint": true,
+    "requireUniquePlanningIdentity": true,
+    "requireSingleDeclaredNavigationSession": true,
+    "requireAllPlanningEventsMatchNavigationSession": true,
+    "requireMonotonicTimestamps": true,
+    "requireFiniteMonotonicStartMs": true,
+    "requirePositiveSessionDuration": true,
+    "requireSafeResolvedUrl": true,
+    "requirePlanningEventsWithinSession": true,
+    "requirePlanningFromSessionBeginning": true,
+    "requirePlanningThroughSessionEnd": true,
+    "planningSessionHeadGapMsMaxFormula": "planningObservationHardAgeMsMax + sessionEndRoundingToleranceMs",
+    "planningSessionTailGapMsMaxFormula": "planningObservationHardAgeMsMax + sessionEndRoundingToleranceMs",
+    "sessionEndRoundingToleranceMs": 5.1
   }
 }
