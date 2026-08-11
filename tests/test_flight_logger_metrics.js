@@ -12,6 +12,7 @@ Object.defineProperty(globalThis, 'location', {
     value: {
         href: 'https://pilot:login-secret@127.0.0.1:8080/'
             + '?panoProfile=flight&panoFacesPerSlice=2'
+            + '&panoramaFarMeters=1200&panoramaLeanStreaming=1'
             + '&flightPreloadRadius=800&flightPreloadMinCoverage=0.97'
             + '&flightPreloadViewTimeoutMs=25000&flightPreloadViewAttempts=3'
             + '&flightPreloadStrict=1'
@@ -74,6 +75,18 @@ logger.recordPerception({
     mode: 'planning', outcome: 'stale', dropReason: 'old-frame',
 });
 logger.recordPerception({
+    frameId: 22, goalId: 'goal-1', generation: 1,
+    mode: 'planning', outcome: 'ignored', planningAuthorized: true,
+    trajectoryApplied: false, trajectoryIgnored: true,
+    dropReason: 'terminal-committed',
+});
+logger.recordPerception({
+    frameId: 23, goalId: 'goal-1', generation: 1,
+    mode: 'planning', outcome: 'rejected', planningAuthorized: true,
+    trajectoryApplied: false, trajectoryIgnored: false,
+    dropReason: 'trajectory-apply-rejected',
+});
+logger.recordPerception({
     frameId: 3, goalId: 'goal-1', generation: 1,
     mode: 'planning', outcome: 'applied', planningAuthorized: false,
     dropReason: 'da360-relative-is-preview-only',
@@ -134,6 +147,9 @@ logger.stop(false);
 
 const log = JSON.parse(await downloadedBlob.text());
 assert.equal(log.perf.uniquePlanningFrames, 1, 'duplicate applies for one frame count once');
+assert.equal(log.perf.planningIgnoredFrames, 1);
+assert.equal(log.perf.planningRejectedFrames, 1);
+assert.equal(log.perf.droppedByReason['terminal-committed'], 1);
 assert.equal(log.perf.droppedByReason['old-frame'], 1);
 assert.equal(log.perf.droppedByReason['da360-relative-is-preview-only'], 1);
 assert.equal(log.perf.captureToApplyP95Ms, 60);
@@ -181,7 +197,7 @@ assert.equal(log.perception[0].terminalAccelerationMps2, 5);
 assert.equal(log.perception[0].trajectoryTimeS, 1.125);
 assert.deepEqual(log.perf.calibrationIds, ['cal-1']);
 assert.ok(log.perf.physicsUpdateIntervalP95Ms >= 0);
-assert.equal(log.perception.length, 5);
+assert.equal(log.perception.length, 7);
 assert.equal(log.perf.crossSessionPerceptionDropped, 2);
 assert.deepEqual(log.navigationSession, { goalId: 'goal-1', generation: '1' });
 assert.equal(log.schemaVersion, 2);
@@ -207,6 +223,8 @@ assert.equal(loggedUrl.password, '');
 assert.equal(loggedUrl.hash, '');
 assert.equal(loggedUrl.searchParams.get('panoProfile'), 'flight');
 assert.equal(loggedUrl.searchParams.get('panoFacesPerSlice'), '2');
+assert.equal(loggedUrl.searchParams.get('panoramaFarMeters'), '1200');
+assert.equal(loggedUrl.searchParams.get('panoramaLeanStreaming'), '1');
 assert.equal(loggedUrl.searchParams.get('flightPreloadRadius'), '800');
 assert.equal(loggedUrl.searchParams.get('flightPreloadMinCoverage'), '0.97');
 assert.equal(loggedUrl.searchParams.get('flightPreloadViewTimeoutMs'), '25000');

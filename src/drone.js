@@ -90,6 +90,11 @@ const TERMINAL_TRACK_MAX_ACCELERATION_MPS2 = 25.0;
 const TERMINAL_DECELERATION_COMMAND_LIMIT_MPS2 = 25.0;
 const TERMINAL_DECELERATION_MAX_TILT_DEG = 60.0;
 const TERMINAL_DECELERATION_ATTITUDE_RESPONSE_S = 0.075;
+const YOPO_INTAKE_ACCEPT = Object.freeze({ outcome: 'accept', reason: null });
+const YOPO_INTAKE_TERMINAL_COMMITTED = Object.freeze({
+    outcome: 'ignored',
+    reason: 'terminal-committed',
+});
 
 // Reusable PlayCanvas math objects (avoid per-frame allocation)
 const _quat  = new pc.Quat();
@@ -258,6 +263,8 @@ export class Drone {
         this._terminalDecelerationElapsedS = 0;
         this._terminalDecelerationAnchor = null;
         this._terminalPredictedStopGoalDistanceM = null;
+        this._goalReached = false;
+        this._goalReachedSimTimeS = null;
         this._trajectoryApplyPositionErrorM = null;
         this._trajectoryApplyVelocityErrorMps = null;
 
@@ -373,6 +380,10 @@ export class Drone {
                     ? this._terminalPredictedStopGoalDistanceM
                     : null,
             terminalDecelerationElapsedS: Number(this._terminalDecelerationElapsedS || 0),
+            goalReached: !!this._goalReached,
+            goalReachedSimTimeS: Number.isFinite(this._goalReachedSimTimeS)
+                ? this._goalReachedSimTimeS
+                : null,
             fallbackReason: reason,
             overrunCount: Number(this._controlDiagnostics?.overrunCount || 0),
             overrunDroppedSeconds: Number(this._controlDiagnostics?.overrunDroppedSeconds || 0),
@@ -449,6 +460,8 @@ export class Drone {
         this._terminalDecelerationElapsedS = 0;
         this._terminalDecelerationAnchor = null;
         this._terminalPredictedStopGoalDistanceM = null;
+        this._goalReached = false;
+        this._goalReachedSimTimeS = null;
         this._trajectoryApplyPositionErrorM = null;
         this._trajectoryApplyVelocityErrorMps = null;
     }
@@ -651,6 +664,16 @@ export class Drone {
         this._latchSo3Hold('cancelled');
         this._navigationState = 'cancelled';
         this._navigationTransitionReason = 'cancelled';
+    }
+
+    /** Tell perception whether a fresh rolling candidate can currently own motion. */
+    getYopoTrajectoryIntakeDisposition() {
+        return this._terminalPhase === 'terminal-track'
+            || this._terminalPhase === 'terminal-decelerating'
+            || this._terminalPhase === 'settling'
+            || this._terminalPhase === 'arrived'
+            ? YOPO_INTAKE_TERMINAL_COMMITTED
+            : YOPO_INTAKE_ACCEPT;
     }
 
     /** 载入 YOPO 轨迹末端状态 → 拟合五次多项式。 */
@@ -926,12 +949,21 @@ export class Drone {
             this._lastYopoRejectReason = reason;
             this._lastYopoRejectAt = now;
         }
-        if (!preserveActive || !this._trajectory.active) {
+        const preservedActiveTrajectory = preserveActive && this._trajectory.active;
+        if (!preservedActiveTrajectory) {
             this._trajectory.clear('trajectory-rejected');
             this._latchSo3Hold('trajectory-rejected');
         }
-        this._navigationTransitionReason = 'trajectory-rejected';
-        this._replanRequested = true;
+        this._navigationTransitionReason = preservedActiveTrajectory
+            ? 'trajectory-candidate-rejected-active-preserved'
+            : 'trajectory-rejected';
+        // A rolling candidate may have been captured while the vehicle was
+        // still following the previous plan. At 200+ ms capture-to-apply age,
+        // a 3--5 m/s suffix mismatch is expected and must reject only that
+        // candidate. The still-valid command and ordinary rolling cadence are
+        // retained; command expiry/fault handling remains responsible for an
+        // epoch-changing immediate replan.
+        if (!preservedActiveTrajectory) this._replanRequested = true;
         return false;
     }
 
@@ -1081,6 +1113,13 @@ export class Drone {
             this._idealGoal.z - this.z,
         );
         const speedMps = Math.hypot(this.vx, this.vy, this.vz);
+        if (!this._goalReached && !this.isColliding && distanceM <= this._arrivalDistanceM) {
+            // `goalReached` is an observation event only. It deliberately does
+            // not clear the goal or truncate the active path: settled arrival
+            // remains a separate low-speed, collision-free terminal state.
+            this._goalReached = true;
+            this._goalReachedSimTimeS = this._simTimeS;
+        }
         const terminalOwnsMotion = this._terminalPhase === 'terminal-track'
             || this._terminalPhase === 'terminal-decelerating'
             || this._terminalPhase === 'settling';

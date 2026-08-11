@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# MindCloud World Fly — verified local-only service launcher
+# MindCloud World Fly — local-only service launcher
 set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -18,8 +18,7 @@ YOPO_MODEL="${YOPO_MODEL_PATH_HOST:-/home/ykx/ros1/YOPO_360_v15/YOPO/saved/YOPO_
 YOPO_CONFIG_NAME="${YOPO_CONFIG:-x5_cruise15_18m_a12_mask_wc3.yaml}"
 YOPO_CONFIG_PATH="$SCRIPT_DIR/third_party/YOPO/config/$YOPO_CONFIG_NAME"
 YOPO_BASE_CONFIG_PATH="$SCRIPT_DIR/third_party/YOPO/config/traj_opt.yaml"
-DEPENDENCY_LOCK="$SCRIPT_DIR/dependencies.lock.json"
-IMAGE_RECIPE="$SCRIPT_DIR/Dockerfile.da360-yopo"
+DEPENDENCY_MANIFEST="$SCRIPT_DIR/dependencies.versions.json"
 STARTUP_TIMEOUT="${MINDCLOUD_STARTUP_TIMEOUT:-180}"
 DEFAULT_CALIBRATION_FILE="$SCRIPT_DIR/../experiment_data/depth_calibration.json"
 DEPTH_MODE="${DA360_DEPTH_MODE:-da360-metric}"
@@ -107,11 +106,11 @@ try:
     p = json.load(sys.stdin)
 except (json.JSONDecodeError, OSError, TypeError):
     raise SystemExit(1)
-expected_sha, expected_mode, expected_resample, expected_channels, expected_scale = sys.argv[1:]
+expected_model, expected_mode, expected_resample, expected_channels, expected_scale = sys.argv[1:]
 valid = (
     p.get("ok") is True
     and p.get("api_version") == 2
-    and p.get("checkpoint", {}).get("sha256") == expected_sha
+    and p.get("model") == expected_model
     and p.get("depth_mode") == expected_mode
     and (
         expected_mode != "da360-metric"
@@ -129,7 +128,7 @@ valid = (
     and abs(float(p.get("input_scale")) - float(expected_scale)) < 0.02
 )
 raise SystemExit(0 if valid else 1)
-' "$DA360_SHA256" "$DEPTH_MODE" \
+' "$(basename "$DA360_MODEL" .pth)" "$DEPTH_MODE" \
           "$RESAMPLE" "${DA360_CHANNELS_LAST:-0}" \
           "$INPUT_SCALE"
 }
@@ -146,13 +145,14 @@ except (json.JSONDecodeError, OSError, TypeError):
 valid = (
     p.get("ok") is True
     and p.get("api_version") == 2
-    and p.get("checkpoint_sha256") == sys.argv[1]
-    and p.get("config_sha256") == sys.argv[2]
-    and p.get("base_config_sha256") == sys.argv[3]
+    and p.get("model") == sys.argv[1]
+    and p.get("config") == sys.argv[2]
+    and p.get("base_config") == sys.argv[3]
+    and bool(p.get("service_session_id"))
     and p.get("planning_authorized") is (sys.argv[4] == "da360-metric")
 )
 raise SystemExit(0 if valid else 1)
-' "$YOPO_SHA256" "$YOPO_CONFIG_SHA256" "$YOPO_BASE_CONFIG_SHA256" "$DEPTH_MODE"
+' "$(basename "$YOPO_MODEL")" "$YOPO_CONFIG_NAME" "$(basename "$YOPO_BASE_CONFIG_PATH")" "$DEPTH_MODE"
 }
 
 web_health_ok() {
@@ -185,7 +185,7 @@ echo "========================================="
 
 echo ""
 echo "=== 1/4 预检 ==="
-for command_name in docker curl python3 nvidia-smi sha256sum readlink nohup setsid; do
+for command_name in docker curl python3 nvidia-smi readlink nohup setsid; do
     require_command "$command_name"
 done
 [[ "$WEB_PORT" =~ ^[0-9]+$ ]] || die "invalid web port: $WEB_PORT"
@@ -207,7 +207,7 @@ python3 -c 'import sys; value=float(sys.argv[1]); assert 0.2 <= value <= 1.0' "$
 [[ -s "$YOPO_MODEL" ]] || die "YOPO checkpoint missing or empty: $YOPO_MODEL"
 [[ -s "$YOPO_CONFIG_PATH" ]] || die "YOPO config missing or empty: $YOPO_CONFIG_PATH"
 [[ -s "$YOPO_BASE_CONFIG_PATH" ]] || die "YOPO base config missing or empty: $YOPO_BASE_CONFIG_PATH"
-[[ -s "$DEPENDENCY_LOCK" ]] || die "dependency lock missing or empty: $DEPENDENCY_LOCK"
+[[ -s "$DEPENDENCY_MANIFEST" ]] || die "dependency version manifest missing or empty: $DEPENDENCY_MANIFEST"
 CALIBRATION_FILE=""
 if [[ -n "${DA360_DEPTH_CALIB_PATH_HOST:-}" ]]; then
     [[ -s "$DA360_DEPTH_CALIB_PATH_HOST" ]] \
@@ -228,62 +228,13 @@ nvidia-smi -L >/dev/null 2>&1 || die "NVIDIA GPU/driver is unavailable"
 
 DA360_MODEL="$(readlink -f "$DA360_MODEL")"
 YOPO_MODEL="$(readlink -f "$YOPO_MODEL")"
-DA360_SHA256="$(sha256sum "$DA360_MODEL" | awk '{print $1}')"
-YOPO_SHA256="$(sha256sum "$YOPO_MODEL" | awk '{print $1}')"
-YOPO_CONFIG_SHA256="$(sha256sum "$YOPO_CONFIG_PATH" | awk '{print $1}')"
-YOPO_BASE_CONFIG_SHA256="$(sha256sum "$YOPO_BASE_CONFIG_PATH" | awk '{print $1}')"
-DEPENDENCY_LOCK_SHA256="$(sha256sum "$DEPENDENCY_LOCK" | awk '{print $1}')"
-IMAGE_RECIPE_SHA256="$(sha256sum "$IMAGE_RECIPE" | awk '{print $1}')"
-python3 "$SCRIPT_DIR/scripts/verify_dependencies.py" --skip-checkpoints \
-    || die "browser/source dependency lock verification failed"
-readarray -t LOCKED_SHA256 < <(python3 - "$DEPENDENCY_LOCK" <<'PY'
-import json, sys
-with open(sys.argv[1], encoding="utf-8") as stream:
-    lock = json.load(stream)
-print(lock["model_checkpoints"]["da360_large"]["sha256"])
-print(lock["model_checkpoints"]["yopo_epoch10"]["sha256"])
-print(lock["runtime_dependencies"]["yopo_config"]["sha256"])
-print(lock["runtime_dependencies"]["yopo_config"]["base_sha256"])
-print(lock["container_images"]["yopo_base"]["reference"])
-print(lock["container_images"]["yopo_base"]["local_image_id"])
-PY
-)
-[[ "$DA360_SHA256" == "${LOCKED_SHA256[0]:-}" ]] \
-    || die "DA360 checkpoint does not match dependencies.lock.json"
-[[ "$YOPO_SHA256" == "${LOCKED_SHA256[1]:-}" ]] \
-    || die "YOPO checkpoint does not match dependencies.lock.json"
-[[ "$YOPO_CONFIG_SHA256" == "${LOCKED_SHA256[2]:-}" ]] \
-    || die "YOPO config does not match dependencies.lock.json"
-[[ "$YOPO_BASE_CONFIG_SHA256" == "${LOCKED_SHA256[3]:-}" ]] \
-    || die "YOPO base config does not match dependencies.lock.json"
-IMAGE_BASE_LABEL="$(docker image inspect --format '{{ index .Config.Labels "mindcloud.yopo_base_image" }}' "$API_IMAGE" 2>/dev/null || true)"
-IMAGE_LOCK_LABEL="$(docker image inspect --format '{{ index .Config.Labels "mindcloud.dependencies_lock_sha256" }}' "$API_IMAGE" 2>/dev/null || true)"
-IMAGE_RECIPE_LABEL="$(docker image inspect --format '{{ index .Config.Labels "mindcloud.image_recipe_sha256" }}' "$API_IMAGE" 2>/dev/null || true)"
-[[ -n "$IMAGE_BASE_LABEL" && "$IMAGE_BASE_LABEL" == "${LOCKED_SHA256[4]:-}" ]] \
-    || die "Docker image base label is missing or does not match dependencies.lock.json; rebuild Dockerfile.da360-yopo"
-[[ -n "$IMAGE_LOCK_LABEL" && "$IMAGE_LOCK_LABEL" == "$DEPENDENCY_LOCK_SHA256" ]] \
-    || die "Docker image dependency-lock label is missing or stale; rebuild Dockerfile.da360-yopo"
-[[ -n "$IMAGE_RECIPE_LABEL" && "$IMAGE_RECIPE_LABEL" == "$IMAGE_RECIPE_SHA256" ]] \
-    || die "Docker image recipe label is missing or stale; rebuild Dockerfile.da360-yopo with the documented build args"
-docker image inspect "$API_IMAGE" "${LOCKED_SHA256[4]:-}" | python3 -c '
-import json, sys
-
-images = json.load(sys.stdin)
-if len(images) != 2:
-    raise SystemExit(1)
-candidate, base = images
-if base.get("Id") != sys.argv[1]:
-    raise SystemExit(1)
-candidate_layers = candidate.get("RootFS", {}).get("Layers", [])
-base_layers = base.get("RootFS", {}).get("Layers", [])
-if not base_layers or candidate_layers[:len(base_layers)] != base_layers:
-    raise SystemExit(1)
-' "${LOCKED_SHA256[5]:-}" \
-    || die "Docker image does not descend from the locked local YOPO base image"
-echo "  DA360: $(basename "$DA360_MODEL") sha256=${DA360_SHA256:0:16}..."
-echo "  YOPO:  $(basename "$YOPO_MODEL") sha256=${YOPO_SHA256:0:16}..."
-echo "  config: traj_opt.yaml sha256=${YOPO_BASE_CONFIG_SHA256:0:16}... + $YOPO_CONFIG_NAME sha256=${YOPO_CONFIG_SHA256:0:16}..."
-echo "  image:  base=${IMAGE_BASE_LABEL} lock=${IMAGE_LOCK_LABEL:0:16}... recipe=${IMAGE_RECIPE_LABEL:0:16}..."
+python3 "$SCRIPT_DIR/scripts/verify_dependencies.py" \
+    --da360-model "$DA360_MODEL" --yopo-model "$YOPO_MODEL" \
+    || die "runtime dependency version verification failed"
+echo "  DA360: $(basename "$DA360_MODEL")"
+echo "  YOPO:  $(basename "$YOPO_MODEL")"
+echo "  config: $(basename "$YOPO_BASE_CONFIG_PATH") + $YOPO_CONFIG_NAME"
+echo "  image:  $API_IMAGE"
 
 OWNED_WEB_PIDS=()
 if [[ -f "$PID_FILE" ]]; then
@@ -335,11 +286,7 @@ run_args=(
     -v "$SCRIPT_DIR/third_party/DA360:/opt/DA360:ro"
     -v "$SCRIPT_DIR/third_party/YOPO:/opt/YOPO_360/YOPO:ro"
     -v "$SCRIPT_DIR/scripts:/opt/server:ro"
-    -e "DA360_MODEL_SHA256=$DA360_SHA256"
-    -e "YOPO_MODEL_SHA256=$YOPO_SHA256"
     -e "YOPO_CONFIG=$YOPO_CONFIG_NAME"
-    -e "YOPO_CONFIG_SHA256=$YOPO_CONFIG_SHA256"
-    -e "YOPO_BASE_CONFIG_SHA256=$YOPO_BASE_CONFIG_SHA256"
     -e "DA360_INPUT_SCALE=$INPUT_SCALE"
     -e "DA360_DEPTH_SCALE=${DA360_DEPTH_SCALE:-2.0}"
     -e "DA360_DEPTH_MODE=$DEPTH_MODE"

@@ -106,10 +106,10 @@ const PANORAMA_BOTTOM_POLE_GUARD = urlNumber('panoBottomPoleGuard', 2, 0, 45);
 const PANORAMA_FRAME_DELAY_MS = urlNumber('panoFrameDelayMs', 0, 0, 1000);
 const PANORAMA_FACE_TILE_TIMEOUT_MS = urlNumber('panoFaceTileTimeoutMs', 6000, 0, 10000);
 const PANORAMA_FACE_TILE_QUIET_MS = urlNumber('panoFaceTileQuietMs', 650, 0, 5000);
-// Three faces per slice removes one RAF yield from every six-face capture while
-// retaining a scheduling boundary between the two halves.  `panoFacesPerSlice`
-// remains the A/B rollback knob.
-const PANORAMA_FACES_PER_SLICE = Math.round(urlNumber('panoFacesPerSlice', 3, 1, 6));
+// Two faces per slice bounds each synchronous Cesium burst. The previous
+// three-face experiment roughly doubled the measured Firefox physics p95, so
+// keep it available only as an explicit A/B override.
+const PANORAMA_FACES_PER_SLICE = Math.round(urlNumber('panoFacesPerSlice', 2, 1, 6));
 const PANORAMA_PRELOAD_FRAME_DELAY_MS = urlNumber(
     'panoPreloadFrameDelayMs',
     Math.max(96, PANORAMA_FRAME_DELAY_MS),
@@ -171,6 +171,26 @@ function getYopoPreviewEndpoint() {
 function shortError(error) {
     const message = error && error.message ? error.message : String(error || 'error');
     return message.length > 52 ? `${message.slice(0, 49)}...` : message;
+}
+
+function normalizeYopoObserverResult(observer) {
+    if (!observer?.available || !observer.succeeded) {
+        return Object.freeze({ committed: false, outcome: 'rejected', reason: null });
+    }
+    if (observer.value === true) {
+        return Object.freeze({ committed: true, outcome: 'applied', reason: null });
+    }
+    if (observer.value && typeof observer.value === 'object') {
+        const outcome = String(observer.value.outcome || '').trim().toLowerCase();
+        if (outcome === 'applied' || outcome === 'ignored') {
+            const reason = typeof observer.value.reason === 'string'
+                && observer.value.reason.trim().length > 0
+                ? observer.value.reason.trim()
+                : outcome === 'ignored' ? 'consumer-ignored' : null;
+            return Object.freeze({ committed: true, outcome, reason });
+        }
+    }
+    return Object.freeze({ committed: false, outcome: 'rejected', reason: null });
 }
 
 function abortErrorFromSignal(signal, fallback = 'request aborted') {
@@ -373,12 +393,6 @@ function responseContentLength(response) {
     // path merely to estimate bytes. Same-origin production responses expose
     // Content-Length; mocks/proxies that omit it are reported as unknown.
     return null;
-}
-
-async function sha256Blob(blob) {
-    if (!globalThis.crypto?.subtle || !blob?.arrayBuffer) return null;
-    const digest = await globalThis.crypto.subtle.digest('SHA-256', await blob.arrayBuffer());
-    return Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, '0')).join('');
 }
 
 function safeArtifactId(value, fallback) {
@@ -618,6 +632,8 @@ export class PanoramaSensor {
         this._forceNextDepthRequest = false;
         this._yopoGeneration = 0;    // 目标会话变化时递增，丢弃过期响应
         this._planningEpoch = 0;     // 同一目标内重规划时递增，隔离故障前的帧/响应
+        this._planningPaused = false;
+        this._planningPauseReason = null;
         this._goalSequence = 0;
         this._goalId = null;
         this._navigationMode = 'idle';
@@ -711,6 +727,8 @@ export class PanoramaSensor {
         this._lastDepthArray = null;
         this._yopoGeneration++;   // 取消/到达时递增，使在途响应过期
         this._planningEpoch++;
+        this._planningPaused = false;
+        this._planningPauseReason = null;
         this._goalId = null;
         this._navigationMode = 'idle';
         this._navigationTransitionReason = 'sensor-reset';
@@ -1111,6 +1129,7 @@ export class PanoramaSensor {
         if (outcome === 'stale') label = `${normalized} · stale`;
         else if (outcome === 'blocked') label = `${normalized} · blocked`;
         else if (outcome === 'rejected') label = `${normalized} · rejected`;
+        else if (outcome === 'ignored') label = `${normalized} · paused`;
         else if (normalized === 'error' && reason) label = `error · ${shortError(reason)}`;
         else if (Number.isFinite(latencyMs)) label = `${normalized} ${Math.round(latencyMs)}ms`;
 
@@ -1157,6 +1176,8 @@ export class PanoramaSensor {
             frameId: this._rgbFrameId,
             generation: this._yopoGeneration,
             planningEpoch: this._planningEpoch,
+            planningPaused: this._planningPaused,
+            planningPauseReason: this._planningPauseReason,
             hasDepth: this.hasDepth,
             rgbFrameId: readiness.frameId,
             rgbFrameComplete: readiness.rgbFrameComplete,
@@ -1194,6 +1215,7 @@ export class PanoramaSensor {
 
     _shouldRequestDepth(now = performance.now()) {
         if (!this.hasRgb || this._depthGate || this.depthPending) return false;
+        if (this._planningPaused && this._yopoGoal) return false;
         if (this._rgbFrameId <= this._lastRequestedFrameId) return false;
         if (this._rgbFrameId < this._minimumRequestFrameId) return false;
         if (this._yopoGoal && !this._yopoPose) {
@@ -1513,6 +1535,7 @@ export class PanoramaSensor {
 
     _queueLatestDepthRequest(now = performance.now()) {
         if (!this.hasRgb || this._depthGate || this.depthPending) return;
+        if (this._planningPaused && this._yopoGoal) return;
         if (this._rgbFrameId <= this._lastRequestedFrameId) return;
         if (this._rgbFrameId < this._minimumRequestFrameId) return;
         if (this._yopoGoal && !this._yopoPose) return;
@@ -1767,6 +1790,14 @@ export class PanoramaSensor {
         if (this._depthGate) return;
         if (!canvas) return;
         const mode = this._desiredDepthMode();
+        if (mode === 'planning' && this._planningPaused) {
+            this._setDepthState(
+                'planning',
+                `paused:${this._planningPauseReason || 'controller-owned-motion'}`,
+                { outcome: 'ignored' },
+            );
+            return false;
+        }
         if (mode === 'planning' && !this._yopoPose) {
             this._setDepthState('planning', 'awaiting-pose');
             return;
@@ -2005,8 +2036,8 @@ export class PanoramaSensor {
                 if (!String(payload.calibration_id || '').trim()) {
                     throw new Error('authorized planning response missing calibration_id');
                 }
-                if (!String(payload.service_fingerprint || '').trim()) {
-                    throw new Error('authorized planning response missing service_fingerprint');
+                if (!String(payload.service_session_id || '').trim()) {
+                    throw new Error('authorized planning response missing service_session_id');
                 }
             }
             const planningReason = request.mode === 'planning' && !planningAuthorized
@@ -2014,6 +2045,7 @@ export class PanoramaSensor {
                 : null;
             let finalReason = planningReason;
             let trajectoryApplied = request.mode === 'planning' ? false : null;
+            let trajectoryIgnored = request.mode === 'planning' ? false : null;
             let trajectoryAppliedAt = null;
             let trajectoryApplyMs = 0;
             let applyWallTimeMs = null;
@@ -2137,7 +2169,7 @@ export class PanoramaSensor {
                             typeof payload.calibration_accuracy_accepted === 'boolean'
                                 ? payload.calibration_accuracy_accepted
                                 : null,
-                        serviceFingerprint: payload.service_fingerprint || null,
+                        serviceSessionId: payload.service_session_id || null,
                         planningAuthorized: true,
                         planningReason: payload.planning_reason || null,
                         timings: payload.timings_ms || null,
@@ -2158,14 +2190,20 @@ export class PanoramaSensor {
                     });
                     const trajectoryApplyStartedAt = performance.now();
                     let applyObserver = null;
-                    trajectoryApplied = commitIfFresh(() => {
+                    let observerDisposition = null;
+                    const observerCommitted = commitIfFresh(() => {
                         applyObserver = this._invokeObserver(
                             'YOPO trajectory',
                             this.onYopoResult,
                             [payload.endstate, payload.traj_time, context],
                         );
-                        return applyObserver.succeeded && applyObserver.value === true;
+                        observerDisposition = normalizeYopoObserverResult(applyObserver);
+                        return observerDisposition.committed;
                     });
+                    trajectoryApplied = observerCommitted
+                        && observerDisposition?.outcome === 'applied';
+                    trajectoryIgnored = observerCommitted
+                        && observerDisposition?.outcome === 'ignored';
                     trajectoryAppliedAt = performance.now();
                     trajectoryApplyMs = trajectoryAppliedAt - trajectoryApplyStartedAt;
                     applyDeadlineExceeded = commitFailureReason
@@ -2176,6 +2214,8 @@ export class PanoramaSensor {
                             this.onYopoLatency,
                             [payload.latency_ms],
                         );
+                    } else if (trajectoryIgnored) {
+                        finalReason = observerDisposition.reason || 'consumer-ignored';
                     } else {
                         finalReason = commitFailureReason
                             || (!applyObserver?.available
@@ -2211,6 +2251,7 @@ export class PanoramaSensor {
                     outcome,
                     planningAuthorized: request.mode === 'planning' ? planningAuthorized : null,
                     trajectoryApplied,
+                    trajectoryIgnored,
                     trajectoryAppliedAtMs: trajectoryApplied ? trajectoryAppliedAt : null,
                     dropReason: finalReason,
                     depthMode: payload.depth_mode || null,
@@ -2219,7 +2260,7 @@ export class PanoramaSensor {
                         typeof payload.calibration_accuracy_accepted === 'boolean'
                             ? payload.calibration_accuracy_accepted
                             : null,
-                    serviceFingerprint: payload.service_fingerprint || null,
+                    serviceSessionId: payload.service_session_id || null,
                     previewRequested: request.previewRequested,
                     previewIncluded,
                     depthPreviewError,
@@ -2261,6 +2302,8 @@ export class PanoramaSensor {
                 ? 'stale'
                 : trajectoryApplied
                 ? 'applied'
+                : trajectoryIgnored
+                ? 'ignored'
                 : 'rejected';
             const makePolarFrame = (previewPayload = payload) => {
                 let polarScan = normalizeDepthPolarScan(previewPayload.polar_scan);
@@ -2379,7 +2422,7 @@ export class PanoramaSensor {
                     }));
                 };
 
-                if (!applyDeadlineExceeded && request.previewRequested) {
+                if (!applyDeadlineExceeded && !trajectoryIgnored && request.previewRequested) {
                     // `_releaseDepthRequest()` queued the next compact planning
                     // request first. Queue this UI-only worker afterwards so
                     // preview fetch/colorization can never extend or reacquire
@@ -2569,6 +2612,33 @@ export class PanoramaSensor {
         }
     }
 
+    setYopoPlanningPaused(paused, reason = 'controller-owned-motion') {
+        const nextPaused = !!paused && this._navigationMode === 'active' && !!this._yopoGoal;
+        const nextReason = nextPaused
+            ? String(reason || 'controller-owned-motion')
+            : null;
+        if (nextPaused === this._planningPaused
+            && nextReason === this._planningPauseReason) {
+            return false;
+        }
+        const wasPaused = this._planningPaused;
+        this._planningPaused = nextPaused;
+        this._planningPauseReason = nextReason;
+        this._cancelDepthCatchup();
+        if (nextPaused) {
+            this._forceNextDepthRequest = false;
+            this._setDepthState('planning', `paused:${nextReason}`, { outcome: 'ignored' });
+        } else if (wasPaused && this._navigationMode === 'active' && this._yopoGoal) {
+            // A frame captured while terminal motion owned the controller does
+            // not automatically become a post-fault planning observation.
+            this._minimumRequestFrameId = this._rgbFrameId + 1;
+            this._forceNextDepthRequest = true;
+            this.lastCaptureStartTime = -Infinity;
+            this._setDepthState('planning', 'awaiting-new-rgb-frame');
+        }
+        return true;
+    }
+
     setYopoGoal(goal) {
         if (!goal) {
             this.resetYopoGoal('empty-goal');
@@ -2582,6 +2652,8 @@ export class PanoramaSensor {
         this._staleLogBuckets.clear();
         this._yopoGeneration++;
         this._planningEpoch++;
+        this._planningPaused = false;
+        this._planningPauseReason = null;
         this._goalId = `goal-${++this._goalSequence}`;
         this._yopoGoal = Object.freeze({ ...goal });
         this._navigationMode = 'active';
@@ -2601,6 +2673,8 @@ export class PanoramaSensor {
         this._staleLogBuckets.clear();
         this._yopoGeneration++;
         this._planningEpoch++;
+        this._planningPaused = false;
+        this._planningPauseReason = null;
         this._goalId = null;
         this._yopoGoal = null;
         this._navigationMode = reason.includes('arriv') ? 'arrived'
@@ -2785,15 +2859,7 @@ export class PanoramaSensor {
             const rawBlob = new Blob([rawBytes], { type: 'application/x-npz' });
 
             const anchorsBlob = new Blob([JSON.stringify(anchors, null, 2)], { type: 'application/json' });
-            const [rgbSha256, rawSha256, anchorsSha256] = await Promise.all([
-                sha256Blob(frame.rgb),
-                sha256Blob(rawBlob),
-                sha256Blob(anchorsBlob),
-            ]);
             assertCalibrationCurrent();
-            if (!rgbSha256 || !rawSha256 || !anchorsSha256) {
-                throw new Error('SHA-256 is required for calibration bundle export');
-            }
 
             const filenames = Object.freeze({
                 rgb: `${captureId}-rgb.jpg`,
@@ -2811,13 +2877,10 @@ export class PanoramaSensor {
                 exportedAt: new Date().toISOString(),
                 rgbWidth: frame.projectionConfig.rgbWidth,
                 rgbHeight: frame.projectionConfig.rgbHeight,
-                rgbSha256,
-                rawSha256,
-                anchorsSha256,
                 files: Object.freeze({
-                    rgb: Object.freeze({ name: filenames.rgb, sha256: rgbSha256 }),
-                    anchors: Object.freeze({ name: filenames.anchors, sha256: anchorsSha256 }),
-                    raw: Object.freeze({ name: filenames.raw, sha256: rawSha256 }),
+                    rgb: Object.freeze({ name: filenames.rgb, bytes: frame.rgb.size }),
+                    anchors: Object.freeze({ name: filenames.anchors, bytes: anchorsBlob.size }),
+                    raw: Object.freeze({ name: filenames.raw, bytes: rawBlob.size }),
                 }),
                 rawModel: rawResponse.headers.get('X-DA360-Model'),
                 rawWidth: Number(rawResponse.headers.get('X-DA360-Width')) || null,

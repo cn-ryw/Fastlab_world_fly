@@ -48,7 +48,7 @@
     "requireTrajectoryApplied": true,
     "requireNoContradictoryPlanningEvents": true,
     "requireStableCalibrationId": true,
-    "requireStableServiceFingerprint": true,
+    "requireStableServiceSessionId": true,
     "requireUniquePlanningIdentity": true,
     "requireSingleDeclaredNavigationSession": true,
     "requireAllPlanningEventsMatchNavigationSession": true,

@@ -528,7 +528,8 @@ function readySo3Drone(endpoint = SO3_ENDPOINT, duration = 1.125) {
         'rejected suffix does not destroy the older valid trajectory');
     near(drone._trajectory.time, previousTime, 1e-12,
         'atomic suffix rejection does not advance or rewind the old tracker');
-    assert(drone.consumeReplanRequest(), 'suffix mismatch requests a fresh planning frame');
+    assert(!drone.consumeReplanRequest(),
+        'suffix mismatch relies on rolling cadence while an older command remains valid');
 }
 
 // Deadline rollback is compare-and-clear: it removes exactly the command that
@@ -739,6 +740,8 @@ function readySo3Drone(endpoint = SO3_ENDPOINT, duration = 1.125) {
         'endpoint outside the goal sphere keeps YOPO in control');
     assert(drone._idealGoal !== null && drone._navigationState !== 'arrived',
         'crossing inside 4m at high speed is never declared arrived');
+    assert(drone.getControlDiagnostics().goalReached === true,
+        'the valid high-speed crossing is logged as goal-reached separately from settled arrival');
     assert(drone.getControlDiagnostics().terminalTrajectoryEligible === false,
         'diagnostics identify a non-terminal active endpoint');
 }
@@ -876,6 +879,9 @@ function readySo3Drone(endpoint = SO3_ENDPOINT, duration = 1.125) {
     assert(drone._terminalPhase === 'terminal-track' && drone._trajectory.active,
         'safe endpoint commits terminal-track without clearing the Poly5');
     const committedTracker = drone._trajectory;
+    const intake = drone.getYopoTrajectoryIntakeDisposition();
+    assert(intake.outcome === 'ignored' && intake.reason === 'terminal-committed',
+        'a committed terminal suffix tells the perception loop to pause rolling replans');
     assert(!drone.setYopoTrajectory(
         [2, 1, 0, 2, 0, 0, 0, 0, 0],
         1,
@@ -895,6 +901,46 @@ function readySo3Drone(endpoint = SO3_ENDPOINT, duration = 1.125) {
     assert(terminalDiagnostics.terminalTrajectoryEligible
         && Number.isFinite(terminalDiagnostics.trajectoryApplyPositionErrorM),
     'settling diagnostics retain the frozen terminal candidate identity and suffix error');
+    assert(drone.getYopoTrajectoryIntakeDisposition().outcome === 'ignored',
+        'settling continues to suppress responses which cannot safely own motion');
+}
+
+// A rolling candidate that fails apply-time continuity must not invalidate a
+// still-live old command or trigger an epoch-abort/replan loop. Normal capture
+// cadence gets another chance; expiry/fault handling remains the authority for
+// requesting an immediate replacement.
+{
+    const drone = new Drone();
+    drone.flightMode = 'so3';
+    drone.update(DT, input(), null);
+    drone.setIdealGoal({ x: 100, y: 2, z: 0 });
+    assert(drone.setYopoTrajectory(
+        [10, 10, 0, 2, 0, 0, 0, 0, 0],
+        1,
+        { generation: 51, frameId: 510, requestId: 'active-old' },
+    ), 'continuity-rejection precondition installs the old trajectory');
+    const activeTracker = drone._trajectory;
+    drone.vx = -10;
+    assert(!drone.setYopoTrajectory(
+        [-10, -10, 0, 2, 0, 0, 0, 0, 0],
+        1,
+        {
+            generation: 51,
+            frameId: 511,
+            requestId: 'inconsistent-new',
+            captureActualState: {
+                position: { x: drone.x, y: drone.y, z: drone.z },
+                velocity: { x: 10, y: 0, z: 0 },
+            },
+            planningAgeS: 0,
+        },
+    ), 'apply-time velocity mismatch rejects only the new candidate');
+    assert(drone._trajectory === activeTracker && drone._trajectory.active,
+        'continuity rejection preserves the live old command');
+    assert(!drone.consumeReplanRequest(),
+        'continuity rejection does not request an epoch-changing immediate replan');
+    assert(drone.getYopoTrajectoryIntakeDisposition().outcome === 'accept',
+        'ordinary rolling planning remains enabled after preserving the old command');
 }
 
 // Arrival requires the full terminal suffix plus 0.4 s continuously inside

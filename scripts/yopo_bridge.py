@@ -18,7 +18,6 @@ drone.js 与 tests/test_yopo_endstate_layout.js。
 """
 
 import argparse
-import hashlib
 import json
 import os
 import sys
@@ -36,7 +35,7 @@ YOPO_ROOT = Path(os.environ.get("YOPO_ROOT", "/opt/YOPO_360")).resolve()
 sys.path.insert(0, str(YOPO_ROOT / "YOPO"))
 
 # config.config materializes its global ``cfg`` at import time. Establish the
-# overlay first so the standalone bridge cannot hash one YAML while actually
+# overlay first so the standalone bridge cannot name one YAML while actually
 # running with the base-only configuration.
 DEFAULT_CONFIG_NAME = "x5_cruise15_18m_a12_mask_wc3.yaml"
 os.environ.setdefault("YOPO_CONFIG", DEFAULT_CONFIG_NAME)
@@ -52,14 +51,6 @@ DEFAULT_CONFIG = os.environ["YOPO_CONFIG"]
 BASE_CONFIG = "traj_opt.yaml"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 YOPO_MAX_VERTICAL_ENDPOINT_STEP_M = 4.0
-
-
-def _sha256_file(path):
-    digest = hashlib.sha256()
-    with open(path, "rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def _load_model(model_path, device):
@@ -133,13 +124,11 @@ def health():
         "ok": True,
         "model": Path(str(runner.model_path)).name,
         "device": runner.device,
-        "checkpoint_sha256": runner.checkpoint_sha256,
         "checkpoint_coverage": runner.checkpoint_coverage,
+        "checkpoint_missing_keys": runner.checkpoint_missing_keys,
+        "checkpoint_unexpected_keys": runner.checkpoint_unexpected_keys,
         "config": runner.config_name,
-        "config_sha256": runner.config_sha256,
         "base_config": runner.base_config_name,
-        "base_config_sha256": runner.base_config_sha256,
-        "effective_config_sha256": runner.effective_config_sha256,
     })
 
 
@@ -200,14 +189,6 @@ class YopoRunner:
         # training scales, which is incorrect for runtime profiles.
         cfg["train"] = False
         self.net = _load_model(model_path, device)
-        actual_checkpoint_sha256 = _sha256_file(model_path)
-        expected_checkpoint_sha256 = os.environ.get("YOPO_MODEL_SHA256", "").strip().lower()
-        if expected_checkpoint_sha256 and actual_checkpoint_sha256 != expected_checkpoint_sha256:
-            raise RuntimeError(
-                "YOPO checkpoint fingerprint mismatch: "
-                f"{actual_checkpoint_sha256} != {expected_checkpoint_sha256}"
-            )
-        self.checkpoint_sha256 = actual_checkpoint_sha256
         self.checkpoint_coverage = self.net.checkpoint_coverage
         self.checkpoint_missing_keys = self.net.checkpoint_missing_keys
         self.checkpoint_unexpected_keys = self.net.checkpoint_unexpected_keys
@@ -221,32 +202,10 @@ class YopoRunner:
                 "YOPO runtime config mismatch: imported "
                 f"{loaded_config_path} but expected {config_path.resolve()}"
             )
-        self.config_sha256 = _sha256_file(config_path)
-        expected_config_sha = os.environ.get("YOPO_CONFIG_SHA256", "").strip().lower()
-        if expected_config_sha and self.config_sha256 != expected_config_sha:
-            raise RuntimeError(
-                "YOPO config fingerprint mismatch: "
-                f"{self.config_sha256} != {expected_config_sha}"
-            )
         self.base_config_name = BASE_CONFIG
         base_config_path = YOPO_ROOT / "YOPO" / "config" / self.base_config_name
         if not base_config_path.is_file():
             raise FileNotFoundError(f"YOPO base config missing: {base_config_path}")
-        self.base_config_sha256 = _sha256_file(base_config_path)
-        expected_base_config_sha = os.environ.get(
-            "YOPO_BASE_CONFIG_SHA256", ""
-        ).strip().lower()
-        if (
-            expected_base_config_sha
-            and self.base_config_sha256 != expected_base_config_sha
-        ):
-            raise RuntimeError(
-                "YOPO base config fingerprint mismatch: "
-                f"{self.base_config_sha256} != {expected_base_config_sha}"
-            )
-        self.effective_config_sha256 = hashlib.sha256(
-            f"{self.base_config_sha256}:{self.config_sha256}".encode("ascii")
-        ).hexdigest()
         # channels_last 在 RTX 5070 Ti + PyTorch 2.8 + Flask 主进程中有 200x 减速 bug，
         # 症状同 DA360_CHANNELS_LAST。默认禁用，换 GPU/PyTorch 版本可重新启用。
         self.use_amp = device == "cuda" and os.environ.get("YOPO_AMP", "1") != "0"

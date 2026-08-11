@@ -15,12 +15,12 @@ Usage:
         --output experiment_data/metric_fit_sample/
 
 Repeat all four artifact flags for multi-capture fitting. The fitter rejects
-unpaired or mutable bundles, incomplete fingerprints and duplicate captures
-before fitting. A runtime calibration is emitted only after every held-out
-location and the pooled result pass all acceptance gates.
+unpaired bundles, incomplete identity/projection contracts and duplicate
+capture identities or poses before fitting. A runtime calibration is emitted
+only after every held-out location and the pooled result pass all acceptance
+gates.
 """
 import argparse
-import hashlib
 import json
 import math
 import os
@@ -270,14 +270,6 @@ def sample_wrapped_bilinear(array, valid_mask, u, v):
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
-def _sha256_file(path):
-    digest = hashlib.sha256()
-    with open(path, "rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 def _load_json_object(path, label):
     try:
         with open(path, encoding="utf-8") as stream:
@@ -322,16 +314,6 @@ def _require_int(mapping, key, label, *, positive=False):
     return value
 
 
-def _require_sha256(value, label):
-    if not isinstance(value, str) or len(value) != 64 or any(
-        character not in "0123456789abcdef" for character in value.lower()
-    ):
-        raise ValueError(f"{label} must be a SHA-256 hex digest")
-    if value != value.lower():
-        raise ValueError(f"{label} must use lowercase hex")
-    return value
-
-
 def _validate_transform(value, label):
     transform = _require_mapping(value, label)
     position = _require_mapping(transform.get("position"), f"{label}.position")
@@ -364,76 +346,70 @@ def _artifact_from_manifest(manifest, key, actual_path):
     files = _require_mapping(manifest.get("files"), "manifest.files")
     entry = _require_mapping(files.get(key), f"manifest.files.{key}")
     name = _require_string(entry, "name", f"manifest.files.{key}")
-    expected_sha = _require_sha256(entry.get("sha256"), f"manifest.files.{key}.sha256")
     if Path(actual_path).name != name:
         raise ValueError(
             f"manifest {key} filename mismatch: {Path(actual_path).name!r} != {name!r}"
         )
-    top_level_key = f"{key}Sha256"
-    if manifest.get(top_level_key) != expected_sha:
-        raise ValueError(f"manifest {top_level_key} does not match files.{key}.sha256")
-    actual_sha = _sha256_file(actual_path)
-    if actual_sha != expected_sha:
-        raise ValueError(f"manifest {key} SHA-256 mismatch")
-    return actual_sha
+    declared_bytes = _require_int(entry, "bytes", f"manifest.files.{key}", positive=True)
+    if not Path(actual_path).is_file() or Path(actual_path).stat().st_size <= 0:
+        raise ValueError(f"manifest {key} artifact is missing or empty")
+    if Path(actual_path).stat().st_size != declared_bytes:
+        raise ValueError(f"manifest {key} artifact size mismatch")
 
 
-def _projection_fingerprint(manifest, rgb_width, rgb_height):
+def _projection_contract(manifest, rgb_width, rgb_height):
     projection = _require_mapping(manifest.get("projectionConfig"), "manifest.projectionConfig")
-    fingerprint = {}
+    contract = {}
     for key in ("width", "height", "faceSize", "rgbWidth", "rgbHeight"):
-        fingerprint[key] = _require_int(projection, key, "manifest.projectionConfig", positive=True)
+        contract[key] = _require_int(projection, key, "manifest.projectionConfig", positive=True)
     for key in ("verticalFovDeg", "faceFovDeg", "topPoleGuardDeg", "bottomPoleGuardDeg"):
-        fingerprint[key] = _require_number(projection, key, "manifest.projectionConfig")
-    fingerprint["jpegQuality"] = _require_number(
+        contract[key] = _require_number(projection, key, "manifest.projectionConfig")
+    contract["jpegQuality"] = _require_number(
         projection, "jpegQuality", "manifest.projectionConfig", positive=True
     )
-    fingerprint["uploadScale"] = _require_number(
+    contract["uploadScale"] = _require_number(
         projection, "uploadScale", "manifest.projectionConfig", positive=True
     )
-    if fingerprint["rgbWidth"] != rgb_width or fingerprint["rgbHeight"] != rgb_height:
+    if contract["rgbWidth"] != rgb_width or contract["rgbHeight"] != rgb_height:
         raise ValueError("manifest RGB dimensions do not match decoded RGB")
-    expected_upload_scale = fingerprint["rgbWidth"] / fingerprint["width"]
-    if not math.isclose(fingerprint["uploadScale"], expected_upload_scale, rel_tol=0, abs_tol=1e-12):
+    expected_upload_scale = contract["rgbWidth"] / contract["width"]
+    if not math.isclose(contract["uploadScale"], expected_upload_scale, rel_tol=0, abs_tol=1e-12):
         raise ValueError("manifest uploadScale does not match encoded/panorama width")
-    if not 0 < fingerprint["verticalFovDeg"] <= 180:
+    if not 0 < contract["verticalFovDeg"] <= 180:
         raise ValueError("manifest projection verticalFovDeg must be in (0, 180]")
-    return fingerprint
+    return contract
 
 
-def _raw_fingerprint(metadata, height, width, rgb_width, rgb_height):
-    fingerprint = {
+def _raw_contract(metadata, height, width, rgb_width, rgb_height):
+    contract = {
         "api_version": _require_int(metadata, "api_version", "raw.metadata", positive=True),
         "model": _require_string(metadata, "model", "raw.metadata"),
         "width": _require_int(metadata, "width", "raw.metadata", positive=True),
         "height": _require_int(metadata, "height", "raw.metadata", positive=True),
         "input_scale": _require_number(metadata, "input_scale", "raw.metadata", positive=True),
         "resample": _require_string(metadata, "resample", "raw.metadata"),
-        "checkpoint_sha256": _require_sha256(
-            metadata.get("checkpoint_sha256"), "raw.metadata.checkpoint_sha256"
-        ),
         "request_width": _require_int(metadata, "request_width", "raw.metadata", positive=True),
         "request_height": _require_int(metadata, "request_height", "raw.metadata", positive=True),
         "depth_mode": _require_string(metadata, "depth_mode", "raw.metadata"),
         "unit_pred_disp": _require_string(metadata, "unit_pred_disp", "raw.metadata"),
     }
-    if fingerprint["api_version"] != 2:
+    if contract["api_version"] != 2:
         raise ValueError("raw.metadata.api_version must be 2")
-    if fingerprint["width"] != width or fingerprint["height"] != height:
-        raise ValueError("raw output dimensions do not match metadata fingerprint")
-    if fingerprint["request_width"] != rgb_width or fingerprint["request_height"] != rgb_height:
+    if contract["width"] != width or contract["height"] != height:
+        raise ValueError("raw output dimensions do not match metadata contract")
+    if contract["request_width"] != rgb_width or contract["request_height"] != rgb_height:
         raise ValueError("raw request dimensions do not match decoded RGB")
-    if fingerprint["depth_mode"] != "da360-relative":
+    if contract["depth_mode"] != "da360-relative":
         raise ValueError("calibration input must use da360-relative raw disparity")
     expected_unit = "raw disparity (inverse depth), NOT per-frame normalized"
-    if fingerprint["unit_pred_disp"] != expected_unit:
+    if contract["unit_pred_disp"] != expected_unit:
         raise ValueError("raw disparity semantic contract is incompatible")
-    if fingerprint["resample"] not in {"bicubic", "bilinear"}:
+    if contract["resample"] not in {"bicubic", "bilinear"}:
         raise ValueError("raw.metadata.resample is unsupported")
-    return fingerprint
+    return contract
 
 
-def _anchor_capture_provenance(anchor_metadata, projection_fingerprint):
+def _anchor_capture_provenance(anchor_metadata, projection_contract):
     """Verify that anchors came from the exact six-face RGB capture source."""
     label = "anchors.metadata"
     if anchor_metadata.get("raycastSource") != "panorama-capture-viewer":
@@ -449,7 +425,7 @@ def _anchor_capture_provenance(anchor_metadata, projection_fingerprint):
     face_size = _require_int(
         anchor_metadata, "panoramaFaceSize", label, positive=True
     )
-    if face_size != projection_fingerprint["faceSize"]:
+    if face_size != projection_contract["faceSize"]:
         raise ValueError(
             "anchors panoramaFaceSize does not match manifest projection faceSize"
         )
@@ -470,14 +446,14 @@ def _anchor_capture_provenance(anchor_metadata, projection_fingerprint):
         "anchors.metadata.panoramaSourceImage",
         positive=True,
     )
-    if source_width != projection_fingerprint["width"] \
-            or source_height != projection_fingerprint["height"]:
+    if source_width != projection_contract["width"] \
+            or source_height != projection_contract["height"]:
         raise ValueError(
             "anchors panoramaSourceImage dimensions do not match manifest projection"
         )
     if not math.isclose(
         source_vertical_fov,
-        projection_fingerprint["verticalFovDeg"],
+        projection_contract["verticalFovDeg"],
         rel_tol=0,
         abs_tol=1e-12,
     ):
@@ -527,7 +503,7 @@ def _anchor_capture_provenance(anchor_metadata, projection_fingerprint):
 
 
 def load_data(raw_path, anchors_path, manifest_path, rgb_path):
-    """Load and verify one immutable RGB/raw/anchor/manifest capture bundle."""
+    """Load and verify one identity-bound RGB/raw/anchor/manifest bundle."""
     manifest = _load_json_object(manifest_path, "manifest")
     if manifest.get("schemaVersion") != 2:
         raise ValueError("manifest.schemaVersion must be 2")
@@ -544,9 +520,9 @@ def load_data(raw_path, anchors_path, manifest_path, rgb_path):
     _validate_state(manifest.get("referenceState"), "manifest.referenceState", True)
     _require_number(manifest, "yaw", "manifest")
 
-    rgb_sha = _artifact_from_manifest(manifest, "rgb", rgb_path)
-    anchors_sha = _artifact_from_manifest(manifest, "anchors", anchors_path)
-    raw_sha = _artifact_from_manifest(manifest, "raw", raw_path)
+    _artifact_from_manifest(manifest, "rgb", rgb_path)
+    _artifact_from_manifest(manifest, "anchors", anchors_path)
+    _artifact_from_manifest(manifest, "raw", raw_path)
 
     try:
         with Image.open(rgb_path) as encoded_rgb:
@@ -555,11 +531,10 @@ def load_data(raw_path, anchors_path, manifest_path, rgb_path):
     except (OSError, ValueError) as error:
         raise ValueError(f"invalid RGB artifact: {error}") from error
     rgb_width, rgb_height = rgb.size
-    decoded_rgb_sha = hashlib.sha256(np.asarray(rgb, dtype=np.uint8).tobytes()).hexdigest()
     if _require_int(manifest, "rgbWidth", "manifest", positive=True) != rgb_width \
             or _require_int(manifest, "rgbHeight", "manifest", positive=True) != rgb_height:
         raise ValueError("manifest top-level RGB dimensions do not match decoded RGB")
-    projection_fingerprint = _projection_fingerprint(manifest, rgb_width, rgb_height)
+    projection_contract = _projection_contract(manifest, rgb_width, rgb_height)
 
     with np.load(raw_path, allow_pickle=False) as raw:
         required_arrays = {"pred_disp", "relative_depth", "valid_mask", "metadata_json"}
@@ -587,7 +562,7 @@ def load_data(raw_path, anchors_path, manifest_path, rgb_path):
         relative_depth[expected_valid], 1.0 / pred_disp[expected_valid], rtol=1e-5, atol=1e-6
     ) or np.any(relative_depth[~expected_valid] != 0):
         raise ValueError("raw relative_depth is inconsistent with pred_disp")
-    raw_fingerprint = _raw_fingerprint(
+    raw_contract = _raw_contract(
         metadata, height, width, rgb_width, rgb_height
     )
     raw_frame_id = _require_string(metadata, "frame_id", "raw.metadata")
@@ -600,11 +575,6 @@ def load_data(raw_path, anchors_path, manifest_path, rgb_path):
     ):
         if _require_string(metadata, raw_key, "raw.metadata") != identity[identity_key]:
             raise ValueError(f"manifest/raw identity mismatch: {identity_key}")
-    if _require_sha256(
-        metadata.get("decoded_rgb_sha256"), "raw.metadata.decoded_rgb_sha256"
-    ) != decoded_rgb_sha:
-        raise ValueError("raw decoded RGB SHA-256 mismatch")
-
     for manifest_key, raw_key in (("rawModel", "model"), ("rawWidth", "width"), ("rawHeight", "height")):
         manifest_value = manifest.get(manifest_key)
         if manifest_value is not None and manifest_value != metadata[raw_key]:
@@ -621,7 +591,7 @@ def load_data(raw_path, anchors_path, manifest_path, rgb_path):
     if anchor_metadata.get("tileState") != "ready":
         raise ValueError("anchors were captured before Cesium tiles reported ready")
     capture_provenance = _anchor_capture_provenance(
-        anchor_metadata, projection_fingerprint
+        anchor_metadata, projection_contract
     )
     anchor_identity = _require_mapping(anchor_metadata.get("identity"), "anchors.metadata.identity")
     for key, expected in identity.items():
@@ -642,7 +612,7 @@ def load_data(raw_path, anchors_path, manifest_path, rgb_path):
     vertical_fov = _require_number(
         erp_metadata, "verticalFovDeg", "anchors.metadata.erp", positive=True
     )
-    if vertical_fov != projection_fingerprint["verticalFovDeg"]:
+    if vertical_fov != projection_contract["verticalFovDeg"]:
         raise ValueError("manifest/anchor ERP vertical FOV mismatch")
     if erp_metadata.get("sensorFrame") != "NWU(+x forward,+y left,+z up)" \
             or erp_metadata.get("componentFrame") != "(+x body-left,+y up,+z back)":
@@ -650,25 +620,25 @@ def load_data(raw_path, anchors_path, manifest_path, rgb_path):
     sampling_metadata = _require_mapping(
         anchor_metadata.get("sampling"), "anchors.metadata.sampling"
     )
-    sampling_fingerprint = {
+    sampling_contract = {
         "gridCols": _require_int(sampling_metadata, "gridCols", "anchors.metadata.sampling", positive=True),
         "gridRows": _require_int(sampling_metadata, "gridRows", "anchors.metadata.sampling", positive=True),
         "maxRangeM": _require_number(sampling_metadata, "maxRangeM", "anchors.metadata.sampling", positive=True),
         "excludeTopDeg": _require_number(sampling_metadata, "excludeTopDeg", "anchors.metadata.sampling"),
         "excludeBottomDeg": _require_number(sampling_metadata, "excludeBottomDeg", "anchors.metadata.sampling"),
     }
-    anchor_fingerprint = {
+    anchor_contract = {
         "image": dict(image_metadata),
         "erp": dict(erp_metadata),
-        "sampling": sampling_fingerprint,
-        "projection": projection_fingerprint,
+        "sampling": sampling_contract,
+        "projection": projection_contract,
         "capture_source": {
             key: value for key, value in capture_provenance.items()
             if key != "panoramaCaptureRevision"
         },
     }
     n_anchor_candidates = _require_int(anchor_metadata, "totalCells", "anchors.metadata", positive=True)
-    expected_cells = sampling_fingerprint["gridCols"] * sampling_fingerprint["gridRows"]
+    expected_cells = sampling_contract["gridCols"] * sampling_contract["gridRows"]
     if n_anchor_candidates != expected_cells or len(anchors) + len(failures) != expected_cells:
         raise ValueError("anchor grid cell accounting is inconsistent")
     if _require_int(anchor_metadata, "validAnchors", "anchors.metadata") != len(anchors) \
@@ -692,7 +662,7 @@ def load_data(raw_path, anchors_path, manifest_path, rgb_path):
         source_u = _require_number(anchor, "u", f"anchor[{index}]")
         source_v = _require_number(anchor, "v", f"anchor[{index}]")
         distance_m = _require_number(anchor, "distance", f"anchor[{index}]", positive=True)
-        if distance_m > sampling_fingerprint["maxRangeM"]:
+        if distance_m > sampling_contract["maxRangeM"]:
             raise ValueError(f"anchor {index} exceeds the declared maximum range")
         if not (-0.5 <= source_u <= source_w - 0.5 and -0.5 <= source_v <= source_h - 0.5):
             raise ValueError(f"anchor {index} is outside the declared ERP image")
@@ -735,8 +705,8 @@ def load_data(raw_path, anchors_path, manifest_path, rgb_path):
         "metadata": metadata,
         "anchor_metadata": anchor_metadata,
         "manifest": manifest,
-        "raw_fingerprint": raw_fingerprint,
-        "anchor_fingerprint": anchor_fingerprint,
+        "raw_contract": raw_contract,
+        "anchor_contract": anchor_contract,
         "n_anchors": n_anchor_candidates,
         "n_hit_anchors": len(anchors),
         "n_valid_anchors": len(x_array),
@@ -744,10 +714,6 @@ def load_data(raw_path, anchors_path, manifest_path, rgb_path):
         "valid_anchor_fraction": len(x_array) / n_anchor_candidates,
         "sample_id": identity["captureId"],
         "identity": identity,
-        "rgb_sha256": rgb_sha,
-        "raw_sha256": raw_sha,
-        "anchors_sha256": anchors_sha,
-        "decoded_rgb_sha256": decoded_rgb_sha,
         "pose_position": manifest_position,
         "pose_quaternion": manifest_quaternion,
     }
@@ -761,14 +727,12 @@ def _same_pose(first, second):
 
 
 def combine_datasets(datasets):
-    """Combine verified captures, rejecting duplicate identities and fingerprints."""
+    """Combine verified captures while rejecting duplicate identities or poses."""
     if not datasets:
         raise ValueError("at least one verified capture bundle is required")
     reference = datasets[0]
     seen_capture_ids = set()
     seen_frame_ids = set()
-    seen_rgb_hashes = set()
-    seen_raw_hashes = set()
     location_captures = {}
     accepted = []
     for dataset in datasets:
@@ -781,14 +745,10 @@ def combine_datasets(datasets):
             raise ValueError(f"duplicate captureId: {capture_id}")
         if frame_identity in seen_frame_ids:
             raise ValueError(f"duplicate session/frame identity: {frame_identity}")
-        if dataset.get("rgb_sha256") in seen_rgb_hashes:
-            raise ValueError(f"duplicate RGB artifact: {dataset.get('rgb_sha256')}")
-        if dataset.get("raw_sha256") in seen_raw_hashes:
-            raise ValueError(f"duplicate raw artifact: {dataset.get('raw_sha256')}")
-        if dataset.get("raw_fingerprint") != reference.get("raw_fingerprint"):
-            raise ValueError("capture raw inference fingerprint mismatch")
-        if dataset.get("anchor_fingerprint") != reference.get("anchor_fingerprint"):
-            raise ValueError("capture ERP/projection/sampling fingerprint mismatch")
+        if dataset.get("raw_contract") != reference.get("raw_contract"):
+            raise ValueError("capture raw inference contract mismatch")
+        if dataset.get("anchor_contract") != reference.get("anchor_contract"):
+            raise ValueError("capture ERP/projection/sampling contract mismatch")
         for prior in accepted:
             same_location = identity.get("locationId") == prior["identity"].get("locationId")
             if same_location and _same_pose(dataset, prior):
@@ -797,8 +757,6 @@ def combine_datasets(datasets):
                 )
         seen_capture_ids.add(capture_id)
         seen_frame_ids.add(frame_identity)
-        seen_rgb_hashes.add(dataset.get("rgb_sha256"))
-        seen_raw_hashes.add(dataset.get("raw_sha256"))
         accepted.append(dataset)
         location_captures.setdefault(identity.get("locationId"), []).append(capture_id)
 
@@ -843,9 +801,6 @@ def combine_datasets(datasets):
             "captureId": dataset["identity"]["captureId"],
             "locationId": dataset["identity"]["locationId"],
             "frameId": dataset["identity"]["frameId"],
-            "rgbSha256": dataset["rgb_sha256"],
-            "rawSha256": dataset["raw_sha256"],
-            "anchorsSha256": dataset["anchors_sha256"],
         }
         for dataset in datasets
     ]
@@ -1131,7 +1086,6 @@ def run_fitting(data, output_dir):
     selected_near_metrics = selected_metrics["near_10m"]
     nonempty_locations = sorted(set(location_ids[location_ids != ""].tolist()))
     inference_metadata = data.get("metadata", {})
-    checkpoint_sha256 = str(inference_metadata.get("checkpoint_sha256", "") or "").lower()
     capture_records = data.get("capture_records", [])
     capture_fractions = data.get("capture_valid_anchor_fractions", {})
     capture_range_counts = data.get("capture_range_anchor_counts", {})
@@ -1142,11 +1096,11 @@ def run_fitting(data, output_dir):
     report["n_samples"] = len(capture_records) if bundle_validation_complete else 0
     report["sample_ids"] = [record["captureId"] for record in capture_records] \
         if bundle_validation_complete else []
-    raw_fingerprint = data.get("raw_fingerprint", {})
-    anchor_fingerprint = data.get("anchor_fingerprint", {})
-    fingerprint_complete = bundle_validation_complete \
-        and isinstance(raw_fingerprint, dict) and isinstance(anchor_fingerprint, dict) \
-        and bool(raw_fingerprint) and bool(anchor_fingerprint)
+    raw_contract = data.get("raw_contract", {})
+    anchor_contract = data.get("anchor_contract", {})
+    inference_contract_complete = bundle_validation_complete \
+        and isinstance(raw_contract, dict) and isinstance(anchor_contract, dict) \
+        and bool(raw_contract) and bool(anchor_contract)
     collected_locations = sorted(location_capture_counts) if isinstance(location_capture_counts, dict) else []
     held_out_locations = sorted(fold["held_out"] for fold in validation["folds"])
     fold_gate_results = {}
@@ -1180,7 +1134,7 @@ def run_fitting(data, output_dir):
         "all_locations_held_out": held_out_locations == collected_locations == nonempty_locations,
         "leave_one_location_out": validation_strategy == "leave-one-location-out"
             and len(validation["folds"]) == len(collected_locations),
-        "inference_fingerprint_complete": bool(fingerprint_complete),
+        "inference_contract_complete": bool(inference_contract_complete),
         "capture_valid_anchor_fractions": capture_fractions,
         "all_capture_coverage_passed": all_capture_coverage_passed,
         "capture_range_anchor_counts": capture_range_counts,
@@ -1197,7 +1151,7 @@ def run_fitting(data, output_dir):
         and collection_requirements["all_locations_sampled"]
         and collection_requirements["all_locations_held_out"]
         and collection_requirements["leave_one_location_out"]
-        and collection_requirements["inference_fingerprint_complete"]
+        and collection_requirements["inference_contract_complete"]
         and collection_requirements["all_capture_coverage_passed"]
         and collection_requirements["all_captures_contribute_to_fit"]
     )
@@ -1215,17 +1169,6 @@ def run_fitting(data, output_dir):
         "metric calibration passed held-out gates"
         if passed_gate else "metric calibration did not pass held-out gates"
     )
-    fingerprint_payload = {
-        "raw": raw_fingerprint,
-        "anchor": anchor_fingerprint,
-        "captures": sorted(
-            capture_records,
-            key=lambda record: (record["sessionId"], record["captureId"]),
-        ) if bundle_validation_complete else [],
-    }
-    fingerprint_sha256 = hashlib.sha256(json.dumps(
-        fingerprint_payload, sort_keys=True, separators=(",", ":"), allow_nan=False
-    ).encode("utf-8")).hexdigest() if fingerprint_complete else None
     calibration_candidate = {
         "schema_version": 1,
         "accepted": bool(passed_gate),
@@ -1234,16 +1177,19 @@ def run_fitting(data, output_dir):
         "depth_min_m": METRIC_MIN_DEPTH_M,
         "depth_max_m": METRIC_MAX_DEPTH_M,
         "model": inference_metadata.get("model"),
+        "calibration_id": (
+            f"da360-metric-v1-{inference_metadata.get('model')}-"
+            f"{raw_contract.get('request_width')}x{raw_contract.get('request_height')}"
+            if inference_contract_complete else None
+        ),
         "width": inference_metadata.get("width"),
         "height": inference_metadata.get("height"),
         "input_scale": inference_metadata.get("input_scale"),
         "resample": inference_metadata.get("resample"),
-        "checkpoint_sha256": checkpoint_sha256 or None,
-        "requestWidth": raw_fingerprint.get("request_width") if fingerprint_complete else None,
-        "requestHeight": raw_fingerprint.get("request_height") if fingerprint_complete else None,
-        "input": raw_fingerprint if fingerprint_complete else None,
-        "projection": anchor_fingerprint.get("projection") if fingerprint_complete else None,
-        "dataset_fingerprint_sha256": fingerprint_sha256,
+        "requestWidth": raw_contract.get("request_width") if inference_contract_complete else None,
+        "requestHeight": raw_contract.get("request_height") if inference_contract_complete else None,
+        "input": raw_contract if inference_contract_complete else None,
+        "projection": anchor_contract.get("projection") if inference_contract_complete else None,
         "selected_model": selected_model,
         "relation": "inverse_depth_1_per_m = a * pred_disp + b",
         "fit_report": "fit_report.json",

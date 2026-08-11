@@ -139,6 +139,24 @@ for proxy_variable in http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY AL
 done
 readonly proxy_environment
 
+# Firefox uses the desktop/system proxy on Linux, while this probe uses the
+# inherited shell proxy. Both should resolve to the same local Clash/ShellCrash
+# path on this workstation. A plain host request contains no API key; any HTTP
+# status proves DNS/TLS/transport are working (the root commonly returns 404).
+google_tiles_transport='not checked'
+if command -v curl >/dev/null 2>&1; then
+    google_tiles_http_code="$({
+        curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
+            --connect-timeout 3 --max-time 6 'https://tile.googleapis.com/'
+    } 2>/dev/null || true)"
+    if [[ "${google_tiles_http_code}" =~ ^[1-5][0-9][0-9]$ ]]; then
+        google_tiles_transport="reachable (HTTP ${google_tiles_http_code})"
+    else
+        google_tiles_transport='unreachable'
+        warn 'Google Tiles transport check failed; verify the active system proxy before flight.'
+    fi
+fi
+
 # Modern GTK provides the accessibility bridge itself. Ubuntu/Xubuntu may
 # export GTK_MODULES=gail:atk-bridge globally, which only produces a harmless
 # startup warning in current Firefox.
@@ -180,14 +198,15 @@ fi
 mkdir -p -- "$(dirname -- "${LOG_FILE}")"
 {
     printf '\n[%s] launch\n' "$(date --iso-8601=seconds)"
-    printf 'executable=%s\nversion=%s\npackaging=%s\ngpu=%s\nurl=%s\nproxy_environment=%s\n' \
+    printf 'executable=%s\nversion=%s\npackaging=%s\ngpu=%s\nurl=%s\nproxy_environment=%s\ngoogle_tiles_transport=%s\n' \
         "${FIREFOX_EXECUTABLE}" "${firefox_version:-unknown}" "${firefox_packaging}" \
-        "${gpu_name}" "${DISPLAY_URL}" "${proxy_environment}"
+        "${gpu_name}" "${DISPLAY_URL}" "${proxy_environment}" "${google_tiles_transport}"
 } >>"${LOG_FILE}"
 
 info "Firefox: ${firefox_version:-unknown} (${firefox_packaging})"
 info "GPU: ${gpu_name}"
 info "Proxy environment: ${proxy_environment}; local loopback addresses bypass it."
+info "Google Tiles transport: ${google_tiles_transport}."
 info "URL: ${DISPLAY_URL}"
 info "Log: ${LOG_FILE}"
 

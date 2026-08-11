@@ -30,7 +30,7 @@ Primary sources:
 
 | Evidence | Result | Interpretation boundary |
 |---|---:|---|
-| Atomic bundles | 12 unique frames/captures; hashes and identities agree | No obvious file mixing |
+| Atomic bundles | 12 unique frames/captures; filenames, identities and semantic contracts agree | No obvious file mixing |
 | Vehicle speed | maximum about `1.98e-5 m/s` | Effectively stationary |
 | Ready ray anchors | 1,140 / 1,536 (74.22%) | Coverage passed; not an independent proof of ray geometry |
 | Anchors in 0.5–20 m | 833 | Enough to reject the current fit |
@@ -71,7 +71,7 @@ Run two fixed poses as a pilot before collecting another 12-frame dataset:
 
 Each pose should contain balanced anchors at 1–2, 3–5, 8–12, and 15–20 m,
 using a 32×16 grid and a separately reported depth-edge mask. For the exact
-same frozen RGB SHA, repeat raw inference 30 times to distinguish model/input
+same frozen RGB capture identity, repeat raw inference 30 times to distinguish model/input
 effects from nondeterminism.
 
 For each arm, report all of the following instead of a single fit number:

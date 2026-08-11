@@ -1,7 +1,6 @@
 """GPU-free contract tests for standalone and combined DA360 Flask apps."""
 
 import io
-import hashlib
 import json
 import os
 import sys
@@ -46,7 +45,6 @@ class FakeDepthRunner:
     channels_last = False
     depth_mode = "da360-relative"
     calibration = None
-    checkpoint_sha256 = "ab" * 32
     checkpoint_coverage = 1.0
     checkpoint_missing_keys = 0
     checkpoint_unexpected_keys = 0
@@ -86,15 +84,11 @@ class FakeDepthRunner:
 class FakeYopoRunner:
     device = "cpu"
     model_path = "/models/fake-yopo.pth"
-    checkpoint_sha256 = "cd" * 32
     checkpoint_coverage = 1.0
     checkpoint_missing_keys = 0
     checkpoint_unexpected_keys = 0
     config_name = "fake.yaml"
-    config_sha256 = "ef" * 32
     base_config_name = "traj_opt.yaml"
-    base_config_sha256 = "12" * 32
-    effective_config_sha256 = "34" * 32
 
     def __init__(self):
         self.lock = threading.Lock()
@@ -131,19 +125,6 @@ def jpeg_bytes(width=16, height=8):
 
 
 class BackendContractTests(unittest.TestCase):
-    @staticmethod
-    def expected_service_fingerprint():
-        identity = {
-            "api_version": 2,
-            "da360_checkpoint_sha256": "ab" * 32,
-            "yopo_checkpoint_sha256": "cd" * 32,
-            "yopo_effective_config_sha256": "34" * 32,
-        }
-        canonical = json.dumps(
-            identity, sort_keys=True, separators=(",", ":"), ensure_ascii=True
-        ).encode("ascii")
-        return hashlib.sha256(canonical).hexdigest()
-
     def test_yopo_overlay_is_selected_before_global_config_import(self):
         source = (SCRIPTS_DIR / "yopo_bridge.py").read_text(encoding="utf-8")
         self.assertLess(
@@ -234,7 +215,7 @@ class BackendContractTests(unittest.TestCase):
                         "api_version", "depth_image", "depth_scale", "latency_ms", "timings_ms",
                         "model", "device", "width", "height", "request_width", "request_height",
                         "depth_mode", "calibration_id", "frame_id", "goal_id", "generation",
-                        "input_sha256", "polar_scan",
+                        "polar_scan",
                     }
                     self.assertLessEqual(required, payload.keys())
                     self.assertTrue(payload["depth_image"].startswith("data:image/jpeg;base64,"))
@@ -318,7 +299,7 @@ class BackendContractTests(unittest.TestCase):
                     self.assertEqual(metadata["location_id"], "site-1")
                     self.assertEqual(metadata["api_version"], 2)
                     self.assertEqual(metadata["resample"], "bicubic")
-                    self.assertEqual(len(metadata["decoded_rgb_sha256"]), 64)
+                    self.assertNotIn("decoded_rgb_sha256", metadata)
                     self.assertEqual(response.headers["X-Frame-ID"], "frame-1")
                     self.assertEqual(response.headers["X-Session-ID"], "session-1")
                     self.assertEqual(response.headers["X-Capture-ID"], "capture-1")
@@ -423,9 +404,7 @@ class BackendContractTests(unittest.TestCase):
             self.assertTrue(payload["depth_image"].startswith("data:image/jpeg;base64,"))
             self.assertEqual(payload["polar_scan"]["unit"], "x-near-reference")
             self.assertIs(payload["planning_authorized"], False)
-            self.assertEqual(
-                payload["service_fingerprint"], self.expected_service_fingerprint()
-            )
+            self.assertEqual(payload["service_session_id"], combined_server.SERVICE_SESSION_ID)
             self.assertEqual(
                 payload["planning_reason"], "da360-relative-is-preview-only"
             )
@@ -463,9 +442,7 @@ class BackendContractTests(unittest.TestCase):
             self.assertEqual(payload["calibration_acceptance_method"], "manual-user")
             self.assertEqual(payload["calibration_acceptance_scope"], "sim-to-sim")
             self.assertEqual(payload["calibration_id"], "calib-1")
-            self.assertEqual(
-                payload["service_fingerprint"], self.expected_service_fingerprint()
-            )
+            self.assertEqual(payload["service_session_id"], combined_server.SERVICE_SESSION_ID)
             self.assertEqual(len(payload["endstate"]), 9)
             self.assertEqual(payload["traj_time"], 1.125)
             diagnostics = payload["planning_diagnostics"]
@@ -679,11 +656,10 @@ class BackendContractTests(unittest.TestCase):
                 "experimental-unaccepted-da360-metric",
             )
 
-    def test_metric_planning_is_blocked_without_complete_service_fingerprint(self):
+    def test_metric_planning_uses_process_session_identity(self):
         with self.clients() as clients:
             combined_server.da360_runner.depth_mode = "da360-metric"
             combined_server.da360_runner.calibration = {"id": "calib-1"}
-            combined_server.yopo_runner.effective_config_sha256 = None
             query = (
                 "px=1&py=2&pz=3&rpx=4&rpy=5&rpz=6&"
                 "gx=10&gy=2&gz=4&vx=0&vy=0&vz=0&ax=0&ay=0&az=0&yaw=0"
@@ -694,13 +670,10 @@ class BackendContractTests(unittest.TestCase):
             )
             self.assertEqual(response.status_code, 200)
             payload = response.get_json()
-            self.assertIs(payload["planning_authorized"], False)
-            self.assertEqual(
-                payload["planning_reason"], "service-fingerprint-unavailable"
-            )
-            self.assertIsNone(payload["service_fingerprint"])
-            self.assertNotIn("endstate", payload)
-            self.assertEqual(combined_server.yopo_runner.infer_calls, 0)
+            self.assertIs(payload["planning_authorized"], True)
+            self.assertEqual(payload["service_session_id"], combined_server.SERVICE_SESSION_ID)
+            self.assertIn("endstate", payload)
+            self.assertEqual(combined_server.yopo_runner.infer_calls, 1)
 
     def test_combined_plan_full_rejects_incomplete_state(self):
         with self.clients() as clients:
@@ -734,18 +707,16 @@ class BackendContractTests(unittest.TestCase):
             self.assertIn("missing planning field: ax", missing_acceleration.get_json()["error"])
             self.assertEqual(combined_server.da360_runner.infer_calls, 0)
 
-    def test_combined_yopo_health_exposes_fingerprints(self):
+    def test_combined_yopo_health_exposes_readable_identity(self):
         with self.clients() as clients:
             response = clients["combined"].get("/yopo/health")
             self.assertEqual(response.status_code, 200)
             payload = response.get_json()
-            self.assertEqual(payload["checkpoint_sha256"], "cd" * 32)
             self.assertEqual(payload["checkpoint_coverage"], 1.0)
             self.assertEqual(payload["config"], "fake.yaml")
-            self.assertEqual(payload["config_sha256"], "ef" * 32)
             self.assertEqual(payload["base_config"], "traj_opt.yaml")
-            self.assertEqual(payload["base_config_sha256"], "12" * 32)
-            self.assertEqual(payload["effective_config_sha256"], "34" * 32)
+            self.assertEqual(payload["model"], "fake-yopo.pth")
+            self.assertEqual(payload["service_session_id"], combined_server.SERVICE_SESSION_ID)
             self.assertIs(payload["planning_authorized"], False)
 
     def test_relative_two_stage_plan_is_blocked_without_running_yopo(self):
@@ -889,13 +860,12 @@ class BackendContractTests(unittest.TestCase):
             self.assertIn("depth mode mismatch", response.get_json()["error"])
             self.assertEqual(combined_server.yopo_runner.infer_calls, 0)
 
-    def test_calibration_is_fail_closed_and_fingerprint_bound(self):
+    def test_calibration_is_fail_closed_and_runtime_contract_bound(self):
         runner = object.__new__(DA360Runner)
         runner.model_name = "DA360_fake"
         runner.width = 8
         runner.height = 4
         runner.resample_name = "bicubic"
-        runner.checkpoint_sha256 = "ab" * 32
         calibration = {
             "schema_version": 1,
             "accepted": True,
@@ -907,7 +877,6 @@ class BackendContractTests(unittest.TestCase):
             "width": runner.width,
             "height": runner.height,
             "resample": runner.resample_name,
-            "checkpoint_sha256": runner.checkpoint_sha256,
             "requestWidth": 16,
             "requestHeight": 8,
             "input": {
@@ -915,7 +884,6 @@ class BackendContractTests(unittest.TestCase):
                 "width": runner.width,
                 "height": runner.height,
                 "resample": runner.resample_name,
-                "checkpoint_sha256": runner.checkpoint_sha256,
                 "request_width": 16,
                 "request_height": 8,
             },
@@ -932,7 +900,6 @@ class BackendContractTests(unittest.TestCase):
                 "jpegQuality": 0.74,
                 "uploadScale": 0.5,
             },
-            "dataset_fingerprint_sha256": "de" * 32,
             "selected_model": "scale_shift",
             "relation": "inverse_depth_1_per_m = a * pred_disp + b",
             "acceptance": {"passed": True},
@@ -944,7 +911,7 @@ class BackendContractTests(unittest.TestCase):
             with patch.dict(os.environ, {"DA360_DEPTH_CALIB_PATH": str(path)}):
                 loaded = runner._load_depth_calibration()
             self.assertEqual(loaded["a"], 1.25)
-            self.assertEqual(len(loaded["id"]), 16)
+            self.assertEqual(loaded["id"], "depth_calibration-v1-DA360_fake-16x8")
             self.assertIs(loaded["accuracy_accepted"], True)
             self.assertIs(loaded["automatic_accuracy_gate_passed"], True)
             self.assertEqual(loaded["acceptance_method"], "automatic")
@@ -1015,10 +982,10 @@ class BackendContractTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "acceptance statuses disagree"):
                     runner._load_depth_calibration()
 
-            mismatched = dict(calibration, checkpoint_sha256="cd" * 32)
+            mismatched = dict(calibration, model="DA360_other")
             path.write_text(json.dumps(mismatched), encoding="utf-8")
             with patch.dict(os.environ, {"DA360_DEPTH_CALIB_PATH": str(path)}):
-                with self.assertRaisesRegex(RuntimeError, "checkpoint_sha256 mismatch"):
+                with self.assertRaisesRegex(RuntimeError, "model mismatch"):
                     runner._load_depth_calibration()
 
 

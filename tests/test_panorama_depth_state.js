@@ -369,7 +369,7 @@ async function nextTask() {
                 depth_mode: 'da360-metric',
                 calibration_id: 'calibration-v1',
                 calibration_accuracy_accepted: false,
-                service_fingerprint: 'service-v1',
+                service_session_id: 'service-v1',
                 planning_diagnostics: {
                     schema_version: 1,
                     selected_endstate_raw: [0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1],
@@ -450,12 +450,12 @@ async function nextTask() {
     assert.equal(planningUrl.searchParams.get('ax'), '0.1', 'YOPO observation uses frame reference acceleration');
     const runtimeProjection = JSON.parse(lastRequestOptions.headers['X-Projection-Config']);
     assert.equal(runtimeProjection.verticalFovDeg, 180,
-        'planning request carries the frozen frame projection fingerprint');
+        'planning request carries the frozen frame projection contract');
     assert.equal(runtimeProjection.jpegQuality, 0.74,
         'planning request carries the actual JPEG encoder quality');
     assert.equal(callbackContext.goalId, goalId);
     assert.equal(callbackContext.mode, 'planning');
-    assert.equal(callbackContext.serviceFingerprint, 'service-v1');
+    assert.equal(callbackContext.serviceSessionId, 'service-v1');
     assert.equal(callbackContext.calibrationAccuracyAccepted, false);
     assert.equal(callbackContext.captureSimTimeS, 12.5);
     assert.equal(callbackContext.captureActualState.position.x, 1);
@@ -479,7 +479,7 @@ async function nextTask() {
     assert.equal(planningMetrics.depthMode, 'da360-metric');
     assert.equal(planningMetrics.calibrationId, 'calibration-v1');
     assert.equal(planningMetrics.calibrationAccuracyAccepted, false);
-    assert.equal(planningMetrics.serviceFingerprint, 'service-v1');
+    assert.equal(planningMetrics.serviceSessionId, 'service-v1');
     assert.equal(planningMetrics.captureToApplyDisplacementM, 1);
     assert.ok(Number.isFinite(planningMetrics.ageAtFetchStartMs));
     assert.ok(Number.isFinite(planningMetrics.ageAtResponseHeadersMs));
@@ -515,7 +515,7 @@ async function nextTask() {
         traj_time: 1,
         depth_mode: 'da360-metric',
         calibration_id: 'cal-order',
-        service_fingerprint: 'svc-order',
+        service_session_id: 'svc-order',
         frame_id: '2', goal_id: 'goal-1', generation: '1',
     });
     sensor.onYopoResult = () => { callbackCalled = true; return true; };
@@ -558,6 +558,46 @@ async function nextTask() {
     assert.equal(rejectedMetrics.trajectoryApplied, false);
     assert.equal(rejectedMetrics.dropReason, 'trajectory-apply-rejected');
     assert.match(rejected.depthStatusEl.textContent, /rejected/);
+
+    const ignored = newSensorWithFrame();
+    ignored.setYopoPose({ x: 0, y: 100, z: 0, vx: 0, vy: 0, vz: 0 }, 0);
+    ignored.setYopoGoal({ x: 30, y: 100, z: 0 });
+    ignored.primeFromCaptureResult(new FakeCanvas('planning-ignore-rgb'));
+    let ignoredMetrics = null;
+    ignored.onYopoResult = () => ({
+        outcome: 'ignored',
+        reason: 'terminal-committed',
+    });
+    ignored.onPerceptionMetrics = value => {
+        if (value.mode === 'planning') ignoredMetrics = value;
+    };
+    assert.equal(await ignored._requestDepth(ignored.rgbCanvas), true);
+    await ignored._waitForDepthPreviewIdle();
+    assert.equal(ignoredMetrics.outcome, 'ignored');
+    assert.equal(ignoredMetrics.trajectoryApplied, false);
+    assert.equal(ignoredMetrics.trajectoryIgnored, true);
+    assert.equal(ignoredMetrics.dropReason, 'terminal-committed');
+    assert.match(ignored.depthStatusEl.textContent, /paused/);
+}
+
+// Terminal ownership pauses network planning without disabling live RGB
+// capture. Once released, only a newly captured frame may be planned.
+{
+    const sensor = newSensorWithFrame();
+    sensor.setYopoPose({ x: 0, y: 100, z: 0, vx: 0, vy: 0, vz: 0 }, 0);
+    sensor.setYopoGoal({ x: 30, y: 100, z: 0 });
+    sensor.primeFromCaptureResult(new FakeCanvas('planning-pause-rgb'));
+    assert.equal(sensor.setYopoPlanningPaused(true, 'terminal-committed'), true);
+    assert.equal(sensor._shouldRequestDepth(), false,
+        'terminal pause suppresses otherwise eligible planning requests');
+    assert.equal(sensor.getDepthState().planningPaused, true);
+    assert.equal(sensor.setYopoPlanningPaused(false, 'terminal-aborted'), true);
+    assert.equal(sensor.getDepthState().planningPaused, false);
+    assert.equal(sensor._shouldRequestDepth(), false,
+        'unpause does not reuse the RGB frame captured under terminal ownership');
+    sensor.primeFromCaptureResult(new FakeCanvas('planning-resumed-rgb'));
+    assert.equal(sensor._shouldRequestDepth(), true,
+        'a fresh post-terminal RGB frame resumes ordinary rolling planning');
 }
 
 // A slow operator preview is never part of the planning request gate. The next
@@ -602,7 +642,7 @@ async function nextTask() {
             traj_time: 1,
             depth_mode: 'da360-metric',
             calibration_id: 'cal-slow-preview',
-            service_fingerprint: 'svc-slow-preview',
+            service_session_id: 'svc-slow-preview',
             frame_id: parsed.searchParams.get('frame_id'),
             goal_id: parsed.searchParams.get('goal_id'),
             generation: parsed.searchParams.get('generation'),
@@ -683,7 +723,7 @@ async function nextTask() {
             traj_time: 1,
             depth_mode: 'da360-metric',
             calibration_id: 'cal-coalesce',
-            service_fingerprint: 'svc-coalesce',
+            service_session_id: 'svc-coalesce',
             frame_id: parsed.searchParams.get('frame_id'),
             goal_id: parsed.searchParams.get('goal_id'),
             generation: parsed.searchParams.get('generation'),
@@ -736,7 +776,7 @@ async function nextTask() {
         traj_time: 1,
         depth_mode: 'da360-metric',
         calibration_id: 'cal-stale-preview',
-        service_fingerprint: 'svc-stale-preview',
+        service_session_id: 'svc-stale-preview',
         frame_id: '2', goal_id: 'goal-1', generation: '1',
     });
     sensor.onYopoResult = () => true;
@@ -793,7 +833,7 @@ async function nextTask() {
                 traj_time: 1,
                 depth_mode: 'da360-metric',
                 calibration_id: 'cal-rejected-pending',
-                service_fingerprint: 'svc-rejected-pending',
+                service_session_id: 'svc-rejected-pending',
                 frame_id: '2', goal_id: 'goal-1', generation: '1',
             },
             apply: () => false,
@@ -851,7 +891,7 @@ async function nextTask() {
         traj_time: 1,
         depth_mode: 'da360-metric',
         calibration_id: 'cal-corrupt-preview',
-        service_fingerprint: 'svc-corrupt-preview',
+        service_session_id: 'svc-corrupt-preview',
         frame_id: '2', goal_id: 'goal-1', generation: '1',
     });
     sensor.onYopoResult = () => true;
@@ -878,7 +918,7 @@ async function nextTask() {
     for (const [label, override, expected] of [
         ['relative-mode', { depth_mode: 'da360-relative' }, /untrusted depth mode/],
         ['missing-calibration', { calibration_id: null }, /missing calibration_id/],
-        ['missing-service', { service_fingerprint: null }, /missing service_fing/],
+        ['missing-service', { service_session_id: null }, /missing service_sess/],
     ]) {
         const sensor = newSensorWithFrame();
         sensor.setYopoPose({ x: 0, y: 100, z: 0, vx: 0, vy: 0, vz: 0 }, 0);
@@ -895,7 +935,7 @@ async function nextTask() {
             traj_time: 1,
             depth_mode: 'da360-metric',
             calibration_id: 'cal-trusted',
-            service_fingerprint: 'svc-trusted',
+            service_session_id: 'svc-trusted',
             frame_id: '2', goal_id: 'goal-1', generation: '1',
             ...override,
         });
@@ -1024,7 +1064,7 @@ async function nextTask() {
         traj_time: 1,
         depth_mode: 'da360-metric',
         calibration_id: 'cal-before-failure',
-        service_fingerprint: 'svc-before-failure',
+        service_session_id: 'svc-before-failure',
         frame_id: '2', goal_id: 'goal-1', generation: '1',
     }));
     assert.equal(await staleRequest, false,
@@ -1092,7 +1132,7 @@ async function nextTask() {
         traj_time: 1,
         depth_mode: 'da360-metric',
         calibration_id: 'cal-pipeline',
-        service_fingerprint: 'svc-pipeline',
+        service_session_id: 'svc-pipeline',
         frame_id: '2', goal_id: 'goal-1', generation: '1',
     }));
 
@@ -1139,7 +1179,7 @@ async function nextTask() {
         traj_time: 1,
         depth_mode: 'da360-metric',
         calibration_id: 'cal-expired',
-        service_fingerprint: 'svc-expired',
+        service_session_id: 'svc-expired',
         frame_id: '2', goal_id: 'goal-1', generation: '1',
         });
     };
@@ -1215,7 +1255,7 @@ async function nextTask() {
                 traj_time: 1,
                 depth_mode: 'da360-metric',
                 calibration_id: 'cal-request-start-cadence',
-                service_fingerprint: 'svc-request-start-cadence',
+                service_session_id: 'svc-request-start-cadence',
                 frame_id: parsed.searchParams.get('frame_id'),
                 goal_id: parsed.searchParams.get('goal_id'),
                 generation: parsed.searchParams.get('generation'),
@@ -1359,7 +1399,7 @@ async function nextTask() {
                     traj_time: 1,
                     depth_mode: 'da360-metric',
                     calibration_id: 'cal-apply-boundary',
-                    service_fingerprint: 'svc-apply-boundary',
+                    service_session_id: 'svc-apply-boundary',
                     planning_diagnostics: { ...VALID_PLANNING_DIAGNOSTICS },
                     frame_id: '2', goal_id: 'goal-1', generation: '1',
                 };
@@ -1428,7 +1468,7 @@ async function nextTask() {
         traj_time: 1,
         depth_mode: 'da360-metric',
         calibration_id: 'cal-schema-v2',
-        service_fingerprint: 'svc-schema-v2',
+        service_session_id: 'svc-schema-v2',
         planning_diagnostics: {
             ...VALID_PLANNING_DIAGNOSTICS,
             schema_version: 2,
@@ -1559,7 +1599,7 @@ async function nextTask() {
             traj_time: 1,
             depth_mode: 'da360-metric',
             calibration_id: `cal-${scenario.label}`,
-            service_fingerprint: `svc-${scenario.label}`,
+            service_session_id: `svc-${scenario.label}`,
             planning_diagnostics: scenario.value,
             frame_id: '2', goal_id: 'goal-1', generation: '1',
         });
@@ -1582,7 +1622,7 @@ async function nextTask() {
         traj_time: 1,
         depth_mode: 'da360-metric',
         calibration_id: 'cal-raw-tolerance',
-        service_fingerprint: 'svc-raw-tolerance',
+        service_session_id: 'svc-raw-tolerance',
         planning_diagnostics: {
             ...VALID_PLANNING_DIAGNOSTICS,
             selected_endstate_raw: [1 + 5e-6, 0, 0, 0, 0, 0, 0, 0, 0],
@@ -1722,7 +1762,7 @@ async function nextTask() {
                     traj_time: 1,
                     depth_mode: 'da360-metric',
                     calibration_id: 'cal-final-deadline',
-                    service_fingerprint: 'svc-final-deadline',
+                    service_session_id: 'svc-final-deadline',
                     planning_diagnostics: { ...VALID_PLANNING_DIAGNOSTICS },
                     frame_id: '2', goal_id: 'goal-1', generation: '1',
                 };
@@ -1792,7 +1832,7 @@ async function nextTask() {
                     traj_time: 1,
                     depth_mode: 'da360-metric',
                     calibration_id: 'cal-cross-deadline',
-                    service_fingerprint: 'svc-cross-deadline',
+                    service_session_id: 'svc-cross-deadline',
                     planning_diagnostics: { ...VALID_PLANNING_DIAGNOSTICS },
                     frame_id: '2', goal_id: 'goal-1', generation: '1',
                 };
@@ -1873,7 +1913,7 @@ async function nextTask() {
                     traj_time: 1,
                     depth_mode: 'da360-metric',
                     calibration_id: 'cal-outer-post-deadline',
-                    service_fingerprint: 'svc-outer-post-deadline',
+                    service_session_id: 'svc-outer-post-deadline',
                     planning_diagnostics: { ...VALID_PLANNING_DIAGNOSTICS },
                     frame_id: '2', goal_id: 'goal-1', generation: '1',
                 };
@@ -1925,7 +1965,7 @@ async function nextTask() {
         traj_time: 1,
         depth_mode: 'da360-metric',
         calibration_id: 'cal-observer-isolation',
-        service_fingerprint: 'svc-observer-isolation',
+        service_session_id: 'svc-observer-isolation',
         frame_id: '2', goal_id: 'goal-1', generation: '1',
     });
     sensor.onYopoResult = () => true;
@@ -1984,7 +2024,7 @@ async function nextTask() {
         assert.deepEqual(
             JSON.parse(options.headers['X-Projection-Config']),
             materialized.frame.projectionConfig,
-            'raw request carries the frozen projection fingerprint',
+            'raw request carries the frozen projection contract',
         );
         assert.equal(options.body, materialized.frame.rgb, 'raw request reuses the frozen frame JPEG');
         return {
@@ -2022,7 +2062,13 @@ async function nextTask() {
     assert.equal(requestedUrl.searchParams.get('session_id'), artifacts.manifest.sessionId);
     assert.equal(requestedUrl.searchParams.get('capture_id'), 'capture-001');
     assert.equal(requestedUrl.searchParams.get('location_id'), 'street-a');
-    assert.equal(artifacts.manifest.files.raw.sha256, artifacts.manifest.rawSha256);
+    assert.equal(artifacts.manifest.files.raw.name, 'capture-001-raw.npz');
+    assert.equal(artifacts.manifest.files.rgb.name, 'capture-001-rgb.jpg');
+    assert.equal(artifacts.manifest.files.anchors.name, 'capture-001-anchors.json');
+    assert.equal(artifacts.manifest.files.raw.bytes, artifacts.files['capture-001-raw.npz'].size);
+    assert.equal(artifacts.manifest.files.rgb.bytes, artifacts.files['capture-001-rgb.jpg'].size);
+    assert.equal(artifacts.manifest.files.anchors.bytes, artifacts.files['capture-001-anchors.json'].size);
+    assert.ok(!('rawSha256' in artifacts.manifest));
     assert.equal(artifacts.manifest.rgbWidth, materialized.frame.projectionConfig.rgbWidth);
     assert.equal(artifacts.manifest.projectionConfig.jpegQuality, 0.74);
     assert.equal(artifacts.manifest.projectionConfig.uploadScale, 1);
@@ -2323,7 +2369,7 @@ for (const transition of ['profile-switch', 'goal-set']) {
             depth_mode: 'da360-metric',
             calibration_id: 'partial-rgb-test',
             calibration_accuracy_accepted: false,
-            service_fingerprint: 'partial-rgb-service',
+            service_session_id: 'partial-rgb-service',
             planning_authorized: true,
             planning_reason: 'experimental-unaccepted-da360-metric',
             endstate: [1, 0, 0, 0, 0, 0, 0, 0, 0],

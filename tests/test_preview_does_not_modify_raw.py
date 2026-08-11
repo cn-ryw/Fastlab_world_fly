@@ -1,5 +1,5 @@
 """Verify that calling /depth (preview) does NOT mutate the raw output of /depth/raw."""
-import io, os, sys
+import io, json, os, sys
 import numpy as np
 import pytest
 import requests
@@ -10,6 +10,13 @@ pytestmark = pytest.mark.integration
 DA360_URL = os.environ.get("DA360_URL", "http://127.0.0.1:5688")
 SESSION = requests.Session()
 SESSION.trust_env = False
+PROJECTION_HEADERS = {"X-Projection-Config": json.dumps({
+    "width": 384, "height": 192, "faceSize": 96,
+    "verticalFovDeg": 180.0, "faceFovDeg": 130.0,
+    "topPoleGuardDeg": 10.0, "bottomPoleGuardDeg": 2.0,
+    "jpegQuality": 0.74, "uploadScale": 134 / 384,
+    "rgbWidth": 134, "rgbHeight": 67,
+})}
 
 
 def _post_raw(image_bytes):
@@ -22,12 +29,14 @@ def _post_raw(image_bytes):
 def _post_depth(image_bytes):
     return SESSION.post(f"{DA360_URL}/depth",
                          data=image_bytes,
-                         headers={"Content-Type": "image/jpeg"},
+                         headers={"Content-Type": "image/jpeg", **PROJECTION_HEADERS},
                          timeout=60)
 
 
 def _jpeg_bytes():
-    img = Image.new("RGB", (1036, 518), (50, 180, 80))
+    # Use the accepted metric request size so /depth exercises the production
+    # contract while /depth/raw still proves inference immutability.
+    img = Image.new("RGB", (134, 67), (50, 180, 80))
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=85)
     return buf.getvalue()

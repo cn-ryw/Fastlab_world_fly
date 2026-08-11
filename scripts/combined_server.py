@@ -11,7 +11,6 @@ for planning (a structurally validated metric calibration).
 """
 
 import argparse
-import hashlib
 import json
 import math
 import os
@@ -56,6 +55,10 @@ app = Flask(__name__)
 configure_api_security(app)
 da360_runner = None
 yopo_runner = None
+SERVICE_SESSION_ID = (
+    os.environ.get("MINDCLOUD_SERVICE_SESSION_ID", "").strip()
+    or f"api{API_VERSION}-pid{os.getpid()}-start{time.time_ns()}"
+)
 # 服务端缓存最近一次 DA360 推理结果（由 /depth 写入，/yopo/plan 读取，避免前端回传 1.4MB）
 _depth_cache = {
     "data": None,
@@ -135,33 +138,9 @@ def _planning_authorization():
         return False, "metric-calibration-not-loaded"
     if yopo_runner is None:
         return False, "yopo-not-initialized"
-    if _service_fingerprint() is None:
-        return False, "service-fingerprint-unavailable"
     if calibration.get("accuracy_accepted") is False:
         return True, "experimental-unaccepted-da360-metric"
     return True, "validated-da360-metric"
-
-
-def _service_fingerprint():
-    """Hash the model/config identity that produced a planning response."""
-    if da360_runner is None or yopo_runner is None:
-        return None
-    identity = {
-        "api_version": API_VERSION,
-        "da360_checkpoint_sha256": getattr(
-            da360_runner, "checkpoint_sha256", None
-        ),
-        "yopo_checkpoint_sha256": getattr(yopo_runner, "checkpoint_sha256", None),
-        "yopo_effective_config_sha256": getattr(
-            yopo_runner, "effective_config_sha256", None
-        ),
-    }
-    if not all(identity.values()):
-        return None
-    canonical = json.dumps(
-        identity, sort_keys=True, separators=(",", ":"), ensure_ascii=True
-    ).encode("ascii")
-    return hashlib.sha256(canonical).hexdigest()
 
 
 # ── YOPO endpoints ───────────────────────────────────────────────────────
@@ -176,19 +155,13 @@ def yopo_health():
         "api_version": API_VERSION,
         "device": yopo_runner.device,
         "model": Path(str(getattr(yopo_runner, "model_path", "unknown"))).name,
-        "checkpoint_sha256": getattr(yopo_runner, "checkpoint_sha256", None),
         "checkpoint_coverage": getattr(yopo_runner, "checkpoint_coverage", None),
         "checkpoint_missing_keys": getattr(yopo_runner, "checkpoint_missing_keys", None),
         "checkpoint_unexpected_keys": getattr(yopo_runner, "checkpoint_unexpected_keys", None),
         "config": getattr(yopo_runner, "config_name", None)
             or os.environ.get("YOPO_CONFIG", "x5_cruise15_18m_a12_mask_wc3.yaml"),
-        "config_sha256": getattr(yopo_runner, "config_sha256", None),
         "base_config": getattr(yopo_runner, "base_config_name", None) or "traj_opt.yaml",
-        "base_config_sha256": getattr(yopo_runner, "base_config_sha256", None),
-        "effective_config_sha256": getattr(
-            yopo_runner, "effective_config_sha256", None
-        ),
-        "service_fingerprint": _service_fingerprint(),
+        "service_session_id": SERVICE_SESSION_ID,
         "calibration_accuracy_accepted": calibration.get("accuracy_accepted")
             if calibration else None,
         "calibration_automatic_gate_passed": calibration.get(
@@ -394,7 +367,7 @@ def yopo_plan():
                 if calibration else None,
             "planning_authorized": planning_authorized,
             "planning_reason": planning_reason,
-            "service_fingerprint": _service_fingerprint(),
+            "service_session_id": SERVICE_SESSION_ID,
         }
         identity = _response_identity(data, required=planning_authorized)
         planning_metadata.update(identity)
@@ -681,7 +654,7 @@ def yopo_plan_full():
                 if calibration else None,
             "planning_authorized": planning_authorized,
             "planning_reason": planning_reason,
-            "service_fingerprint": _service_fingerprint(),
+            "service_session_id": SERVICE_SESSION_ID,
             "latency_ms": (time.perf_counter() - started) * 1000.0,
             "timings_ms": {
                 "decode_ms": (t_decode - t0) * 1000.0,

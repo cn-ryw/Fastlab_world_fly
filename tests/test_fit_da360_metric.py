@@ -1,13 +1,12 @@
 """Pure tests for fail-closed DA360 inverse-depth metric fitting."""
 
 import copy
-import hashlib
 import json
 from pathlib import Path
 
 import numpy as np
 import pytest
-from PIL import Image, ImageOps
+from PIL import Image
 
 from scripts.fit_da360_metric import (
     _depth_metrics_from_inverse,
@@ -23,26 +22,19 @@ from scripts.fit_da360_metric import (
 
 TRUE_A = 2.25
 TRUE_B = 0.12
-CHECKPOINT_SHA = "a" * 64
 UNIT_PRED_DISP = "raw disparity (inverse depth), NOT per-frame normalized"
 PANORAMA_FACES = ("front", "right", "back", "left", "up", "down")
 
 
-def _sha256(path):
-    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
-
-
 def _rewrite_anchor_metadata(paths, mutate):
-    """Mutate anchor metadata while preserving the bundle's SHA contract."""
+    """Mutate anchor metadata while preserving the bundle identity contract."""
     anchors_path = paths[1]
     manifest_path = paths[2]
     anchor_payload = json.loads(anchors_path.read_text(encoding="utf-8"))
     mutate(anchor_payload["metadata"])
     anchors_path.write_text(json.dumps(anchor_payload, indent=2), encoding="utf-8")
-    anchors_sha = _sha256(anchors_path)
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    manifest["anchorsSha256"] = anchors_sha
-    manifest["files"]["anchors"]["sha256"] = anchors_sha
+    manifest["files"]["anchors"]["bytes"] = anchors_path.stat().st_size
     manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
 
@@ -85,11 +77,6 @@ def _write_bundle(
         ((xx + yy) * 13 + color_seed * 71) % 256,
     ], axis=-1).astype(np.uint8)
     Image.fromarray(rgb_array).save(rgb_path, format="JPEG", quality=88)
-    with Image.open(rgb_path) as encoded:
-        decoded = ImageOps.exif_transpose(encoded).convert("RGB")
-        decoded.load()
-    decoded_sha = hashlib.sha256(np.asarray(decoded, dtype=np.uint8).tobytes()).hexdigest()
-
     base = np.linspace(0.08, 0.32, raw_width * raw_height, dtype=np.float32)
     pred_disp = base.reshape(raw_height, raw_width) + np.float32(disparity_offset)
     epsilon = 1e-6
@@ -102,10 +89,8 @@ def _write_bundle(
         "height": raw_height,
         "input_scale": 0.46,
         "resample": "bicubic",
-        "checkpoint_sha256": CHECKPOINT_SHA,
         "request_width": source_width,
         "request_height": source_height,
-        "decoded_rgb_sha256": decoded_sha,
         "frame_id": str(frame_id),
         "session_id": session_id,
         "capture_id": capture_id,
@@ -213,7 +198,6 @@ def _write_bundle(
         "rgbWidth": source_width,
         "rgbHeight": source_height,
     }
-    rgb_sha, raw_sha, anchors_sha = map(_sha256, (rgb_path, raw_path, anchors_path))
     manifest = {
         "schemaVersion": 2,
         "sessionId": session_id,
@@ -224,13 +208,10 @@ def _write_bundle(
         "exportedAt": "2026-08-09T12:00:00.000Z",
         "rgbWidth": source_width,
         "rgbHeight": source_height,
-        "rgbSha256": rgb_sha,
-        "rawSha256": raw_sha,
-        "anchorsSha256": anchors_sha,
         "files": {
-            "rgb": {"name": rgb_path.name, "sha256": rgb_sha},
-            "raw": {"name": raw_path.name, "sha256": raw_sha},
-            "anchors": {"name": anchors_path.name, "sha256": anchors_sha},
+            "rgb": {"name": rgb_path.name, "bytes": rgb_path.stat().st_size},
+            "raw": {"name": raw_path.name, "bytes": raw_path.stat().st_size},
+            "anchors": {"name": anchors_path.name, "bytes": anchors_path.stat().st_size},
         },
         "rawModel": "synthetic-da360",
         "rawWidth": raw_width,
@@ -287,9 +268,9 @@ def test_pixel_center_mapping_and_horizontal_wrap(tmp_path):
         raw_size=(4, 2),
         anchors_override=anchors,
     )
-    # Replace the raw values, then repair all bundle hashes and decoded semantic
-    # fields through a fresh fixture is unnecessarily opaque; the pure sampler
-    # assertions below lock the same mapping directly.
+    # Replacing the raw values and all associated semantic fields through the
+    # fixture would be unnecessarily opaque; the pure sampler assertions below
+    # lock the same mapping directly.
     assert map_pixel_center(1.5, 8, 4) == 0.5
     assert map_pixel_center(7.5, 8, 4) == 3.5
     assert sample_wrapped_bilinear(pred_disp, np.ones_like(pred_disp, bool), 0.5, 0) == 5.0
@@ -316,20 +297,30 @@ def test_load_rejects_missing_manifest_identity(tmp_path, missing_field):
         _load_bundle(*paths)
 
 
-def test_load_rejects_manifest_hash_tamper(tmp_path):
-    paths = _write_bundle(tmp_path / "tamper")
+def test_load_rejects_manifest_filename_mismatch(tmp_path):
+    paths = _write_bundle(tmp_path / "filename")
     manifest_path = paths[2]
     manifest = json.loads(manifest_path.read_text())
-    manifest["rgbSha256"] = "b" * 64
+    manifest["files"]["rgb"]["name"] = "another-frame-rgb.jpg"
     manifest_path.write_text(json.dumps(manifest))
-    with pytest.raises(ValueError, match="rgbSha256"):
+    with pytest.raises(ValueError, match="filename mismatch"):
         _load_bundle(*paths)
 
 
-def test_load_rejects_artifact_tamper_and_frame_mismatch(tmp_path):
+def test_load_rejects_manifest_artifact_size_mismatch(tmp_path):
+    paths = _write_bundle(tmp_path / "size")
+    manifest_path = paths[2]
+    manifest = json.loads(manifest_path.read_text())
+    manifest["files"]["raw"]["bytes"] += 1
+    manifest_path.write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match="artifact size mismatch"):
+        _load_bundle(*paths)
+
+
+def test_load_rejects_corrupt_artifact_and_frame_mismatch(tmp_path):
     paths = _write_bundle(tmp_path / "bytes")
-    paths[3].write_bytes(paths[3].read_bytes() + b"tampered")
-    with pytest.raises(ValueError, match="rgb SHA-256 mismatch"):
+    paths[3].write_bytes(b"x" * paths[3].stat().st_size)
+    with pytest.raises(ValueError, match="invalid RGB artifact"):
         _load_bundle(*paths)
 
     paths = _write_bundle(tmp_path / "frame", frame_id="raw-frame")
@@ -468,7 +459,7 @@ def test_metrics_are_computed_in_metres():
     assert np.isclose(metrics["rmse_m"], 1.0)
 
 
-def test_duplicate_capture_frame_rgb_and_pose_are_rejected(tmp_path):
+def test_duplicate_capture_frame_and_pose_are_rejected(tmp_path):
     first = _load_bundle(*_write_bundle(
         tmp_path / "first", capture_id="one", frame_id="1", position=(0, 0, 0), color_seed=1
     ))
@@ -484,11 +475,6 @@ def test_duplicate_capture_frame_rgb_and_pose_are_rejected(tmp_path):
     duplicate = copy.deepcopy(second)
     duplicate["identity"]["frameId"] = "1"
     with pytest.raises(ValueError, match="duplicate session/frame"):
-        combine_datasets([first, duplicate])
-
-    duplicate = copy.deepcopy(second)
-    duplicate["rgb_sha256"] = first["rgb_sha256"]
-    with pytest.raises(ValueError, match="duplicate RGB"):
         combine_datasets([first, duplicate])
 
     duplicate = copy.deepcopy(second)
@@ -549,13 +535,13 @@ def test_known_scale_shift_all_locations_pass_and_candidate_is_bound(tmp_path):
 
     calibration = json.loads((output_dir / "depth_calibration.json").read_text())
     assert calibration["accepted"] is True
-    assert calibration["checkpoint_sha256"] == CHECKPOINT_SHA
+    assert calibration["calibration_id"] == "da360-metric-v1-synthetic-da360-8x4"
     assert calibration["requestWidth"] == 8
     assert calibration["requestHeight"] == 4
     assert calibration["input"]["request_width"] == 8
     assert calibration["projection"]["jpegQuality"] == 0.74
     assert calibration["projection"]["rgbWidth"] == 8
-    assert len(calibration["dataset_fingerprint_sha256"]) == 64
+    assert "dataset_fingerprint_sha256" not in calibration
 
 
 def test_one_bad_held_out_location_rejects_aggregate_candidate(tmp_path):

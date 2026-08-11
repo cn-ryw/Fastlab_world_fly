@@ -52,6 +52,103 @@ globalThis.document = {
 
 const { CesiumWorld } = await import('../src/cesium-world.js?scheduler-test');
 
+// The 500 m startup preload must retain the complete 160 m grid. Truncating
+// the nearest-first list at the old 420 m count drops most of the outer ring
+// and makes coverage depend on iteration order.
+{
+    const world = Object.create(CesiumWorld.prototype);
+    const targets = world._buildPreloadTargets(500, 160, 30);
+    if (targets.length !== 29) {
+        throw new Error(`expected the complete 500 m preload grid, got ${targets.length} targets`);
+    }
+    const keys = new Set(targets.map(({ x, z }) => `${x},${z}`));
+    for (const { x, z } of targets) {
+        if (!keys.has(`${-x},${-z}`)) {
+            throw new Error(`500 m preload grid is asymmetric at ${x},${z}`);
+        }
+    }
+    const maxRadius = Math.max(...targets.map(({ x, z }) => Math.hypot(x, z)));
+    if (maxRadius < 450 || maxRadius > 500) {
+        throw new Error(`500 m preload outer ring is incomplete: ${maxRadius.toFixed(2)} m`);
+    }
+}
+
+// API credentials must be carried by the supported Google header, never in a
+// browser-visible root or derived tile URL.
+{
+    let receivedResource = null;
+    let receivedOptions = null;
+    class FakeResource {
+        constructor(options) { Object.assign(this, options); }
+    }
+    const world = Object.create(CesiumWorld.prototype);
+    world.assetId = 123;
+    world.Cesium = {
+        IonResource: {
+            async fromAssetId(assetId) {
+                if (assetId !== 123) throw new Error('wrong asset ID');
+                return {
+                    url: 'https://tile.googleapis.com/v1/3dtiles/root.json?key=test-secret',
+                    headers: { 'X-Test': 'retained' },
+                    credits: ['credit'],
+                    proxy: null,
+                };
+            },
+        },
+        Resource: FakeResource,
+        Cesium3DTileset: {
+            async fromUrl(resource, options) {
+                receivedResource = resource;
+                receivedOptions = options;
+                return { resource };
+            },
+        },
+    };
+    await world._createGoogleTileset();
+    if (!receivedResource
+        || receivedResource.url.includes('test-secret')
+        || receivedResource.url.includes('?')
+        || receivedResource.headers['X-Goog-Api-Key'] !== 'test-secret'
+        || receivedResource.headers['X-Test'] !== 'retained'
+        || receivedOptions.enableCollision !== true) {
+        throw new Error('Google Tiles API key was not moved from URL to header');
+    }
+}
+
+// Hidden-viewer defaults avoid sibling/leaf over-fetch, while the explicit
+// rollback profile retains the previous Cesium streaming flags for live A/B.
+{
+    const propertyNames = [
+        'maximumScreenSpaceError', 'cullRequestsWhileMoving',
+        'preloadWhenHidden', 'preloadFlightDestinations',
+        'foveatedScreenSpaceError', 'dynamicScreenSpaceError',
+        'dynamicScreenSpaceErrorDensity', 'dynamicScreenSpaceErrorFactor',
+        'loadSiblings', 'skipLevelOfDetail', 'baseScreenSpaceError',
+        'skipScreenSpaceErrorFactor', 'skipLevels',
+        'immediatelyLoadDesiredLevelOfDetail', 'preferLeaves',
+    ];
+    const makeTileset = () => Object.fromEntries(propertyNames.map(name => [name, null]));
+    const world = Object.create(CesiumWorld.prototype);
+    world.panoramaTileSSE = 512;
+    world.panoramaLeanStreaming = true;
+    const lean = makeTileset();
+    world._configurePanoramaTileset(lean);
+    if (lean.loadSiblings || lean.preloadWhenHidden || lean.preloadFlightDestinations
+        || lean.immediatelyLoadDesiredLevelOfDetail || lean.preferLeaves
+        || lean.skipLevelOfDetail !== true) {
+        throw new Error('lean panorama tileset profile retained an over-fetch flag');
+    }
+
+    world.panoramaLeanStreaming = false;
+    const legacy = makeTileset();
+    world._configurePanoramaTileset(legacy);
+    if (!legacy.loadSiblings || !legacy.preloadWhenHidden || !legacy.preloadFlightDestinations
+        || !legacy.immediatelyLoadDesiredLevelOfDetail || !legacy.preferLeaves
+        || legacy.skipLevelOfDetail !== false) {
+        throw new Error('legacy panorama tileset rollback profile was not preserved');
+    }
+}
+
 function harness() {
     const faces = [];
     const projector = {
@@ -277,8 +374,8 @@ for (const [facesPerSlice, expectedYields] of [[2, 2], [3, 1], [6, 0]]) {
         || flightOptions.frameDelayMs !== 0
         || flightOptions.tileTimeoutMs !== 0
         || flightOptions.tileQuietMs !== 0
-        || flightOptions.facesPerSlice !== 3) {
-        throw new Error('flight profile must force zero-wait capture with the 3-face A/B default');
+        || flightOptions.facesPerSlice !== 2) {
+        throw new Error('flight profile must force zero-wait capture with the 2-face default');
     }
     const flightPreloadOptions = flightSensor.getCaptureOptions({ preload: true });
     if (flightPreloadOptions.captureAnyway

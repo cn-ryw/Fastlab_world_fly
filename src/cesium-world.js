@@ -28,7 +28,7 @@
  * longitude/latitude.
  */
 
-import { reportUserError } from './error-report.js';
+import { formatError, reportUserError } from './error-report.js';
 import { erpDirectionToComponent, sampleAnchorDirections } from './erp-geometry.js';
 
 const DEFAULT_ION_TOKEN = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJqdGkiOiJlMTg2MGFhOS02YTdhLTQ1NWMtYjkzMi05YjQ2ODRlZjI5YTgiLCJpZCI6MjUxNzM1LCJpYXQiOjE3MzAyODI0ODN9.prWAxx4RB8teelutQQbVqdxhgRZpZ4zjw8wzM-8k1Ug';
@@ -465,6 +465,22 @@ export class CesiumWorld {
             1024,
             512
         );
+        // The hidden 96 px capture faces are used for local obstacle sensing,
+        // not a globe-scale horizon. A finite far plane materially reduces the
+        // six repeated tileset traversals without changing ERP dimensions or
+        // the accepted DA360 projection/calibration contract.
+        this.panoramaFarMeters = clampNumber(
+            urlNumber('panoramaFarMeters', options.panoramaFarMeters ?? 1200),
+            500,
+            15000000,
+            1200
+        );
+        this.panoramaLeanStreaming = urlNumber(
+            'panoramaLeanStreaming',
+            options.panoramaLeanStreaming === undefined
+                ? 1
+                : options.panoramaLeanStreaming ? 1 : 0,
+        ) >= 0.5;
         this.Cesium = null;
         this.viewer = null;
         this.tileset = null;
@@ -613,35 +629,79 @@ export class CesiumWorld {
 
     async _createGoogleTileset(progressCb = null) {
         const Cesium = this.Cesium;
-        if (typeof Cesium.createGooglePhotorealistic3DTileset === 'function') {
+        // Resolve the ion external asset ourselves so the Google API key can
+        // travel in its supported X-Goog-Api-Key header instead of every tile
+        // URL. Derived Cesium Resources inherit headers, while Firefox's own
+        // network errors can no longer print the key in a failed request URL.
+        if (Cesium.IonResource?.fromAssetId
+            && Cesium.Resource
+            && Cesium.Cesium3DTileset?.fromUrl) {
             try {
                 if (progressCb) progressCb('Loading Google Photorealistic 3D Tiles...');
-                return await Cesium.createGooglePhotorealistic3DTileset();
+                const ionResource = await Cesium.IonResource.fromAssetId(this.assetId);
+                const sourceUrl = new URL(ionResource.url);
+                const googleApiKey = sourceUrl.searchParams.get('key');
+                if (sourceUrl.hostname !== 'tile.googleapis.com' || !googleApiKey) {
+                    throw new Error('ion Google Tiles endpoint is missing its expected host/key contract');
+                }
+                sourceUrl.username = '';
+                sourceUrl.password = '';
+                sourceUrl.searchParams.delete('key');
+                sourceUrl.hash = '';
+                const resourceOptions = {
+                    url: sourceUrl.toString(),
+                    headers: {
+                        ...(ionResource.headers || {}),
+                        'X-Goog-Api-Key': googleApiKey,
+                    },
+                    credits: ionResource.credits,
+                };
+                if (ionResource.proxy) resourceOptions.proxy = ionResource.proxy;
+                const resource = new Cesium.Resource(resourceOptions);
+                return await Cesium.Cesium3DTileset.fromUrl(resource, {
+                    cacheBytes: 1536 * 1024 * 1024,
+                    maximumCacheOverflowBytes: 1024 * 1024 * 1024,
+                    enableCollision: true,
+                });
             } catch (e) {
-                reportUserError('Google Photorealistic tileset API failed; falling back to ion asset', e, {
-                    key: 'google-photorealistic-tileset',
+                reportUserError('Credential-safe Google Photorealistic tileset load failed', e, {
+                    key: 'google-photorealistic-tileset-safe-load',
                     intervalMs: 10000,
                 });
+                // Do not silently fall back to query credentials: that would
+                // reintroduce API keys into Firefox-native network errors.
+                throw e;
             }
         }
 
-        if (progressCb) progressCb(`Loading Google Photorealistic 3D Tiles asset ${this.assetId}...`);
-        return Cesium.Cesium3DTileset.fromIonAssetId(this.assetId);
+        throw new Error('Cesium build lacks credential-safe Google Tiles Resource APIs');
     }
 
     _wireTilesetDiagnostics(progressCb = null, tileset = this.tileset, loadState = null, label = 'Google 3D Tiles') {
         if (!tileset) return;
         const keyPrefix = String(label || 'Google 3D Tiles').toLowerCase().replace(/[^a-z0-9]+/g, '-');
+        let nextFailureReportAt = -Infinity;
+        let failureReportBackoffMs = 10000;
+        let lastFailureAt = -Infinity;
         const onFailure = (error) => {
-            const message = error && error.message ? error.message : String(error || 'unknown tile error');
+            const message = formatError(error);
+            const now = performance.now();
             if (loadState) {
                 loadState.errorCount = Math.max(0, Number(loadState.errorCount) || 0) + 1;
-                loadState.lastErrorAt = performance.now();
+                loadState.lastErrorAt = now;
                 loadState.lastErrorMessage = message;
             }
+            // Cesium can emit one event per failed JSON/GLB. Report one
+            // sanitized summary with exponential backoff instead of flooding
+            // DevTools (and the Firefox main thread) with full request errors.
+            if (now - lastFailureAt > 60000) failureReportBackoffMs = 10000;
+            lastFailureAt = now;
+            if (now < nextFailureReportAt) return;
+            nextFailureReportAt = now + failureReportBackoffMs;
+            failureReportBackoffMs = Math.min(60000, failureReportBackoffMs * 2);
             reportUserError(`${label} request failed`, error, {
-                key: `${keyPrefix}-failed-${message}`,
-                intervalMs: 10000,
+                key: `${keyPrefix}-request-failed`,
+                intervalMs: 0,
             });
             if (progressCb) progressCb(`${label} request failed: ${message}`, true);
         };
@@ -1572,15 +1632,21 @@ export class CesiumWorld {
 
         setIfPresent('maximumScreenSpaceError', this.panoramaTileSSE);
         setIfPresent('cullRequestsWhileMoving', false);
-        setIfPresent('preloadWhenHidden', true);
-        setIfPresent('preloadFlightDestinations', true);
+        setIfPresent('preloadWhenHidden', !this.panoramaLeanStreaming);
+        setIfPresent('preloadFlightDestinations', !this.panoramaLeanStreaming);
         setIfPresent('foveatedScreenSpaceError', false);
         setIfPresent('dynamicScreenSpaceError', true);
         setIfPresent('dynamicScreenSpaceErrorDensity', 0.004);
         setIfPresent('dynamicScreenSpaceErrorFactor', 12);
-        setIfPresent('loadSiblings', true);
-        setIfPresent('immediatelyLoadDesiredLevelOfDetail', true);
-        setIfPresent('preferLeaves', true);
+        setIfPresent('loadSiblings', !this.panoramaLeanStreaming);
+        setIfPresent('skipLevelOfDetail', this.panoramaLeanStreaming);
+        if (this.panoramaLeanStreaming) {
+            setIfPresent('baseScreenSpaceError', 1536);
+            setIfPresent('skipScreenSpaceErrorFactor', 18);
+            setIfPresent('skipLevels', 2);
+        }
+        setIfPresent('immediatelyLoadDesiredLevelOfDetail', !this.panoramaLeanStreaming);
+        setIfPresent('preferLeaves', !this.panoramaLeanStreaming);
 
         if ('maximumMemoryUsage' in tileset) tileset.maximumMemoryUsage = 768;
         if ('cacheBytes' in tileset) tileset.cacheBytes = 768 * 1024 * 1024;
@@ -1852,7 +1918,7 @@ export class CesiumWorld {
             if (frustum) {
                 if ('fov' in frustum) frustum.fov = faceFovDeg * Math.PI / 180;
                 if ('near' in frustum) frustum.near = 0.03;
-                if ('far' in frustum) frustum.far = 15000000;
+                if ('far' in frustum) frustum.far = this.panoramaFarMeters || 1200;
             }
 
             for (let faceIndex = 0; faceIndex < PANORAMA_FACE_DEFS.length; faceIndex++) {

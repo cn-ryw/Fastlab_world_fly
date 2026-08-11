@@ -3,8 +3,8 @@
 
 Schema v2 is deliberately fail closed.  A frame counts only when the browser
 records a successful trajectory-install acknowledgement, an allowed metric
-depth mode, complete frame identity, and stable calibration/service
-fingerprints.  The first ``warmup_frames`` legal unique frames are excluded
+depth mode, complete frame identity, and stable calibration/service-session
+identities.  The first ``warmup_frames`` legal unique frames are excluded
 from every timed perception metric. RGB panorama tile readiness is reported as
 an advisory diagnostic; it is deliberately not a pass/fail gate.
 """
@@ -70,6 +70,8 @@ SAFE_RESOLVED_URL_NUMERIC_QUERY_KEYS = frozenset((
     "depthMs",
     "yopoMaxFrameAgeMs",
     "panoramaTileSse",
+    "panoramaFarMeters",
+    "panoramaLeanStreaming",
     "flightTileSse",
     "placementTileSse",
     "resolutionScale",
@@ -216,7 +218,7 @@ def _generation_token(value):
     return token if int(token) <= MAX_SAFE_GENERATION else None
 
 
-def _nonempty_fingerprint(value):
+def _nonempty_identity(value):
     return _identity_token(value)
 
 
@@ -267,9 +269,9 @@ def _validate_planning_event(item, allowed_depth_modes):
         _identity_token(item.get("frameId")),
     )
     depth_mode = _identity_token(item.get("depthMode"))
-    calibration_id = _nonempty_fingerprint(item.get("calibrationId"))
+    calibration_id = _nonempty_identity(item.get("calibrationId"))
     calibration_accuracy_accepted = item.get("calibrationAccuracyAccepted") is True
-    service_fingerprint = _nonempty_fingerprint(item.get("serviceFingerprint"))
+    service_session_id = _identity_token(item.get("serviceSessionId"))
     apply_at = _finite_number(item.get("trajectoryAppliedAtMs"))
     capture_to_apply = _finite_number(item.get("captureToApplyMs"))
     server_ms = _finite_number(item.get("serverMs"))
@@ -284,8 +286,8 @@ def _validate_planning_event(item, allowed_depth_modes):
         errors.append("calibrationId")
     if not calibration_accuracy_accepted:
         errors.append("calibrationAccuracyAccepted")
-    if service_fingerprint is None:
-        errors.append("serviceFingerprint")
+    if service_session_id is None:
+        errors.append("serviceSessionId")
     if apply_at is None:
         errors.append("trajectoryAppliedAtMs")
     if capture_to_apply is None or capture_to_apply < 0:
@@ -298,7 +300,7 @@ def _validate_planning_event(item, allowed_depth_modes):
         "depth_mode": depth_mode,
         "calibration_id": calibration_id,
         "calibration_accuracy_accepted": calibration_accuracy_accepted,
-        "service_fingerprint": service_fingerprint,
+        "service_session_id": service_session_id,
         "apply_at_ms": apply_at,
         "capture_to_apply_ms": capture_to_apply,
         "server_ms": server_ms,
@@ -406,7 +408,7 @@ def evaluate_log(
     goal_ids = {event["identity"][0] for event in unique}
     generations = {event["identity"][1] for event in unique}
     calibration_ids = {event["calibration_id"] for event in unique}
-    service_fingerprints = {event["service_fingerprint"] for event in unique}
+    service_session_ids = {event["service_session_id"] for event in unique}
     overage_planning_frames = sum(
         event["capture_to_apply_ms"] > hard_observation_age_ms for event in unique
     )
@@ -612,8 +614,8 @@ def evaluate_log(
         "nonpositive_planning_intervals": nonpositive_intervals,
         "depth_modes": sorted(mode for mode in depth_modes if mode is not None),
         "calibration_ids": sorted(value for value in calibration_ids if value is not None),
-        "service_fingerprints": sorted(
-            value for value in service_fingerprints if value is not None
+        "service_session_ids": sorted(
+            value for value in service_session_ids if value is not None
         ),
         "goal_ids": sorted(value for value in goal_ids if value is not None),
         "generations": sorted(value for value in generations if value is not None),
@@ -685,9 +687,9 @@ def evaluate_log(
             for event in validated
         ),
         "calibration_id_stable": len(calibration_ids) == 1,
-        "service_fingerprint_present": bool(service_fingerprints)
-        and not any("serviceFingerprint" in event["errors"] for event in validated),
-        "service_fingerprint_stable": len(service_fingerprints) == 1,
+        "service_session_id_present": bool(service_session_ids)
+        and not any("serviceSessionId" in event["errors"] for event in validated),
+        "service_session_id_stable": len(service_session_ids) == 1,
         "physics_timestamps_present": bool(physics_times)
         and invalid_physics_timestamps == 0,
         "physics_timestamps_strictly_increasing": bool(physics_times)

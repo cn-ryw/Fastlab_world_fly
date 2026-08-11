@@ -31,8 +31,8 @@ def synthetic_log(
     server_ms=40.0,
     physics_ms=16.0,
     depth_mode="da360-metric",
-    calibration_id="calibration-sha-1",
-    service_fingerprint="service-sha-1",
+    calibration_id="calibration-run-1",
+    service_session_id="service-run-1",
 ):
     count = warmup_count + measured_count
     perception = [
@@ -51,7 +51,7 @@ def synthetic_log(
             "depthMode": depth_mode,
             "calibrationId": calibration_id,
             "calibrationAccuracyAccepted": True,
-            "serviceFingerprint": service_fingerprint,
+            "serviceSessionId": service_session_id,
             "rgbTilesReady": True,
             "rgbReadyFaces": 6,
             "rgbTotalFaces": 6,
@@ -82,7 +82,7 @@ def quality_archive(cases=12, height=32, width=32, depth=10.0):
         "endstate": np.zeros((cases, 9), dtype=np.float32),
         "case_ids": np.asarray([f"case-{index:02d}" for index in range(cases)]),
         "case_provenance": np.asarray(
-            [f"scene-pose-state-goal-sha-{index:02d}" for index in range(cases)]
+            [f"scene-pose-state-goal-id-{index:02d}" for index in range(cases)]
         ),
     }
 
@@ -143,7 +143,8 @@ def test_closed_loop_accepts_allowlisted_flight_url():
     log["resolvedUrl"] = (
         "https://127.0.0.1:8080/index.html"
         "?panoProfile=flight&panoCaptureProfile=flight"
-        "&panoFacesPerSlice=2&depthMs=20&yopoMaxFrameAgeMs=250"
+        "&panoFacesPerSlice=2&panoramaFarMeters=1200&panoramaLeanStreaming=1"
+        "&depthMs=20&yopoMaxFrameAgeMs=250"
         "&flightPreloadRadius=650&flightPreloadMinCoverage=0.9"
         "&flightPreloadViewTimeoutMs=1500&flightPreloadViewAttempts=3"
         "&flightPreloadStrict=1"
@@ -376,16 +377,16 @@ def test_closed_loop_relative_mode_cannot_pass_even_if_authorized_flag_is_true()
     assert report["metrics"]["unique_planning_frames"] == 0
 
 
-def test_closed_loop_requires_complete_identity_and_stable_fingerprints():
+def test_closed_loop_requires_complete_and_stable_runtime_identities():
     log = synthetic_log()
     log["perception"][40]["goalId"] = None
-    log["perception"][50]["calibrationId"] = "calibration-sha-2"
-    log["perception"][60]["serviceFingerprint"] = "service-sha-2"
+    log["perception"][50]["calibrationId"] = "calibration-run-2"
+    log["perception"][60]["serviceSessionId"] = "service-run-2"
     report = closed_loop.evaluate_log(log)
     assert not report["passed"]
     assert not report["checks"]["required_identity_fields"]
     assert not report["checks"]["calibration_id_stable"]
-    assert not report["checks"]["service_fingerprint_stable"]
+    assert not report["checks"]["service_session_id_stable"]
 
 
 def test_closed_loop_rejects_experimental_unaccepted_metric_calibration():

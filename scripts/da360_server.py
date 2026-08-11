@@ -3,7 +3,6 @@
 
 import argparse
 import base64
-import hashlib
 import io
 import json
 import math
@@ -82,14 +81,6 @@ def env_int(name, default):
         return int(os.environ.get(name, default))
     except (TypeError, ValueError):
         return default
-
-
-def _file_sha256(path):
-    digest = hashlib.sha256()
-    with open(path, "rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def _normalize_projection_config(value, label="projection config"):
@@ -564,14 +555,6 @@ class DA360Runner:
         self.checkpoint_unexpected_keys = len(incompatible.unexpected_keys)
         self.model.eval()
         self.model_name = Path(model_path).stem
-        actual_checkpoint_sha256 = _file_sha256(model_path)
-        expected_checkpoint_sha256 = os.environ.get("DA360_MODEL_SHA256", "").strip().lower()
-        if expected_checkpoint_sha256 and actual_checkpoint_sha256 != expected_checkpoint_sha256:
-            raise RuntimeError(
-                "DA360 checkpoint fingerprint mismatch: "
-                f"{actual_checkpoint_sha256} != {expected_checkpoint_sha256}"
-            )
-        self.checkpoint_sha256 = actual_checkpoint_sha256
         self.use_amp = self.device.type == "cuda" and env_bool("DA360_AMP", True)
         # channels_last 在 RTX 5070 Ti + PyTorch 2.8 + Flask 主进程中会导致
         # model forward 从 ~25ms 退化到 ~5.5s（200x 减速）。docker exec 子进程不受影响。
@@ -809,13 +792,12 @@ class DA360Runner:
 
             context = calib.get("input", {})
             if not isinstance(context, dict):
-                raise ValueError("calibration input fingerprint must be an object")
+                raise ValueError("calibration input contract must be an object")
             expected = {
                 "model": self.model_name,
                 "width": self.width,
                 "height": self.height,
                 "resample": self.resample_name,
-                "checkpoint_sha256": self.checkpoint_sha256,
             }
             observed = {
                 key: calib.get(key, context.get(key)) for key in expected
@@ -823,7 +805,7 @@ class DA360Runner:
             missing = [key for key, value in observed.items() if value is None]
             if missing:
                 raise ValueError(
-                    "calibration is missing inference fingerprint fields: "
+                    "calibration is missing inference contract fields: "
                     + ", ".join(missing)
                 )
             for key, expected_value in expected.items():
@@ -843,10 +825,10 @@ class DA360Runner:
                 raise ValueError("calibration requestWidth/requestHeight must be positive")
             if int(context.get("request_width", 0)) != request_width \
                     or int(context.get("request_height", 0)) != request_height:
-                raise ValueError("calibration request dimensions disagree with input fingerprint")
+                raise ValueError("calibration request dimensions disagree with input contract")
 
             projection = _normalize_projection_config(
-                calib.get("projection"), "calibration projection fingerprint"
+                calib.get("projection"), "calibration projection contract"
             )
             if int(projection["rgbWidth"]) != request_width \
                     or int(projection["rgbHeight"]) != request_height:
@@ -857,23 +839,25 @@ class DA360Runner:
                     rel_tol=0, abs_tol=1e-12):
                 raise ValueError("calibration uploadScale does not match request/panorama width")
 
-            dataset_fingerprint = str(calib.get("dataset_fingerprint_sha256", ""))
-            if len(dataset_fingerprint) != 64 or any(
-                    character not in "0123456789abcdef" for character in dataset_fingerprint.lower()):
-                raise ValueError("calibration dataset fingerprint must be SHA-256")
-
-            calibration_sha = _file_sha256(calibration_path)
+            declared_id = str(calib.get("calibration_id", "")).strip()
+            if declared_id and not all(
+                    character.isalnum() or character in {"-", "_", "."}
+                    for character in declared_id):
+                raise ValueError("calibration_id contains unsupported characters")
+            calibration_id = declared_id or (
+                f"{calibration_path.stem}-v{calib['schema_version']}-"
+                f"{self.model_name}-{request_width}x{request_height}"
+            )
             return {
                 "a": a,
                 "b": b,
                 "depth_min_m": min_depth,
                 "depth_max_m": max_depth,
-                "id": calibration_sha[:16],
-                "sha256": calibration_sha,
+                "id": calibration_id,
+                "version": calib["schema_version"],
                 "request_width": request_width,
                 "request_height": request_height,
                 "projection": projection,
-                "dataset_fingerprint_sha256": dataset_fingerprint.lower(),
                 # Accuracy acceptance is provenance, not a runtime gate.  This
                 # allows an explicitly selected metric candidate to be tested
                 # without ever treating raw relative depth as metric input.
@@ -934,7 +918,6 @@ class DA360Runner:
                 "amp": self.use_amp,
                 "depth_mode": self.depth_mode,
                 "calibration_id": self.calibration["id"] if self.calibration else None,
-                "checkpoint_sha256": self.checkpoint_sha256,
                 "epsilon": float(eps),
                 "unit_pred_disp": "raw disparity (inverse depth), NOT per-frame normalized",
                 "unit_relative_depth": "1/pred_disp (not divided by frame min)",
@@ -979,11 +962,9 @@ def runner_health_payload(runner):
                 if calibration else None,
             "request_width": calibration.get("request_width") if calibration else None,
             "request_height": calibration.get("request_height") if calibration else None,
-            "dataset_fingerprint_sha256": calibration.get("dataset_fingerprint_sha256")
-                if calibration else None,
+            "version": calibration.get("version") if calibration else None,
         },
         "checkpoint": {
-            "sha256": getattr(runner, "checkpoint_sha256", None),
             "coverage": getattr(runner, "checkpoint_coverage", None),
             "missing_keys": getattr(runner, "checkpoint_missing_keys", None),
             "unexpected_keys": getattr(runner, "checkpoint_unexpected_keys", None),
@@ -992,7 +973,6 @@ def runner_health_payload(runner):
 
 
 def _request_image_metadata(image):
-    rgb = np.asarray(image, dtype=np.uint8)
     projection_header = request.headers.get(PROJECTION_CONFIG_HEADER)
     projection_config = None
     if projection_header is not None:
@@ -1005,7 +985,7 @@ def _request_image_metadata(image):
         projection_config = _normalize_projection_config(
             projection_payload, "runtime projection config"
         )
-    return {
+    metadata = {
         "frame_id": request.args.get("frame_id") or request.headers.get("X-Frame-ID"),
         "session_id": request.args.get("session_id") or request.headers.get("X-Session-ID"),
         "capture_id": request.args.get("capture_id") or request.headers.get("X-Capture-ID"),
@@ -1014,9 +994,9 @@ def _request_image_metadata(image):
         "generation": request.args.get("generation") or request.headers.get("X-Generation"),
         "request_width": image.width,
         "request_height": image.height,
-        "decoded_rgb_sha256": hashlib.sha256(rgb.tobytes()).hexdigest(),
         "projection_config": projection_config,
     }
+    return metadata
 
 
 def _infer_configured_depth(runner, image, request_metadata=None):
@@ -1169,7 +1149,6 @@ def register_depth_routes(app, runner_provider, on_depth=None, endpoint_prefix="
                 "frame_id": request_metadata["frame_id"],
                 "goal_id": request_metadata["goal_id"],
                 "generation": request_metadata["generation"],
-                "input_sha256": request_metadata["decoded_rgb_sha256"],
             })
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 400

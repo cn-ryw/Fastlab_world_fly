@@ -79,7 +79,7 @@ let thirdPersonCamera = {
 const SPAWN_ALTITUDE_MIN = 0;
 const SPAWN_ALTITUDE_MAX = 20000;
 const SPAWN_ALTITUDE_SLIDER_DEFAULT_MAX = 1000;
-const SPAWN_PRELOAD_RADIUS_METERS = Math.round(urlNumber('flightPreloadRadius', 420, 120, 2000));
+const SPAWN_PRELOAD_RADIUS_METERS = Math.round(urlNumber('flightPreloadRadius', 500, 120, 2000));
 const FLIGHT_PRELOAD_MIN_COVERAGE = urlNumber('flightPreloadMinCoverage', 0.95, 0.5, 1);
 const FLIGHT_PRELOAD_VIEW_TIMEOUT_MS = Math.round(urlNumber('flightPreloadViewTimeoutMs', 20000, 3000, 60000));
 const FLIGHT_PRELOAD_VIEW_ATTEMPTS = Math.round(urlNumber('flightPreloadViewAttempts', 2, 1, 5));
@@ -755,7 +755,10 @@ async function confirmSpawnAndFly() {
                 lift: 220,
                 gridSpacing: 160,
                 viewDistance: 240,
-                maxTargets: 22,
+                // 500 m / 160 m yields 29 in-circle samples including the
+                // center. Keep the full symmetric grid instead of truncating
+                // the outer ring by nearest-distance order.
+                maxTargets: 30,
                 dwellMs: 160,
                 perViewTimeoutMs: 2500,
                 finalIdleTimeoutMs: 15000,
@@ -874,6 +877,13 @@ function startFlight(viewMode = 'first') {
                     `generation=${context.generation}`
                 );
                 return false;
+            }
+            const intakeDisposition = drone?.getYopoTrajectoryIntakeDisposition?.();
+            if (intakeDisposition?.outcome === 'ignored') {
+                return {
+                    outcome: 'ignored',
+                    reason: intakeDisposition.reason || 'controller-owned-motion',
+                };
             }
             const installTrajectory = () => (
                 drone?.setYopoTrajectory(endstate, trajTime, context) === true
@@ -1097,6 +1107,11 @@ function updateFlight(dt) {
             ? drone.getYopoPlanningState()
             : { x: drone.x, y: drone.y, z: drone.z, vx: drone.vx, vy: drone.vy, vz: drone.vz },
         drone.getFixedYaw ? drone.getFixedYaw() : drone.yaw);
+        const intakeDisposition = drone.getYopoTrajectoryIntakeDisposition?.();
+        panoramaSensor.setYopoPlanningPaused?.(
+            intakeDisposition?.outcome === 'ignored',
+            intakeDisposition?.reason || 'controller-owned-motion',
+        );
     }
     if (drone.consumeReplanRequest?.()) {
         panoramaSensor?.requestImmediatePlanningFrame?.('controller-replan');

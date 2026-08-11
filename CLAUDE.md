@@ -55,15 +55,11 @@ docker restart mindcloud-da360-yopo
 Dockerfile、third_party 或 Python 依赖变化后重建：
 
 ```bash
-lock_sha="$(sha256sum dependencies.lock.json | awk '{print $1}')"
-recipe_sha="$(sha256sum Dockerfile.da360-yopo | awk '{print $1}')"
-docker build \
-  --build-arg "MINDCLOUD_DEPENDENCY_LOCK_SHA256=$lock_sha" \
-  --build-arg "MINDCLOUD_IMAGE_RECIPE_SHA256=$recipe_sha" \
-  -f Dockerfile.da360-yopo -t mindcloud-da360-yopo:latest .
+python3 scripts/verify_dependencies.py
+docker build -f Dockerfile.da360-yopo -t mindcloud-da360-yopo:latest .
 ```
 
-2026-08-10 已用 base/lock/recipe 三重指纹镜像完成 live 启动。实际 health 为 API v2、`resample=bicubic`、`input_scale≈0.459`、loopback publish，DA360/YOPO checkpoint coverage 100%，19 项 live API integration 全部通过。Firefox 已加载完整页面与模块，但尚未人工完成出生点、真实 depth canvas、目标切换和飞行验收。当前工作树随后加入 capture profile、timing 拆分、纹理复用、service fingerprint 与 evaluator v2；自动测试已复验通过（精确计数以最终 sweep 原始输出为准），但 live Firefox/GPU 和可信 15Hz 尚未验收，旧镜像结论不能沿用为这些新改动的 live 证据。
+历史镜像曾使用内容哈希做启动绑定；该机制已撤除。现在以可读的模型文件名、YOPO 配置名、标定 ID 和进程级 service session ID 记录运行身份；checkpoint coverage 仍做模型结构完整性检查。
 
 ## 前端感知与导航状态
 
@@ -100,7 +96,7 @@ yaw, captureProfile, projection config
 
 全景 capture 开始时快照 planning state 和 transform；capture 完成后才形成该 RGB 的 frame context。`/yopo/plan_full` 必须从对应 `PerceptionFrame` 取 observation，禁止从持续变化的当前 `_yopoPose` 拼接旧 RGB。
 
-该原语也用于原子标定导出。无人机静止、没有活动目标、完整帧就绪且 capture profile 为 `calibration` 时，`window.__captureMetricCalibration(locationId, options)` 会从同一个冻结 `PerceptionFrame` 生成同一 `captureId` 的 RGB、anchors、manifest 和 raw NPZ；禁止手工拼接来自不同帧的文件。manifest 必须保留 frame/location/capture ID、RGB/raw SHA、pose、capture transform、ERP 配置和模型 metadata。
+该原语也用于原子标定导出。无人机静止、没有活动目标、完整帧就绪且 capture profile 为 `calibration` 时，`window.__captureMetricCalibration(locationId, options)` 会从同一个冻结 `PerceptionFrame` 生成同一 `captureId` 的 RGB、anchors、manifest 和 raw NPZ；禁止手工拼接来自不同帧的文件。manifest 必须保留 frame/location/capture/session ID、三份文件名与字节数、pose、capture transform、ERP 配置和模型 metadata。
 
 ## 服务端 API v2
 
@@ -108,7 +104,7 @@ standalone `da360_server.py` 和 combined `combined_server.py` 通过共享 rout
 
 | 路径 | 契约 |
 |---|---|
-| `/health` | 模型、尺寸、resample、depth mode、标定、checkpoint 指纹 |
+| `/health` | 模型、尺寸、resample、depth mode、标定、checkpoint 参数覆盖率 |
 | `/depth` | JPEG 请求；返回 depth JPEG 与轻量 metadata |
 | `/depth/raw` | NPZ：raw pred_disp、relative depth、valid mask、metadata |
 | `/yopo/health` | YOPO 模型/config/checkpoint 信息 |
@@ -125,7 +121,7 @@ standalone `da360_server.py` 和 combined `combined_server.py` 通过共享 rout
 ```text
 panoProfile=flight
 panoWidth=384 panoHeight=192 panoFace=96 panoVfov=180
-panoMs=20 depthMs=20 yopoMaxFrameAgeMs=250 panoFrameDelayMs=0 panoFacesPerSlice=3
+panoMs=20 depthMs=20 yopoMaxFrameAgeMs=250 panoFrameDelayMs=0 panoFacesPerSlice=2
 panoTopPoleGuard=10 panoBottomPoleGuard=2
 panoPreloadTimeoutMs=60000
 da360UploadScale=0.35
@@ -170,13 +166,13 @@ depth_m = 1 / inverse_depth_1_per_m
 - anchor 使用 canonical ERP helper 与真实 capture transform
 - anchor 分辨率到 raw 分辨率采用像素中心映射、水平 wrap 双线性采样
 - fitter 只应用一次 Huber loss，支持多 capture 和 leave-one-location-out
-- metric calibration 启动时一次加载并绑定模型、输入尺寸、resample 和 checkpoint SHA
-- metric loader 必须校验标定的 projection/JPEG fingerprint；每次请求通过 `X-Projection-Config` 携带冻结帧的完整投影配置，并在 GPU 推理前同时匹配 RGB request size、ERP/FOV、pole guard、JPEG quality 和 upload scale
+- metric calibration 启动时一次加载并绑定可读模型名、输入尺寸和 resample
+- metric loader 必须校验标定的 projection/JPEG contract；每次请求通过 `X-Projection-Config` 携带冻结帧的完整投影配置，并在 GPU 推理前同时匹配 RGB request size、ERP/FOV、pole guard、JPEG quality 和 upload scale
 - calibration anchor 只有在六个 cubemap 面各自在复制 RGB 像素时都已报告 tiles ready 才可导出；不能用采集结束后的单次 `tilesLoaded` 状态代替逐面 provenance
-- `DA360_DEPTH_MODE=da360-metric` fail closed；校准结构、指纹或接受来源无效时拒绝启动
+- `DA360_DEPTH_MODE=da360-metric` fail closed；校准结构、输入/投影契约或接受来源无效时拒绝启动
 - `window.__captureMetricCalibration()` 原子导出同 captureId 的 RGB、anchors、manifest 与 raw NPZ
 
-2026-08-10 已完成 4 地点×3 captures 的真实原子数据集和 LOLO 报告：`../experiment_data/metric_fit-lolo-20260810-12capture/fit_report.json`。1536 anchors 中 1140 有效（74.22%），833 个落在 0.5–20m；四件套、指纹和地点覆盖完整。**自动 calibration 精度门禁失败**：
+2026-08-10 已完成 4 地点×3 captures 的真实原子数据集和 LOLO 报告：`../experiment_data/metric_fit-lolo-20260810-12capture/fit_report.json`。1536 anchors 中 1140 有效（74.22%），833 个落在 0.5–20m；四件套 identity、输入/投影契约和地点覆盖完整。**自动 calibration 精度门禁失败**：
 
 | 留出地点 | median AbsRel | p90 AbsRel | 10m 内 p90 绝对误差 |
 |---|---:|---:|---:|
@@ -226,7 +222,7 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
 - 日志声明单一 `navigationSession(goalId,generation)`，generation 必须是非负 JavaScript-safe integer；每个 planning identity 与其一致，frame 唯一，apply 与 physics timestamp 严格递增
 - physics timestamp 覆盖至少 95% 的计量窗口；最少帧数为 `ceil(measurementDurationMs×0.95/33.3)+1`，60s 窗口至少 1713 帧
 - depth mode 只能是 `da360-metric` 或 `cesium-truth`
-- calibration ID 和 service fingerprint 非空、全段稳定；service fingerprint 绑定 API version、DA360/YOPO checkpoint SHA 和 YOPO effective config SHA
+- calibration ID 和 service session ID 非空、全段稳定；service session ID 只标识当前 combined-server 进程，模型与配置用 health 中的可读名称记录
 - 设置目标后的下一张完整帧进入 planning
 - 到达/取消后回 preview，深度仍更新
 - 高速穿越4m球不提前结束；合格终端轨迹沿原 Poly5 到达后锁定实际位姿，并在无碰撞、三维速度≤0.75m/s连续0.4s才到达
@@ -236,7 +232,7 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
 
 截至 2026-08-10，上述真实门禁尚未完成。修复后一次 relative `/yopo/plan_full` 诊断为 DA360 44.6ms、端到端 63.3ms，但它未授权 YOPO，既不是统计样本也不能证明 15Hz。修复前基线约为 depth 3.1Hz、YOPO 2.9Hz；不要把 API/单元测试通过写成 15Hz 已达标。
 
-六面 capture 当前仍执行六次 Cesium scene render，默认每三面 `requestAnimationFrame` yield，并支持 AbortSignal；URL 可显式改回2做 A/B。projector texture 在尺寸相同时使用 `texSubImage2D` 复用。飞行期 planning 固定 `include_preview=0`；操作员深度预览约每2s从按身份索引的4帧LRU异步读取，latest-only且不占控制request gate。timing 必须分别保留 `scene_render/tile_wait/wait_rerender/face_upload/project/scheduler`、fetch/header/json、response bytes、DA360、YOPO、trajectory apply、preview fetch/decode/draw 和 gate hold，不能再用旧 aggregate `render` 归因。FlightLogger schema v2 记录真实轨迹安装回执、唯一 planning frame、选中候选、Poly5峰值、控制饱和、drop reason、单调时间和 p95。相关自动测试已复验，但仍待 live Firefox/GPU benchmark；不能写成 15Hz 已通过。
+六面 capture 当前仍执行六次 Cesium scene render，默认每两面 `requestAnimationFrame` yield，并支持 AbortSignal；1/3/6 面仅保留为显式 A/B 参数。projector texture 在尺寸相同时使用 `texSubImage2D` 复用。飞行期 planning 固定 `include_preview=0`；操作员深度预览约每2s从按身份索引的4帧LRU异步读取，latest-only且不占控制request gate。timing 必须分别保留 `scene_render/tile_wait/wait_rerender/face_upload/project/scheduler`、fetch/header/json、response bytes、DA360、YOPO、trajectory apply、preview fetch/decode/draw 和 gate hold，不能再用旧 aggregate `render` 归因。FlightLogger schema v2 记录真实轨迹安装回执、唯一 planning frame、选中候选、Poly5峰值、控制饱和、drop reason、单调时间和 p95。真实 Firefox preview A/B 已测得新默认 capture p95=53/45ms、RAF/physics-frame p95=17.1/17.1ms；这只证明 preview/主线程预算改善，仍不能写成带航点的 15Hz 闭环已通过。
 
 门禁实现位于 `config/perception-sweep.json`、`scripts/evaluate_closed_loop.py` 和 `scripts/evaluate_perception_quality.py`。真实数据必须按该配置的候选顺序跑完并保存报告，不能凭 URL 参数或平均延迟口头选择配置。
 
@@ -244,7 +240,7 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
 
 ```bash
 ./launch-firefox-gpu.sh \
-'http://127.0.0.1:8080/?panoProfile=flight&panoPreloadRequired=0&panoWidth=384&panoHeight=192&panoFace=96&panoFacesPerSlice=3&panoVfov=180&panoJpeg=0.74&da360UploadScale=0.35&panoMs=20&depthMs=20&panoramaTileSse=512'
+'http://127.0.0.1:8080/?panoProfile=flight&panoPreloadRequired=0&panoWidth=384&panoHeight=192&panoFace=96&panoFacesPerSlice=2&panoVfov=180&panoJpeg=0.74&da360UploadScale=0.35&panoMs=20&depthMs=20&panoramaTileSse=512&panoramaFarMeters=1200&panoramaLeanStreaming=1'
 ```
 
 先用 `window.__getPanoramaCaptureProfile()` 核对 `flight`，保存原始 timing/log；evaluator 命令必须显式或默认使用 `--warmup-frames 30 --min-duration-s 60 --min-planning-frames 900`。relative preview 可以用于性能归因，但绝不能通过正式 evaluator。
@@ -275,9 +271,9 @@ Dense Cesium truth 仅允许按阶段推进，目前全是设计、没有代码�
 
 禁止重新暴露 `.git`、Markdown、scripts、tests、checkpoint、目录列表或任意 traversal。路径 API 只允许同源且原子写入。
 
-模型、PID、raw NPZ/NPY 和实验大文件不得进入 Git。锁定的版本与本机 checkpoint SHA 记录在 `dependencies.lock.json`。
+模型、PID、raw NPZ/NPY 和实验大文件不得进入 Git。可读的依赖版本、来源与本地路径记录在 `dependencies.versions.json`。
 
-依赖核验命令为 `python3 scripts/verify_dependencies.py`；只有核验通过并记录镜像 ID 后，才可开始 live 验收。
+依赖核验命令为 `python3 scripts/verify_dependencies.py`；它核对可读版本标记、必需路径与镜像 tag，不计算内容哈希。
 
 ## Git
 

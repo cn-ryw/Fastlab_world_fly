@@ -49,6 +49,8 @@ const SAFE_URL_QUERY_KEYS = new Set([
     'depthMs',
     'yopoMaxFrameAgeMs',
     'panoramaTileSse',
+    'panoramaFarMeters',
+    'panoramaLeanStreaming',
     'flightTileSse',
     'placementTileSse',
     'resolutionScale',
@@ -157,6 +159,8 @@ function compactControlDiagnostics(drone) {
         planningRequestId: diagnostics.planningRequestId ?? null,
         selectedCandidateId: diagnostics.selectedCandidateId ?? null,
         terminalPhase: diagnostics.terminalPhase ?? null,
+        goalReached: diagnostics.goalReached === true,
+        goalReachedSimTimeS: roundedFinite(diagnostics.goalReachedSimTimeS),
         fallbackReason: diagnostics.fallbackReason ?? null,
         referencePosition: reference ? diagnosticVector(reference.position || reference) : null,
         referenceVelocity: reference ? diagnosticVector({
@@ -298,8 +302,11 @@ export class FlightLogger {
         this._perceptionMetrics.push(item);
         const unauthorizedPlanning = item.mode === 'planning'
             && item.planningAuthorized !== true;
+        const trajectoryIgnored = item.mode === 'planning'
+            && (item.outcome === 'ignored' || item.trajectoryIgnored === true);
         const trajectoryRejected = item.mode === 'planning'
-            && item.trajectoryApplied !== true;
+            && item.trajectoryApplied !== true
+            && !trajectoryIgnored;
         if (item.outcome !== 'applied' || unauthorizedPlanning || trajectoryRejected) {
             const reason = item.dropReason
                 || (unauthorizedPlanning ? 'planning-not-authorized' : null)
@@ -394,6 +401,15 @@ export class FlightLogger {
             && item.planningAuthorized === true
             && item.trajectoryApplied === true
         ));
+        const planningIgnoredFrames = this._perceptionMetrics.filter(item => (
+            item.mode === 'planning'
+            && (item.outcome === 'ignored' || item.trajectoryIgnored === true)
+        )).length;
+        const planningRejectedFrames = this._perceptionMetrics.filter(item => (
+            item.mode === 'planning'
+            && item.outcome === 'rejected'
+            && item.trajectoryIgnored !== true
+        )).length;
         const uniqueAuthorizedPlanningByIdentity = new Map();
         for (const item of authorizedPlanningMetrics) {
             const identity = `${item.goalId ?? ''}:${item.generation ?? ''}:${item.frameId ?? ''}`;
@@ -496,6 +512,8 @@ export class FlightLogger {
                     ? Math.round(this._yopoTrackerCount / this._frames.length * 100) : 0,
                 uniquePlanningHz: Math.round(this._appliedPlanningFrames.size / duration * 10) / 10,
                 uniquePlanningFrames: this._appliedPlanningFrames.size,
+                planningIgnoredFrames,
+                planningRejectedFrames,
                 rgbTilesReadyPlanningFrames,
                 rgbTilesPartialPlanningFrames,
                 rgbTilesUnknownPlanningFrames,
