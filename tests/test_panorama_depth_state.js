@@ -99,6 +99,68 @@ function newSensorWithFrame() {
     return sensor;
 }
 
+// request-started is UI-only and repeated terminal states are coalesced so
+// Firefox DevTools is not flooded at perception rate. Distinct terminal,
+// error, stale, blocked, and rejected states remain visible.
+{
+    const originalLog = console.log;
+    const messages = [];
+    console.log = (...args) => messages.push(args.join(' '));
+    try {
+        const sensor = new PanoramaSensor();
+        messages.length = 0;
+        sensor._setDepthState('preview', 'request-started');
+        sensor._setDepthState('preview', 'depth-ready', { outcome: 'applied' });
+        sensor._setDepthState('preview', 'request-started');
+        sensor._setDepthState('preview', 'depth-ready', { outcome: 'applied' });
+        assert.equal(
+            messages.filter(message => message.includes('[depth-state]')).length,
+            1,
+            'healthy per-frame transitions should produce one session-level state log',
+        );
+        assert.match(messages[0], /reason=depth-ready/);
+
+        sensor._setDepthState('preview', 'response-after-session-change', { outcome: 'stale' });
+        sensor._setDepthState('preview', 'response-after-session-change', { outcome: 'stale' });
+        assert.equal(
+            messages.filter(message => message.includes('[depth-state]')).length,
+            2,
+            'a distinct stale outcome remains visible without repeating forever',
+        );
+
+        sensor._goalId = 'goal-log-test';
+        sensor._yopoGeneration = 1;
+        for (let frame = 0; frame < 3; frame++) {
+            sensor._rgbFrameId = frame + 1;
+            sensor._setDepthState('planning', 'request-started');
+            sensor._setDepthState('planning', 'trajectory-ready', { outcome: 'applied' });
+        }
+        assert.equal(
+            messages.filter(message => message.includes('reason=trajectory-ready')).length,
+            1,
+            'successful planning frames should produce one state line per goal generation',
+        );
+
+        for (let frame = 0; frame < 3; frame++) {
+            sensor._rgbFrameId = frame + 4;
+            sensor._setDepthState('planning', 'request-started');
+            sensor._setDepthState('planning', 'blocked:preview-only', { outcome: 'blocked' });
+        }
+        assert.equal(
+            messages.filter(message => message.includes('reason=blocked:preview-only')).length,
+            1,
+            'repeated planning blocks should be logged once instead of once per frame',
+        );
+
+        sensor._setDepthState('planning', 'trajectory-apply-rejected', { outcome: 'rejected' });
+        sensor._setDepthState('error', 'HTTP 503', { outcome: 'error' });
+        assert.ok(messages.some(message => message.includes('reason=trajectory-apply-rejected')));
+        assert.ok(messages.some(message => message.includes('reason=HTTP 503')));
+    } finally {
+        console.log = originalLog;
+    }
+}
+
 function primeCalibrationFrame(sensor, label = 'calibration-rgb', captureMs = 0) {
     assert.equal(sensor.getCaptureProfile(), 'calibration');
     assert.equal(sensor.primeFromCaptureResult(

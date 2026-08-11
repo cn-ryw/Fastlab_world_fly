@@ -292,6 +292,7 @@ export class PanoramaSensor {
         this._depthReqStart = 0;         // 当前请求发起时间
         this._depthState = 'offline';
         this._depthOutcome = 'idle';
+        this._lastDepthLogKey = null;
         this._depthAbortController = null;
         this._activeDepthRequest = null;
         this._depthRequestSequence = 0;
@@ -726,13 +727,24 @@ export class PanoramaSensor {
             this.depthStatusEl.title = reason || normalized;
         }
 
-        const statusKey = `${normalized}|${outcome}|${reason}`;
-        if (statusKey !== this._lastDepthStatusKey) {
+        // request-started alternates with the terminal result for every frame.
+        // Logging it would defeat terminal-state de-duplication and flood
+        // Firefox DevTools at perception rate. The UI is still updated above;
+        // console output records each distinct terminal/wait/error state once
+        // per goal generation, plus the periodic segmented [depth] summary.
+        if (outcome === 'ok' && reason === 'request-started') return;
+        const rawLogReason = reason || outcome;
+        const logReason = /^trajectory-ready:depth-lag-\d+-frames$/.test(rawLogReason)
+            ? 'trajectory-ready:depth-lag'
+            : rawLogReason;
+        const logKey =
+            `${normalized}|${outcome}|${logReason}|${this._goalId || '-'}|${this._yopoGeneration}`;
+        if (logKey !== this._lastDepthLogKey) {
             console.log(
                 `[depth-state] mode=${normalized} goalId=${this._goalId || '-'} ` +
-                `frameId=${this._rgbFrameId} generation=${this._yopoGeneration} reason=${reason || outcome}`
+                `frameId=${this._rgbFrameId} generation=${this._yopoGeneration} reason=${logReason}`
             );
-            this._lastDepthStatusKey = statusKey;
+            this._lastDepthLogKey = logKey;
         }
     }
 
