@@ -1,46 +1,48 @@
-MindCloud_World_Fly
-Copyright 2026 Manifold Tech Ltd.
-Author: MENG Guotao <mengguotao@manifoldtech.cn>
+MindCloud World Fly
+Copyright 2026 Manifold Tech Ltd. and contributors
 
 This product is licensed under the Apache License, Version 2.0.
 
-=========================================================================
+Third-party software and services
+=================================
 
-This project includes the following third-party software:
+CesiumJS 1.117
+  Copyright Cesium GS, Inc. and contributors
+  Apache License 2.0
+  https://github.com/CesiumGS/cesium
 
--------------------------------------------------------------------------
-PlayCanvas Engine
-  Version: 2.16.2
-  License: MIT
-  URL: https://github.com/playcanvas/engine
-  Copyright: Copyright (c) 2011-2024 PlayCanvas Ltd.
+PlayCanvas Engine 2.17.2
+  Copyright (c) 2011-2024 PlayCanvas Ltd.
+  MIT License
+  https://github.com/playcanvas/engine
 
-  Permission is hereby granted, free of charge, to any person obtaining
-  a copy of this software and associated documentation files (the
-  "Software"), to deal in the Software without restriction, including
-  without limitation the rights to use, copy, modify, merge, publish,
-  distribute, sublicense, and/or sell copies of the Software, and to
-  permit persons to whom the Software is furnished to do so, subject to
-  the following conditions:
+DA360
+  Copyright Insta360 Research Team and contributors
+  MIT License
+  https://github.com/Insta360-Research-Team/DA360
 
-  The above copyright notice and this permission notice shall be
-  included in all copies or substantial portions of the Software.
+YOPO
+  Copyright (c) 2024 TJU-Aerial-Robotics, Tianjin University, China
+  MIT License
+  https://github.com/cn-ryw/YOPO_360_X5_PR
+  The vendored subset and local modifications are documented in
+  third_party/YOPO/README.md.
 
--------------------------------------------------------------------------
-JSZip
-  Version: 3.10.1
-  License: MIT (or GPLv3)
-  URL: https://github.com/Stuk/jszip
-  Copyright: Copyright (c) 2009-2016 Stuart Knightley, David Duponchel,
-             Franz Buchinger, António Afonso
+Python runtime packages are installed from their public package indexes and
+remain under their respective licenses: Flask, NumPy, SciPy, Pillow,
+opencv-python-headless, ruamel.yaml and timm.
 
-  Permission is hereby granted, free of charge, to any person obtaining
-  a copy of this software and associated documentation files (the
-  "Software"), to deal in the Software without restriction, including
-  without limitation the rights to use, copy, modify, merge, publish,
-  distribute, sublicense, and/or sell copies of the Software, and to
-  permit persons to whom the Software is furnished to do so, subject to
-  the following conditions:
+External data services
+======================
 
-  The above copyright notice and this permission notice shall be
-  included in all copies or substantial portions of the Software.
+Google Photorealistic 3D Tiles are accessed through Cesium Ion. Their use is
+subject to the applicable Google Maps Platform and Cesium terms; they are not
+distributed in this repository.
+
+Project assets
+==============
+
+The representative simulator screenshot was produced from this project.
+The ZJU FAST Lab logo and CesiumDrone.glb were imported from the upstream
+project in commit 4825d7d. Their names and trademarks remain the property of
+their respective owners; see asset/ATTRIBUTION.md for provenance limits.
