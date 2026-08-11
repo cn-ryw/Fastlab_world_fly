@@ -93,13 +93,49 @@ const RELATIVE_POLAR_SCAN = Object.freeze({
     valid_fraction: 1,
     values: [1, 2, 3, 4],
 });
+const METRIC_POLAR_SCAN = Object.freeze({
+    schema_version: 1,
+    depth_mode: 'da360-metric',
+    unit: 'metres',
+    radius: 20,
+    angle_start_deg: -135,
+    angle_step_deg: 90,
+    angle_positive: 'body-left',
+    valid_fraction: 1,
+    values: [1, 2, 3, 4],
+});
+const VALID_PLANNING_DIAGNOSTICS = Object.freeze({
+    schema_version: 1,
+    selected_endstate_raw: Object.freeze([0, 0, 0, 0, 0, 0, 0, 0, 0]),
+    selected_candidate_id: 0,
+    selected_action_id: 0,
+    selected_lattice_id: 0,
+    selected_score: 0.25,
+    terminal_speed_mps: 1,
+    terminal_acceleration_mps2: 0,
+    endpoint_displacement_m: 1,
+    trajectory_time_s: 1,
+    candidate_count: 1,
+    velocity_scale_mps: 15,
+    acceleration_scale_mps2: 10,
+});
 
 function fakeBitmap(label = 'depth') {
     return { width: 8, height: 4, label, closed: false, close() { this.closed = true; } };
 }
 
 function response(payload) {
-    return { ok: true, status: 200, async json() { return payload; } };
+    const normalizedPayload = payload?.planning_authorized === true
+        && payload.planning_diagnostics === undefined
+        ? { ...payload, planning_diagnostics: { ...VALID_PLANNING_DIAGNOSTICS } }
+        : payload;
+    const bytes = new TextEncoder().encode(JSON.stringify(normalizedPayload)).byteLength;
+    return {
+        ok: true,
+        status: 200,
+        headers: { get(name) { return name === 'Content-Length' ? String(bytes) : null; } },
+        async json() { return normalizedPayload; },
+    };
 }
 
 function newSensorWithFrame() {
@@ -173,6 +209,24 @@ function newSensorWithFrame() {
         sensor._setDepthState('error', 'HTTP 503', { outcome: 'error' });
         assert.ok(messages.some(message => message.includes('reason=trajectory-apply-rejected')));
         assert.ok(messages.some(message => message.includes('reason=HTTP 503')));
+
+        const staleRequest = {
+            mode: 'planning', goalId: 'goal-log-test', generation: 1,
+            frameId: 9, gateAcquiredAt: performance.now(), frameContext: null,
+        };
+        for (let index = 0; index < 5; index++) {
+            sensor._markStale(staleRequest, 'planning-frame-too-old');
+        }
+        assert.equal(
+            messages.filter(message => message.includes('[depth-stale]')).length,
+            1,
+            'high-rate planning age drops are summarized once per throttle window',
+        );
+        assert.equal(
+            messages.filter(message => message.includes('reason=stale:planning-frame-too-old')).length,
+            0,
+            'ready/stale UI alternation must not bypass stale-log throttling',
+        );
     } finally {
         console.log = originalLog;
     }
@@ -316,6 +370,21 @@ async function nextTask() {
                 calibration_id: 'calibration-v1',
                 calibration_accuracy_accepted: false,
                 service_fingerprint: 'service-v1',
+                planning_diagnostics: {
+                    schema_version: 1,
+                    selected_endstate_raw: [0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1],
+                    selected_candidate_id: 5,
+                    selected_action_id: 5,
+                    selected_lattice_id: 58,
+                    selected_score: 0.25,
+                    terminal_speed_mps: 14.5,
+                    terminal_acceleration_mps2: 2.5,
+                    endpoint_displacement_m: 13.2,
+                    trajectory_time_s: 1.125,
+                    candidate_count: 64,
+                    velocity_scale_mps: 15,
+                    acceleration_scale_mps2: 10,
+                },
                 frame_id: '2',
                 goal_id: 'goal-1',
                 generation: '1',
@@ -339,12 +408,28 @@ async function nextTask() {
             acceleration: { x: 0.1, y: 0.2, z: 0.3 },
         },
         yaw: 0.25,
+        simTimeS: 12.5,
     });
     const goalId = sensor.setYopoGoal({ x: 10, y: 20, z: 30 });
     assert.equal(sensor.getDepthState().mode, 'planning');
     assert.equal(sensor._shouldRequestDepth(), false, 'old RGB frame must not be reused for a new goal');
 
     sensor.primeFromCaptureResult(new FakeCanvas('next-rgb'));
+    // The capture contract must stay frozen even if the vehicle advances before
+    // the response is installed.
+    sensor.setYopoPose({
+        actualState: {
+            position: { x: 2, y: 2, z: 3 },
+            velocity: { x: 4, y: 5, z: 6 },
+        },
+        referenceState: {
+            position: { x: 12, y: 12, z: 13 },
+            velocity: { x: 7, y: 8, z: 9 },
+            acceleration: { x: 0.1, y: 0.2, z: 0.3 },
+        },
+        yaw: 0.25,
+        simTimeS: 12.6,
+    });
     let callbackContext = null;
     let planningMetrics = null;
     sensor.onYopoResult = (_endstate, _trajTime, context) => {
@@ -355,6 +440,7 @@ async function nextTask() {
         if (metrics.mode === 'planning') planningMetrics = metrics;
     };
     assert.equal(await sensor._requestDepth(sensor.rgbCanvas), true);
+    await sensor._waitForDepthPreviewIdle();
     assert.match(calls.at(-1), /\/yopo\/plan_full\?/);
     assert.match(calls.at(-1), new RegExp(`goal_id=${goalId}`));
     const planningUrl = new URL(calls.at(-1));
@@ -371,12 +457,36 @@ async function nextTask() {
     assert.equal(callbackContext.mode, 'planning');
     assert.equal(callbackContext.serviceFingerprint, 'service-v1');
     assert.equal(callbackContext.calibrationAccuracyAccepted, false);
+    assert.equal(callbackContext.captureSimTimeS, 12.5);
+    assert.equal(callbackContext.captureActualState.position.x, 1);
+    assert.equal(callbackContext.applyActualState.position.x, 2);
+    assert.deepEqual(callbackContext.captureToApplyDelta, { x: 1, y: 0, z: 0 });
+    assert.equal(callbackContext.captureToApplyDisplacementM, 1);
+    assert.equal(callbackContext.planningDiagnosticsSchemaVersion, 1);
+    assert.equal(callbackContext.selectedCandidateId, 5);
+    assert.equal(callbackContext.selectedActionId, 5);
+    assert.equal(callbackContext.selectedLatticeId, 58);
+    assert.equal(callbackContext.terminalSpeedMps, 14.5);
+    assert.equal(callbackContext.terminalAccelerationMps2, 2.5);
+    assert.equal(callbackContext.endpointDisplacementM, 13.2);
+    assert.equal(callbackContext.velocityScaleMps, 15);
+    assert.deepEqual(
+        callbackContext.planningDiagnostics.selected_endstate_raw,
+        [0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1],
+    );
     assert.equal(planningMetrics.trajectoryApplied, true);
     assert.ok(Number.isFinite(planningMetrics.trajectoryAppliedAtMs));
     assert.equal(planningMetrics.depthMode, 'da360-metric');
     assert.equal(planningMetrics.calibrationId, 'calibration-v1');
     assert.equal(planningMetrics.calibrationAccuracyAccepted, false);
     assert.equal(planningMetrics.serviceFingerprint, 'service-v1');
+    assert.equal(planningMetrics.captureToApplyDisplacementM, 1);
+    assert.ok(Number.isFinite(planningMetrics.ageAtFetchStartMs));
+    assert.ok(Number.isFinite(planningMetrics.ageAtResponseHeadersMs));
+    assert.ok(Number.isFinite(planningMetrics.ageAtJsonParsedMs));
+    assert.ok(planningMetrics.responseBytes > 0);
+    assert.ok(Number.isFinite(planningMetrics.gateWaitMs));
+    assert.equal(planningMetrics.planningDiagnosticsSchemaVersion, 1);
 
     sensor.resetYopoGoal('cancelled');
     assert.equal(sensor.getDepthState().mode, 'preview');
@@ -413,17 +523,24 @@ async function nextTask() {
     const pending = sensor._requestDepth(sensor.rgbCanvas);
     await nextTask();
     assert.equal(callbackCalled, true, 'trajectory apply must not wait for preview decode');
+    assert.equal(sensor._depthGate, false,
+        'trajectory response releases the request gate before preview decode');
+    assert.equal(await pending, true,
+        'the control request resolves while its optional preview is still pending');
     const appliedMetrics = metrics.find(value => value.mode === 'planning');
     assert.equal(appliedMetrics.trajectoryApplied, true,
         'trajectory evidence is emitted synchronously with the install');
     assert.equal(appliedMetrics.depthPreviewCommitted, null,
         'optional preview outcome is not part of the trajectory acknowledgement');
     resolveDecode(fakeBitmap('planning-order-depth'));
-    assert.equal(await pending, true);
+    await sensor._waitForDepthPreviewIdle();
     assert.equal(appliedMetrics.trajectoryApplied, true);
     assert.ok(appliedMetrics.captureToApplyMs <= appliedMetrics.frameAgeMs);
     assert.equal(metrics.filter(value => value.mode === 'planning').length, 1);
     assert.equal(metrics.filter(value => value.mode === 'depth-preview').length, 1);
+    const displayMetrics = metrics.find(value => value.mode === 'depth-preview');
+    assert.ok(Number.isFinite(displayMetrics.depthDecodeMs));
+    assert.ok(Number.isFinite(displayMetrics.depthDrawMs));
 
     const rejected = newSensorWithFrame();
     rejected.setYopoPose({ x: 0, y: 100, z: 0, vx: 0, vy: 0, vz: 0 }, 0);
@@ -436,10 +553,167 @@ async function nextTask() {
         if (value.mode === 'planning') rejectedMetrics = value;
     };
     assert.equal(await rejected._requestDepth(rejected.rgbCanvas), true);
+    await rejected._waitForDepthPreviewIdle();
     assert.equal(rejectedMetrics.outcome, 'rejected');
     assert.equal(rejectedMetrics.trajectoryApplied, false);
     assert.equal(rejectedMetrics.dropReason, 'trajectory-apply-rejected');
     assert.match(rejected.depthStatusEl.textContent, /rejected/);
+}
+
+// A slow operator preview is never part of the planning request gate. The next
+// compact trajectory request starts and installs while the prior JPEG decode is
+// still pending; cached UI previews are sampled at most once per 2 s window.
+{
+    const sensor = newSensorWithFrame();
+    sensor.setYopoPose({ x: 0, y: 100, z: 0, vx: 0, vy: 0, vz: 0, simTimeS: 1 }, 0);
+    sensor.setYopoGoal({ x: 30, y: 100, z: 0 });
+    sensor.primeFromCaptureResult(new FakeCanvas('slow-preview-first-rgb'));
+    let resolvePreviewFetch;
+    const planningUrls = [];
+    const previewUrls = [];
+    let applyCalls = 0;
+    globalThis.createImageBitmap = async () => fakeBitmap('independent-preview');
+    globalThis.fetch = async url => {
+        const parsed = new URL(String(url));
+        if (parsed.pathname === '/yopo/preview') {
+            previewUrls.push(parsed);
+            const previewResponse = response({
+                depth_image: DEPTH_JPEG,
+                preview_included: true,
+                latency_ms: 4,
+                depth_mode: 'da360-metric',
+                frame_id: parsed.searchParams.get('frame_id'),
+                goal_id: parsed.searchParams.get('goal_id'),
+                generation: parsed.searchParams.get('generation'),
+            });
+            if (previewUrls.length === 1) {
+                return new Promise(resolve => { resolvePreviewFetch = () => resolve(previewResponse); });
+            }
+            return previewResponse;
+        }
+        planningUrls.push(parsed);
+        return response({
+            preview_included: false,
+            preview_available: true,
+            latency_ms: 30,
+            planning_authorized: true,
+            planning_reason: 'validated-da360-metric',
+            endstate: [1, 2, 3, 4, 5, 6, 7, 8, 9],
+            traj_time: 1,
+            depth_mode: 'da360-metric',
+            calibration_id: 'cal-slow-preview',
+            service_fingerprint: 'svc-slow-preview',
+            frame_id: parsed.searchParams.get('frame_id'),
+            goal_id: parsed.searchParams.get('goal_id'),
+            generation: parsed.searchParams.get('generation'),
+        });
+    };
+    sensor.onYopoResult = () => { applyCalls++; return true; };
+
+    assert.equal(await sensor._requestDepth(sensor.rgbCanvas), true);
+    assert.equal(sensor._depthGate, false);
+    assert.equal(applyCalls, 1);
+    assert.equal(planningUrls[0].searchParams.get('include_preview'), '0');
+    await nextTask();
+    assert.equal(previewUrls.length, 1);
+
+    sensor.setYopoPose({ x: 1, y: 100, z: 0, vx: 1, vy: 0, vz: 0, simTimeS: 1.05 }, 0);
+    sensor.primeFromCaptureResult(new FakeCanvas('slow-preview-second-rgb'));
+    assert.equal(await sensor._requestDepth(sensor.rgbCanvas), true,
+        'next control request must finish before the prior preview decode');
+    assert.equal(applyCalls, 2);
+    assert.equal(planningUrls.length, 2);
+    assert.equal(planningUrls[1].searchParams.get('include_preview'), '0');
+    assert.equal(previewUrls.length, 1,
+        'the stalled independent preview neither blocks nor duplicates planning');
+
+    resolvePreviewFetch();
+    await sensor._waitForDepthPreviewIdle();
+    assert.equal(sensor.depthCanvas.context.drawCalls.length, 1);
+
+    sensor._lastPlanningPreviewFetchAt -= 2001;
+    globalThis.createImageBitmap = async () => fakeBitmap('sampled-preview');
+    sensor.setYopoPose({ x: 2, y: 100, z: 0, vx: 1, vy: 0, vz: 0, simTimeS: 1.1 }, 0);
+    sensor.primeFromCaptureResult(new FakeCanvas('sampled-preview-third-rgb'));
+    assert.equal(await sensor._requestDepth(sensor.rgbCanvas), true);
+    await sensor._waitForDepthPreviewIdle();
+    assert.equal(planningUrls[2].searchParams.get('include_preview'), '0');
+    assert.equal(previewUrls.length, 2,
+        'independent preview sampling resumes after the 2 s cadence window');
+}
+
+// If preview-producing planning responses outrun decoding, retain only the
+// latest queued preview. The in-progress stale bitmap may finish, but it cannot
+// draw, and the superseded middle JPEG is never decoded.
+{
+    const sensor = newSensorWithFrame();
+    sensor.setYopoPose({ x: 0, y: 100, z: 0, vx: 0, vy: 0, vz: 0 }, 0);
+    sensor.setYopoGoal({ x: 30, y: 100, z: 0 });
+    const leveledTransform = {
+        position: { x: 0, y: 100, z: 0 },
+        rotation: { x: 0, y: 0, z: 0 },
+    };
+    sensor.primeFromCaptureResult(
+        new FakeCanvas('coalesce-first-rgb'),
+        0,
+        { transform: leveledTransform },
+    );
+    let resolveFirstDecode;
+    let decodeCalls = 0;
+    globalThis.createImageBitmap = () => {
+        decodeCalls++;
+        if (decodeCalls === 1) {
+            return new Promise(resolve => { resolveFirstDecode = resolve; });
+        }
+        return Promise.resolve(fakeBitmap(`coalesce-${decodeCalls}`));
+    };
+    globalThis.fetch = async url => {
+        const parsed = new URL(String(url));
+        const responseFrameId = Number(parsed.searchParams.get('frame_id'));
+        return response({
+            depth_image: DEPTH_JPEG,
+            polar_scan: {
+                ...METRIC_POLAR_SCAN,
+                values: [responseFrameId, 2, 3, 4],
+            },
+            preview_included: true,
+            latency_ms: 30,
+            planning_authorized: true,
+            endstate: [1, 2, 3, 4, 5, 6, 7, 8, 9],
+            traj_time: 1,
+            depth_mode: 'da360-metric',
+            calibration_id: 'cal-coalesce',
+            service_fingerprint: 'svc-coalesce',
+            frame_id: parsed.searchParams.get('frame_id'),
+            goal_id: parsed.searchParams.get('goal_id'),
+            generation: parsed.searchParams.get('generation'),
+        });
+    };
+    sensor.onYopoResult = () => true;
+    assert.equal(await sensor._requestDepth(sensor.rgbCanvas), true);
+
+    for (const [position, label] of [[1, 'middle'], [2, 'latest']]) {
+        sensor._lastPlanningPreviewFetchAt -= 2001;
+        sensor.setYopoPose({ x: position, y: 100, z: 0, vx: 1, vy: 0, vz: 0 }, 0);
+        sensor.primeFromCaptureResult(
+            new FakeCanvas(`coalesce-${label}-rgb`),
+            0,
+            { transform: leveledTransform },
+        );
+        assert.equal(await sensor._requestDepth(sensor.rgbCanvas), true);
+    }
+    assert.equal(decodeCalls, 1,
+        'middle/latest previews queue without waiting for the active decoder');
+    assert.equal(sensor.getDepthPolarScan(), null,
+        'a polar scan must not publish before its matching bitmap wins the latest gate');
+    resolveFirstDecode(fakeBitmap('coalesce-stale-first'));
+    await sensor._waitForDepthPreviewIdle();
+    assert.equal(decodeCalls, 2, 'the superseded middle preview is never decoded');
+    assert.equal(sensor.depthCanvas.context.drawCalls.length, 1,
+        'only the latest preview may draw after coalescing');
+    assert.equal(sensor.getDepthPolarScan().requestId, 3);
+    assert.equal(sensor.getDepthPolarScan().scan.values[0], 4,
+        'the committed polar scan and bitmap must belong to the same latest response');
 }
 
 // Once the trajectory is installed, a new navigation generation makes only
@@ -470,11 +744,12 @@ async function nextTask() {
     const drawCount = sensor.depthCanvas.context.drawCalls.length;
     const pending = sensor._requestDepth(sensor.rgbCanvas);
     await nextTask();
+    assert.equal(await pending, true);
 
     sensor.setYopoGoal({ x: 60, y: 100, z: 0 });
     const newerState = sensor.getDepthState();
     resolveDecode(fakeBitmap('stale-depth-preview'));
-    assert.equal(await pending, true);
+    await sensor._waitForDepthPreviewIdle();
     assert.equal(sensor.depthCanvas.context.drawCalls.length, drawCount,
         'stale preview must not draw over the newer frame');
     assert.deepEqual(sensor.getDepthState(), newerState,
@@ -537,6 +812,7 @@ async function nextTask() {
         const drawCount = sensor.depthCanvas.context.drawCalls.length;
         const pending = sensor._requestDepth(sensor.rgbCanvas);
         await nextTask();
+        assert.equal(await pending, true);
 
         const controlBeforeDecode = metrics.filter(value => value.mode === 'planning');
         assert.equal(controlBeforeDecode.length, 1, `${scenario.label} has one immediate control event`);
@@ -545,7 +821,7 @@ async function nextTask() {
 
         sensor.setYopoGoal({ x: 60, y: 100, z: 0 });
         resolveDecode(fakeBitmap(`${scenario.label}-stale-preview`));
-        assert.equal(await pending, true);
+        await sensor._waitForDepthPreviewIdle();
         assert.equal(sensor.depthCanvas.context.drawCalls.length, drawCount,
             `${scenario.label} old preview must not draw into the new goal`);
         assert.equal(metrics.filter(value => value.mode === 'planning').length, 1,
@@ -583,6 +859,7 @@ async function nextTask() {
     const drawCount = sensor.depthCanvas.context.drawCalls.length;
 
     assert.equal(await sensor._requestDepth(sensor.rgbCanvas), true);
+    await sensor._waitForDepthPreviewIdle();
     const control = metrics.filter(value => value.mode === 'planning');
     const display = metrics.filter(value => value.mode === 'depth-preview');
     assert.equal(control.length, 1);
@@ -592,7 +869,7 @@ async function nextTask() {
     assert.equal(display[0].outcome, 'error');
     assert.match(display[0].depthPreviewError, /corrupt planning preview/);
     assert.equal(sensor.depthCanvas.context.drawCalls.length, drawCount);
-    assert.match(sensor.depthStatusEl.title, /depth-preview-error/);
+    assert.match(display[0].depthPreviewError, /corrupt planning preview/);
 }
 
 // A backend authorization bit is insufficient without the full provenance
@@ -638,7 +915,7 @@ async function nextTask() {
     sensor.primeFromCaptureResult(
         new FakeCanvas('relative-planning-rgb'),
         0,
-        { capturedAt: performance.now() - 1000 },
+        { capturedAt: performance.now() },
     );
     let yopoCallbacks = 0;
     let metrics = null;
@@ -659,7 +936,8 @@ async function nextTask() {
     });
 
     assert.equal(await sensor._requestDepth(sensor.rgbCanvas), true,
-        'even an old blocked planning response still commits its useful depth preview');
+        'a blocked planning response may still commit its useful depth preview');
+    await sensor._waitForDepthPreviewIdle();
     assert.equal(sensor.hasDepth, true);
     assert.equal(sensor.getDepthState().mode, 'planning');
     assert.equal(sensor.getDepthState().outcome, 'blocked');
@@ -697,7 +975,9 @@ async function nextTask() {
     assert.equal(sensor.depthCanvas.context.drawCalls.length, 0);
     assert.equal(yopoCallbacks, 0);
     assert.equal(sensor.getDepthState().mode, 'planning');
-    assert.equal(sensor.getDepthState().outcome, 'stale');
+    assert.equal(sensor.getDepthState().outcome, 'ok',
+        'the stale old request must not overwrite the new session outcome');
+    assert.match(sensor.getDepthState().reason, /awaiting-new-rgb-frame/);
     assert.equal(sensor.getDepthState().goalId, goalId);
 }
 
@@ -773,6 +1053,7 @@ async function nextTask() {
     resolveFetch(response({ depth_image: DEPTH_JPEG, latency_ms: 14 }));
 
     assert.equal(await oldRequest, true);
+    await sensor._waitForDepthPreviewIdle();
     assert.equal(sensor.hasDepth, true, 'newest available ordered depth becomes ready');
     assert.equal(sensor.depthCanvas.context.drawCalls.length, 1,
         'latest depth response may display one frame behind RGB');
@@ -816,6 +1097,7 @@ async function nextTask() {
     }));
 
     assert.equal(await oldRequest, true);
+    await sensor._waitForDepthPreviewIdle();
     assert.equal(callbackCalls, 1, 'fresh frozen planning frame must still apply');
     assert.equal(sensor.depthCanvas.context.drawCalls.length, drawCount + 1,
         'latest ordered depth response keeps the planning preview advancing');
@@ -844,8 +1126,11 @@ async function nextTask() {
     );
     let callbackCalls = 0;
     let metrics = null;
+    let fetchCalls = 0;
     globalThis.createImageBitmap = async () => fakeBitmap('expired-preview');
-    globalThis.fetch = async () => response({
+    globalThis.fetch = async () => {
+        fetchCalls++;
+        return response({
         depth_image: DEPTH_JPEG,
         latency_ms: 35,
         planning_authorized: true,
@@ -856,14 +1141,801 @@ async function nextTask() {
         calibration_id: 'cal-expired',
         service_fingerprint: 'svc-expired',
         frame_id: '2', goal_id: 'goal-1', generation: '1',
-    });
+        });
+    };
     sensor.onYopoResult = () => { callbackCalls++; return true; };
     sensor.onPerceptionMetrics = value => { metrics = value; };
 
     assert.equal(await sensor._requestDepth(sensor.rgbCanvas), false);
     assert.equal(callbackCalls, 0);
+    assert.equal(fetchCalls, 0,
+        'an already exhausted 250 ms age budget must not consume a GPU request');
     assert.equal(metrics.outcome, 'stale');
     assert.equal(metrics.dropReason, 'planning-frame-too-old');
+    assert.equal(metrics.fetchStarted, false);
+    assert.equal(metrics.captureMs, 0);
+    assert.equal(metrics.renderMs, null);
+    assert.equal(metrics.jpegMs, null);
+    assert.equal(metrics.fetchStartedAtMs, null);
+    assert.equal(metrics.responseHeadersAtMs, null);
+    assert.equal(metrics.payloadParsedAtMs, null);
+    assert.equal(metrics.responseHeadersMs, null);
+    assert.equal(metrics.httpBodyMs, null);
+    assert.equal(metrics.responseJsonMs, null);
+    assert.equal(metrics.networkMs, null);
+    assert.equal(metrics.responseBytes, null);
+    assert.equal(metrics.serverMs, null);
+    assert.equal(metrics.da360Ms, null);
+    assert.equal(metrics.yopoMs, null);
+    assert.equal(metrics.planningDiagnostics, null);
+    assert.equal(metrics.planningDiagnosticsSchemaVersion, null);
+}
+
+// At a 60 Hz render cadence, a response that already consumed more than the
+// nominal 20 ms interval must hand the newest frozen frame directly to the next
+// planning request. Limiting from response completion would add a 20--37 ms
+// idle window; limiting from request start produces a zero-gap 50 ms cadence.
+{
+    const realPerformance = globalThis.performance;
+    const originalWindowSetTimeout = window.setTimeout;
+    const originalWindowClearTimeout = window.clearTimeout;
+    let clockMs = 1000;
+    let timerSequence = 0;
+    const timers = new Map();
+    Object.defineProperty(globalThis, 'performance', {
+        configurable: true,
+        value: { now: () => clockMs },
+    });
+    window.setTimeout = (callback, delay = 0) => {
+        const id = ++timerSequence;
+        timers.set(id, { callback, dueAt: clockMs + Number(delay) });
+        return id;
+    };
+    window.clearTimeout = id => { timers.delete(id); };
+    try {
+        const sensor = newSensorWithFrame();
+        sensor.setYopoPose({ x: 0, y: 100, z: 0, vx: 0, vy: 0, vz: 0 }, 0);
+        sensor.setYopoGoal({ x: 30, y: 100, z: 0 });
+        sensor.primeFromCaptureResult(
+            new FakeCanvas('request-start-cadence-first-rgb'),
+            0,
+            { capturedAt: clockMs },
+        );
+        sensor._lastPlanningPreviewFetchAt = clockMs;
+        const fetchStarts = [];
+        let resolveFirstFetch = null;
+        const planningResponse = url => {
+            const parsed = new URL(String(url));
+            return response({
+                preview_included: false,
+                preview_available: false,
+                latency_ms: 30,
+                planning_authorized: true,
+                endstate: [1, 2, 3, 4, 5, 6, 7, 8, 9],
+                traj_time: 1,
+                depth_mode: 'da360-metric',
+                calibration_id: 'cal-request-start-cadence',
+                service_fingerprint: 'svc-request-start-cadence',
+                frame_id: parsed.searchParams.get('frame_id'),
+                goal_id: parsed.searchParams.get('goal_id'),
+                generation: parsed.searchParams.get('generation'),
+            });
+        };
+        globalThis.fetch = url => {
+            fetchStarts.push(clockMs);
+            if (fetchStarts.length === 1) {
+                return new Promise(resolve => { resolveFirstFetch = resolve; });
+            }
+            return Promise.resolve(planningResponse(url));
+        };
+        sensor.onYopoResult = () => true;
+
+        const firstRequest = sensor._requestDepth(sensor.rgbCanvas);
+        await nextTask();
+        assert.deepEqual(fetchStarts, [1000]);
+
+        // A new panorama becomes available on the next 60 Hz frame while the
+        // first request remains the sole control request in flight.
+        clockMs = 1000 + 1000 / 60;
+        sensor.setYopoPose({ x: 1, y: 100, z: 0, vx: 1, vy: 0, vz: 0 }, 0);
+        sensor.primeFromCaptureResult(
+            new FakeCanvas('request-start-cadence-latest-rgb'),
+            0,
+            { capturedAt: clockMs },
+        );
+
+        clockMs = 1050;
+        resolveFirstFetch(planningResponse(
+            'http://127.0.0.1:5688/yopo/plan_full?frame_id=2&goal_id=goal-1&generation=1'
+        ));
+        assert.equal(await firstRequest, true);
+        await nextTask();
+        assert.deepEqual(fetchStarts, [1000, 1050],
+            'response completion must immediately start the latest frame without another 20 ms wait');
+        assert.equal(sensor._depthGate, false);
+        assert.equal(sensor._depthCatchupTimer, null);
+    } finally {
+        window.setTimeout = originalWindowSetTimeout;
+        window.clearTimeout = originalWindowClearTimeout;
+        Object.defineProperty(globalThis, 'performance', {
+            configurable: true,
+            value: realPerformance,
+        });
+    }
+}
+
+// A sub-20 ms response uses one remaining-time timer and repeated scheduling
+// attempts do not create a busy loop or duplicate request.
+{
+    const realPerformance = globalThis.performance;
+    const originalWindowSetTimeout = window.setTimeout;
+    const originalWindowClearTimeout = window.clearTimeout;
+    let clockMs = 1010;
+    let scheduled = null;
+    let timerCalls = 0;
+    Object.defineProperty(globalThis, 'performance', {
+        configurable: true,
+        value: { now: () => clockMs },
+    });
+    window.setTimeout = (callback, delay = 0) => {
+        timerCalls++;
+        scheduled = { callback, delay };
+        return 811;
+    };
+    window.clearTimeout = () => { scheduled = null; };
+    try {
+        const sensor = newSensorWithFrame();
+        sensor._lastDepthRequestStartedAt = 1000;
+        sensor._lastRequestedFrameId = 0;
+        const starts = [];
+        sensor._requestDepth = () => { starts.push(performance.now()); };
+        sensor._queueLatestDepthRequest();
+        sensor._queueLatestDepthRequest();
+        assert.equal(timerCalls, 1);
+        assert.equal(scheduled.delay, 10);
+
+        const fire = scheduled.callback;
+        clockMs = 1020;
+        scheduled = null;
+        fire();
+        await nextTask();
+        assert.deepEqual(starts, [1020]);
+        assert.equal(timerCalls, 1);
+    } finally {
+        window.setTimeout = originalWindowSetTimeout;
+        window.clearTimeout = originalWindowClearTimeout;
+        Object.defineProperty(globalThis, 'performance', {
+            configurable: true,
+            value: realPerformance,
+        });
+    }
+}
+
+// Installation reserves 2 ms inside the 250 ms hard age limit. This closes the
+// boundary where validation at 249.x ms could previously become a 251 ms apply
+// after the synchronous trajectory callback and accounting.
+{
+    const realPerformance = globalThis.performance;
+    let clockMs = 1000;
+    Object.defineProperty(globalThis, 'performance', {
+        configurable: true,
+        value: { now: () => clockMs },
+    });
+    try {
+        const sensor = newSensorWithFrame();
+        sensor.setYopoPose({ x: 0, y: 100, z: 0, vx: 0, vy: 0, vz: 0 }, 0);
+        sensor.setYopoGoal({ x: 30, y: 100, z: 0 });
+        sensor.primeFromCaptureResult(
+            {
+                canvas: new FakeCanvas('planning-apply-boundary-rgb'),
+                complete: true,
+                timings_ms: {
+                    total: 41,
+                    render: 20,
+                    scene_render: 18,
+                    tile_wait: 2,
+                    wait_rerender: 1,
+                    face_upload: 3,
+                    project: 4,
+                    scheduler: 5,
+                },
+            },
+            0,
+            { capturedAt: clockMs },
+        );
+        let callbackCalls = 0;
+        let staleMetrics = null;
+        globalThis.fetch = async () => ({
+            ok: true,
+            status: 200,
+            headers: { get() { return '256'; } },
+            async json() {
+                clockMs = 1248;
+                return {
+                    latency_ms: 40,
+                    timings_ms: { da360_ms: 30, yopo_ms: 3 },
+                    planning_authorized: true,
+                    endstate: [1, 2, 3, 4, 5, 6, 7, 8, 9],
+                    traj_time: 1,
+                    depth_mode: 'da360-metric',
+                    calibration_id: 'cal-apply-boundary',
+                    service_fingerprint: 'svc-apply-boundary',
+                    planning_diagnostics: { ...VALID_PLANNING_DIAGNOSTICS },
+                    frame_id: '2', goal_id: 'goal-1', generation: '1',
+                };
+            },
+        });
+        sensor.onYopoResult = () => { callbackCalls++; return true; };
+        sensor.onPerceptionMetrics = value => { staleMetrics = value; };
+        assert.equal(await sensor._requestDepth(sensor.rgbCanvas), false);
+        assert.equal(callbackCalls, 0,
+            '248 ms boundary must be rejected before entering the apply callback');
+        assert.equal(staleMetrics.dropReason, 'planning-frame-too-old');
+        assert.equal(staleMetrics.planningApplyReserveMs, 2);
+        assert.equal(staleMetrics.captureMs, 41);
+        assert.equal(staleMetrics.renderMs, 20);
+        assert.equal(staleMetrics.sceneRenderMs, 18);
+        assert.equal(staleMetrics.tileWaitMs, 2);
+        assert.equal(staleMetrics.waitRerenderMs, 1);
+        assert.equal(staleMetrics.faceUploadMs, 3);
+        assert.equal(staleMetrics.projectMs, 4);
+        assert.equal(staleMetrics.schedulerYieldMs, 5);
+        assert.equal(staleMetrics.jpegMs, 0);
+        assert.equal(staleMetrics.fetchStarted, true);
+        assert.equal(staleMetrics.fetchStartedAtMs, 1000);
+        assert.equal(staleMetrics.responseHeadersAtMs, 1000);
+        assert.equal(staleMetrics.payloadParsedAtMs, 1248);
+        assert.equal(staleMetrics.responseHeadersMs, 0);
+        assert.equal(staleMetrics.httpBodyMs, 248);
+        assert.equal(staleMetrics.responseJsonMs, 248);
+        assert.equal(staleMetrics.networkMs, 248);
+        assert.equal(staleMetrics.responseBytes, 256);
+        assert.equal(staleMetrics.gateWaitMs, 248);
+        assert.equal(staleMetrics.serverMs, 40);
+        assert.equal(staleMetrics.da360Ms, 30);
+        assert.equal(staleMetrics.yopoMs, 3);
+        assert.deepEqual(staleMetrics.serverTimings, { da360_ms: 30, yopo_ms: 3 });
+        assert.equal(staleMetrics.ageBudgetRemainingMs, 2);
+        assert.equal(staleMetrics.planningDiagnosticsSchemaVersion, 1);
+        assert.equal(staleMetrics.selectedCandidateId, 0);
+        assert.deepEqual(
+            staleMetrics.planningDiagnostics.selected_endstate_raw,
+            VALID_PLANNING_DIAGNOSTICS.selected_endstate_raw,
+        );
+    } finally {
+        Object.defineProperty(globalThis, 'performance', {
+            configurable: true,
+            value: realPerformance,
+        });
+    }
+}
+
+// Parsed-but-unsupported planner diagnostics fail closed while preserving all
+// response-stage evidence needed to distinguish transport, server, and schema
+// faults. The unaccepted payload is never forwarded to the controller.
+{
+    const sensor = newSensorWithFrame();
+    sensor.setYopoPose({ x: 0, y: 100, z: 0, vx: 0, vy: 0, vz: 0 }, 0);
+    sensor.setYopoGoal({ x: 30, y: 100, z: 0 });
+    sensor.primeFromCaptureResult(new FakeCanvas('planning-schema-v2-rgb'));
+    let callbackCalls = 0;
+    let errorMetrics = null;
+    globalThis.fetch = async () => response({
+        latency_ms: 40,
+        timings_ms: { da360_ms: 29, yopo_ms: 3, serialize_ms: 2 },
+        planning_authorized: true,
+        endstate: [1, 2, 3, 4, 5, 6, 7, 8, 9],
+        traj_time: 1,
+        depth_mode: 'da360-metric',
+        calibration_id: 'cal-schema-v2',
+        service_fingerprint: 'svc-schema-v2',
+        planning_diagnostics: {
+            ...VALID_PLANNING_DIAGNOSTICS,
+            schema_version: 2,
+        },
+        frame_id: '2', goal_id: 'goal-1', generation: '1',
+    });
+    sensor.onYopoResult = () => { callbackCalls++; return true; };
+    sensor.onPerceptionMetrics = metrics => { errorMetrics = metrics; };
+
+    assert.equal(await sensor._requestDepth(sensor.rgbCanvas), false);
+    assert.equal(callbackCalls, 0);
+    assert.equal(sensor.getDepthState().mode, 'error');
+    assert.match(sensor.getDepthState().reason, /unsupported planning_diagnostics schema_version=2/);
+    assert.equal(errorMetrics.outcome, 'error');
+    assert.equal(errorMetrics.planningDiagnosticsSchemaVersion, 2);
+    assert.equal(errorMetrics.planningDiagnostics, null);
+    assert.deepEqual(errorMetrics.selectedEndstate, [1, 2, 3, 4, 5, 6, 7, 8, 9]);
+    assert.equal(errorMetrics.serverMs, 40);
+    assert.equal(errorMetrics.da360Ms, 29);
+    assert.equal(errorMetrics.yopoMs, 3);
+    assert.deepEqual(
+        errorMetrics.serverTimings,
+        { da360_ms: 29, yopo_ms: 3, serialize_ms: 2 },
+    );
+    assert.ok(errorMetrics.responseBytes > 0);
+    assert.equal(errorMetrics.fetchStarted, true);
+    assert.ok(Number.isFinite(errorMetrics.responseHeadersMs));
+    assert.ok(Number.isFinite(errorMetrics.responseJsonMs));
+    assert.ok(Number.isFinite(errorMetrics.networkMs));
+    assert.ok(Number.isFinite(errorMetrics.gateWaitMs));
+}
+
+// Authorized planning diagnostics are a versioned, self-consistent contract.
+// Numeric schema aliases, missing/non-finite/out-of-range fields, inconsistent
+// lattice mappings, and raw endstates outside the tolerance all fail closed.
+{
+    const invalidDiagnostics = [
+        {
+            label: 'missing diagnostics',
+            value: null,
+            reason: /authorized planning response missing planning/,
+        },
+        {
+            label: 'numeric-string schema',
+            value: { ...VALID_PLANNING_DIAGNOSTICS, schema_version: '1' },
+            reason: /unsupported planning_diagnostics schema_version=1/,
+        },
+        {
+            label: 'candidate/action mismatch',
+            value: {
+                ...VALID_PLANNING_DIAGNOSTICS,
+                selected_candidate_id: 1,
+                selected_action_id: 0,
+                selected_lattice_id: 1,
+                candidate_count: 2,
+            },
+            reason: /planning_diagnostics candidate\/action/,
+        },
+        {
+            label: 'lattice mismatch',
+            value: {
+                ...VALID_PLANNING_DIAGNOSTICS,
+                selected_candidate_id: 0,
+                selected_action_id: 0,
+                selected_lattice_id: 0,
+                candidate_count: 2,
+            },
+            reason: /planning_diagnostics candidate\/action/,
+        },
+        {
+            label: 'raw outside tolerance',
+            value: {
+                ...VALID_PLANNING_DIAGNOSTICS,
+                selected_endstate_raw: [1 + 2e-5, 0, 0, 0, 0, 0, 0, 0, 0],
+            },
+            reason: /planning_diagnostics selected_endstate_raw is out/,
+        },
+        {
+            label: 'missing selected score',
+            value: {
+                ...VALID_PLANNING_DIAGNOSTICS,
+                selected_score: undefined,
+            },
+            reason: /planning_diagnostics missing\/non-finite number/,
+        },
+        {
+            label: 'non-finite terminal speed',
+            value: {
+                ...VALID_PLANNING_DIAGNOSTICS,
+                terminal_speed_mps: Number.NaN,
+            },
+            reason: /planning_diagnostics missing\/non-finite number/,
+        },
+        {
+            label: 'negative terminal acceleration',
+            value: {
+                ...VALID_PLANNING_DIAGNOSTICS,
+                terminal_acceleration_mps2: -0.01,
+            },
+            reason: /planning_diagnostics negative score\/terminal metric/,
+        },
+        {
+            label: 'zero trajectory time',
+            value: {
+                ...VALID_PLANNING_DIAGNOSTICS,
+                trajectory_time_s: 0,
+            },
+            reason: /planning_diagnostics time\/scale must be positive/,
+        },
+        {
+            label: 'zero acceleration scale',
+            value: {
+                ...VALID_PLANNING_DIAGNOSTICS,
+                acceleration_scale_mps2: 0,
+            },
+            reason: /planning_diagnostics time\/scale must be positive/,
+        },
+    ];
+    for (const scenario of invalidDiagnostics) {
+        const sensor = newSensorWithFrame();
+        sensor.setYopoPose({ x: 0, y: 100, z: 0, vx: 0, vy: 0, vz: 0 }, 0);
+        sensor.setYopoGoal({ x: 30, y: 100, z: 0 });
+        sensor.primeFromCaptureResult(new FakeCanvas(`planning-${scenario.label}-rgb`));
+        let callbackCalls = 0;
+        globalThis.fetch = async () => response({
+            planning_authorized: true,
+            endstate: [1, 2, 3, 4, 5, 6, 7, 8, 9],
+            traj_time: 1,
+            depth_mode: 'da360-metric',
+            calibration_id: `cal-${scenario.label}`,
+            service_fingerprint: `svc-${scenario.label}`,
+            planning_diagnostics: scenario.value,
+            frame_id: '2', goal_id: 'goal-1', generation: '1',
+        });
+        sensor.onYopoResult = () => { callbackCalls++; return true; };
+
+        assert.equal(await sensor._requestDepth(sensor.rgbCanvas), false, scenario.label);
+        assert.equal(callbackCalls, 0, scenario.label);
+        assert.equal(sensor.getDepthState().mode, 'error', scenario.label);
+        assert.match(sensor.getDepthState().reason, scenario.reason, scenario.label);
+    }
+
+    const accepted = newSensorWithFrame();
+    accepted.setYopoPose({ x: 0, y: 100, z: 0, vx: 0, vy: 0, vz: 0 }, 0);
+    accepted.setYopoGoal({ x: 30, y: 100, z: 0 });
+    accepted.primeFromCaptureResult(new FakeCanvas('planning-raw-tolerance-rgb'));
+    let acceptedContext = null;
+    globalThis.fetch = async () => response({
+        planning_authorized: true,
+        endstate: [1, 2, 3, 4, 5, 6, 7, 8, 9],
+        traj_time: 1,
+        depth_mode: 'da360-metric',
+        calibration_id: 'cal-raw-tolerance',
+        service_fingerprint: 'svc-raw-tolerance',
+        planning_diagnostics: {
+            ...VALID_PLANNING_DIAGNOSTICS,
+            selected_endstate_raw: [1 + 5e-6, 0, 0, 0, 0, 0, 0, 0, 0],
+        },
+        frame_id: '2', goal_id: 'goal-1', generation: '1',
+    });
+    accepted.onYopoResult = (_endstate, _duration, context) => {
+        acceptedContext = context;
+        return true;
+    };
+    assert.equal(await accepted._requestDepth(accepted.rgbCanvas), true);
+    assert.equal(acceptedContext.planningDiagnosticsSchemaVersion, 1);
+    assert.equal(acceptedContext.selectedRawEndstate[0], 1 + 5e-6);
+}
+
+// Calibration artifacts all originate from one frozen PerceptionFrame.
+// The planning deadline owns JPEG materialization too. Even a non-abort-aware
+// toBlob/rgbPromise cannot retain the single-request gate after expiry.
+{
+    const originalWindowSetTimeout = window.setTimeout;
+    const originalWindowClearTimeout = window.clearTimeout;
+    let fireDeadline = null;
+    window.setTimeout = callback => {
+        fireDeadline = callback;
+        return 991;
+    };
+    window.clearTimeout = () => {};
+    try {
+        const sensor = newSensorWithFrame();
+        sensor.setYopoPose({ x: 0, y: 100, z: 0, vx: 0, vy: 0, vz: 0 }, 0);
+        sensor.setYopoGoal({ x: 30, y: 100, z: 0 });
+        sensor.primeFromCaptureResult(new FakeCanvas('deadline-jpeg-rgb'));
+        let resolveRgb;
+        sensor._rgbFrameContext = Object.freeze({
+            ...sensor._rgbFrameContext,
+            rgbPromise: new Promise(resolve => { resolveRgb = resolve; }),
+        });
+        let fetchCalls = 0;
+        let staleMetrics = null;
+        globalThis.fetch = async () => { fetchCalls++; return response({}); };
+        sensor.onPerceptionMetrics = metrics => { staleMetrics = metrics; };
+
+        const pending = sensor._requestDepth(sensor.rgbCanvas);
+        assert.equal(sensor._depthGate, true);
+        assert.equal(typeof fireDeadline, 'function');
+        fireDeadline();
+        assert.equal(await pending, false);
+        assert.equal(fetchCalls, 0);
+        assert.equal(sensor._depthGate, false);
+        assert.equal(sensor.depthPending, false);
+        assert.equal(sensor._activeDepthRequest, null);
+        assert.equal(staleMetrics.dropReason, 'planning-frame-too-old');
+        resolveRgb({
+            blob: new Blob(['late-rgb'], { type: 'image/jpeg' }),
+            width: 384,
+            height: 192,
+            jpegMs: 999,
+        });
+        await nextTask();
+        assert.equal(sensor._depthGate, false,
+            'a late JPEG completion cannot reacquire request ownership');
+    } finally {
+        window.setTimeout = originalWindowSetTimeout;
+        window.clearTimeout = originalWindowClearTimeout;
+    }
+}
+
+// The same deadline releases the gate even if a fetch mock/backend transport
+// ignores AbortSignal and never settles on its own.
+{
+    const originalWindowSetTimeout = window.setTimeout;
+    const originalWindowClearTimeout = window.clearTimeout;
+    let fireDeadline = null;
+    window.setTimeout = callback => {
+        fireDeadline = callback;
+        return 992;
+    };
+    window.clearTimeout = () => {};
+    try {
+        const sensor = newSensorWithFrame();
+        sensor.setYopoPose({ x: 0, y: 100, z: 0, vx: 0, vy: 0, vz: 0 }, 0);
+        sensor.setYopoGoal({ x: 30, y: 100, z: 0 });
+        sensor.primeFromCaptureResult(new FakeCanvas('deadline-fetch-rgb'));
+        let fetchCalls = 0;
+        let staleMetrics = null;
+        globalThis.fetch = () => {
+            fetchCalls++;
+            return new Promise(() => {});
+        };
+        sensor.onPerceptionMetrics = metrics => { staleMetrics = metrics; };
+
+        const pending = sensor._requestDepth(sensor.rgbCanvas);
+        await nextTask();
+        assert.equal(fetchCalls, 1);
+        assert.equal(sensor._depthGate, true);
+        fireDeadline();
+        assert.equal(await pending, false);
+        assert.equal(sensor._depthGate, false);
+        assert.equal(sensor._activeDepthRequest, null);
+        assert.equal(staleMetrics.dropReason, 'planning-frame-too-old');
+    } finally {
+        window.setTimeout = originalWindowSetTimeout;
+        window.clearTimeout = originalWindowClearTimeout;
+    }
+}
+
+// A deadline-aware consumer can defer its final mutation through commitIfFresh.
+// If time crosses the hard 250 ms age immediately before that mutation, the
+// callback is never executed and the response is reported stale.
+{
+    const realPerformance = globalThis.performance;
+    let clockMs = 1000;
+    Object.defineProperty(globalThis, 'performance', {
+        configurable: true,
+        value: { now: () => clockMs },
+    });
+    try {
+        const sensor = newSensorWithFrame();
+        sensor.setYopoPose({ x: 0, y: 100, z: 0, vx: 0, vy: 0, vz: 0 }, 0);
+        sensor.setYopoGoal({ x: 30, y: 100, z: 0 });
+        sensor.primeFromCaptureResult(
+            new FakeCanvas('planning-final-commit-deadline-rgb'),
+            0,
+            { capturedAt: clockMs },
+        );
+        let finalMutations = 0;
+        let controlMetrics = null;
+        globalThis.fetch = async () => ({
+            ok: true,
+            status: 200,
+            headers: { get() { return '256'; } },
+            async json() {
+                clockMs = 1247;
+                return {
+                    planning_authorized: true,
+                    endstate: [1, 2, 3, 4, 5, 6, 7, 8, 9],
+                    traj_time: 1,
+                    depth_mode: 'da360-metric',
+                    calibration_id: 'cal-final-deadline',
+                    service_fingerprint: 'svc-final-deadline',
+                    planning_diagnostics: { ...VALID_PLANNING_DIAGNOSTICS },
+                    frame_id: '2', goal_id: 'goal-1', generation: '1',
+                };
+            },
+        });
+        sensor.onYopoResult = (_endstate, _duration, context) => {
+            assert.equal(context.applyDeadlineWallTimeMs, 1250);
+            assert.equal(typeof context.commitIfFresh, 'function');
+            clockMs = 1250;
+            return context.commitIfFresh(() => {
+                finalMutations++;
+                return true;
+            });
+        };
+        sensor.onPerceptionMetrics = metrics => {
+            if (metrics.mode === 'planning') controlMetrics = metrics;
+        };
+
+        assert.equal(await sensor._requestDepth(sensor.rgbCanvas), false);
+        assert.equal(finalMutations, 0,
+            'the final mutation must not run at or beyond the hard age deadline');
+        assert.equal(controlMetrics.outcome, 'stale');
+        assert.equal(controlMetrics.trajectoryApplied, false);
+        assert.equal(controlMetrics.dropReason, 'trajectory-apply-deadline-exceeded');
+        assert.equal(controlMetrics.applyDeadlineExceeded, true);
+        assert.equal(sensor._depthGate, false);
+    } finally {
+        Object.defineProperty(globalThis, 'performance', {
+            configurable: true,
+            value: realPerformance,
+        });
+    }
+}
+
+// If a synchronous trajectory install itself crosses the hard boundary, the
+// cooperative transaction rolls back that exact request before returning a
+// stale result. Production uses a compare-and-clear rollback so N cannot erase
+// a newer N+1 command.
+{
+    const realPerformance = globalThis.performance;
+    let clockMs = 1000;
+    Object.defineProperty(globalThis, 'performance', {
+        configurable: true,
+        value: { now: () => clockMs },
+    });
+    try {
+        const sensor = newSensorWithFrame();
+        sensor.setYopoPose({ x: 0, y: 100, z: 0, vx: 0, vy: 0, vz: 0 }, 0);
+        sensor.setYopoGoal({ x: 30, y: 100, z: 0 });
+        sensor.primeFromCaptureResult(
+            new FakeCanvas('planning-cross-deadline-rollback-rgb'),
+            0,
+            { capturedAt: clockMs },
+        );
+        let installed = 0;
+        let rollbackCalls = 0;
+        let controlMetrics = null;
+        globalThis.fetch = async () => ({
+            ok: true,
+            status: 200,
+            headers: { get() { return '256'; } },
+            async json() {
+                clockMs = 1247;
+                return {
+                    planning_authorized: true,
+                    endstate: [1, 2, 3, 4, 5, 6, 7, 8, 9],
+                    traj_time: 1,
+                    depth_mode: 'da360-metric',
+                    calibration_id: 'cal-cross-deadline',
+                    service_fingerprint: 'svc-cross-deadline',
+                    planning_diagnostics: { ...VALID_PLANNING_DIAGNOSTICS },
+                    frame_id: '2', goal_id: 'goal-1', generation: '1',
+                };
+            },
+        });
+        sensor.onYopoResult = (_endstate, _duration, context) => context.commitIfFresh(
+            () => {
+                installed++;
+                clockMs = 1250;
+                return true;
+            },
+            () => {
+                rollbackCalls++;
+                installed--;
+                return true;
+            },
+        );
+        sensor.onPerceptionMetrics = metrics => {
+            if (metrics.mode === 'planning') controlMetrics = metrics;
+        };
+
+        assert.equal(await sensor._requestDepth(sensor.rgbCanvas), false);
+        assert.equal(installed, 0);
+        assert.equal(rollbackCalls, 1);
+        assert.equal(controlMetrics.outcome, 'stale');
+        assert.equal(controlMetrics.dropReason, 'trajectory-apply-deadline-exceeded');
+        assert.equal(controlMetrics.applyDeadlineExceeded, true);
+    } finally {
+        Object.defineProperty(globalThis, 'performance', {
+            configurable: true,
+            value: realPerformance,
+        });
+    }
+}
+
+// The inner main.js transaction may finish just inside the deadline while the
+// surrounding observer transaction crosses it on the very next clock read.
+// Its registered compare-and-clear rollback must remain armed until the outer
+// post-check commits the whole nested transaction.
+{
+    const realPerformance = globalThis.performance;
+    let clockMs = 1000;
+    let advanceAfterInnerPost = false;
+    Object.defineProperty(globalThis, 'performance', {
+        configurable: true,
+        value: {
+            now: () => {
+                const sampled = clockMs;
+                if (advanceAfterInnerPost && clockMs === 1249) {
+                    clockMs = 1250;
+                    advanceAfterInnerPost = false;
+                }
+                return sampled;
+            },
+        },
+    });
+    try {
+        const sensor = newSensorWithFrame();
+        sensor.setYopoPose({ x: 0, y: 100, z: 0, vx: 0, vy: 0, vz: 0 }, 0);
+        sensor.setYopoGoal({ x: 30, y: 100, z: 0 });
+        sensor.primeFromCaptureResult(
+            new FakeCanvas('planning-outer-post-deadline-rgb'),
+            0,
+            { capturedAt: clockMs },
+        );
+        let installed = 0;
+        let rollbackCalls = 0;
+        let controlMetrics = null;
+        globalThis.fetch = async () => ({
+            ok: true,
+            status: 200,
+            headers: { get() { return '256'; } },
+            async json() {
+                clockMs = 1247;
+                return {
+                    planning_authorized: true,
+                    endstate: [1, 2, 3, 4, 5, 6, 7, 8, 9],
+                    traj_time: 1,
+                    depth_mode: 'da360-metric',
+                    calibration_id: 'cal-outer-post-deadline',
+                    service_fingerprint: 'svc-outer-post-deadline',
+                    planning_diagnostics: { ...VALID_PLANNING_DIAGNOSTICS },
+                    frame_id: '2', goal_id: 'goal-1', generation: '1',
+                };
+            },
+        });
+        sensor.onYopoResult = (_endstate, _duration, context) => context.commitIfFresh(
+            () => {
+                installed++;
+                clockMs = 1249;
+                advanceAfterInnerPost = true;
+                return true;
+            },
+            () => {
+                rollbackCalls++;
+                installed--;
+                return true;
+            },
+        );
+        sensor.onPerceptionMetrics = metrics => {
+            if (metrics.mode === 'planning') controlMetrics = metrics;
+        };
+
+        assert.equal(await sensor._requestDepth(sensor.rgbCanvas), false);
+        assert.equal(installed, 0,
+            'outer post-deadline accounting must not leave the inner trajectory active');
+        assert.equal(rollbackCalls, 1);
+        assert.equal(controlMetrics.outcome, 'stale');
+        assert.equal(controlMetrics.dropReason, 'trajectory-apply-deadline-exceeded');
+        assert.equal(controlMetrics.applyDeadlineExceeded, true);
+    } finally {
+        Object.defineProperty(globalThis, 'performance', {
+            configurable: true,
+            value: realPerformance,
+        });
+    }
+}
+
+// Optional logging observers are fault-isolated from the control result. A
+// logger exception cannot turn an installed trajectory into error/stale state.
+{
+    const sensor = newSensorWithFrame();
+    sensor.setYopoPose({ x: 0, y: 100, z: 0, vx: 0, vy: 0, vz: 0 }, 0);
+    sensor.setYopoGoal({ x: 30, y: 100, z: 0 });
+    sensor.primeFromCaptureResult(new FakeCanvas('observer-isolation-rgb'));
+    globalThis.fetch = async () => response({
+        latency_ms: 30,
+        planning_authorized: true,
+        endstate: [1, 2, 3, 4, 5, 6, 7, 8, 9],
+        traj_time: 1,
+        depth_mode: 'da360-metric',
+        calibration_id: 'cal-observer-isolation',
+        service_fingerprint: 'svc-observer-isolation',
+        frame_id: '2', goal_id: 'goal-1', generation: '1',
+    });
+    sensor.onYopoResult = () => true;
+    sensor.onYopoLatency = () => { throw new Error('latency logger failed'); };
+    sensor.onPerceptionMetrics = () => { throw new Error('metrics logger failed'); };
+
+    assert.equal(await sensor._requestDepth(sensor.rgbCanvas), true);
+    assert.equal(sensor.getDepthState().outcome, 'applied');
+    assert.match(sensor.getDepthState().reason, /trajectory-ready/);
+    assert.equal(sensor._depthGate, false);
 }
 
 // Calibration artifacts all originate from one frozen PerceptionFrame.

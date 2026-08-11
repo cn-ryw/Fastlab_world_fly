@@ -16,7 +16,7 @@
 
 关键契约：
 
-- 到达距离固定为 4.0m；不能用 9m `radio_range` 代替。
+- 到达球半径固定为 4.0m；不能用 9m `radio_range` 代替。终端候选必须沿原 Poly5 完整执行，随后还要满足无碰撞、三维速度不大于 0.75m/s并连续稳定0.4s，才可声明 arrived。
 - YOPO endstate 为轴主序 `[px,vx,ax, py,vy,ay, pz,vz,az]`。
 - Sim local 为 `x=east,y=up,z=north`；YOPO world 为 `x=east,y=north,z=up`。
 - ERP canonical sensor frame 为 NWU：`+x forward,+y left,+z up`。
@@ -92,7 +92,7 @@ docker build \
 `src/perception-frame.js` 将以下内容绑定为不可变快照：
 
 ```text
-frameId, capturedAt, capture transform, RGB Blob,
+frameId, capturedAt, captureSimTimeS, capture transform, RGB Blob,
 actual position/velocity,
 reference position/velocity/acceleration,
 yaw, captureProfile, projection config
@@ -112,7 +112,8 @@ standalone `da360_server.py` 和 combined `combined_server.py` 通过共享 rout
 | `/depth` | JPEG 请求；返回 depth JPEG 与轻量 metadata |
 | `/depth/raw` | NPZ：raw pred_disp、relative depth、valid mask、metadata |
 | `/yopo/health` | YOPO 模型/config/checkpoint 信息 |
-| `/yopo/plan_full` | JPEG+完整状态；总返回 depth/identity，只有授权 metric 模式返回 9 元 endstate |
+| `/yopo/plan_full` | JPEG+完整状态；总返回 identity，授权 metric 模式返回9元endstate及选中候选诊断；兼容调用仅在 `include_preview=1` 时返回深度预览，飞行链固定使用 `0` |
+| `/yopo/preview` | 按 frame/goal/generation 从最近4帧有界缓存读取规划深度预览，不重复运行DA360 |
 | `/yopo/plan` | 兼容调试路径；relative 模式 409，授权时缓存仍有最大年龄限制 |
 
 所有 planning 数字、frame/goal/generation identity 和参考加速度都是必填；缺字段返回 400，模型异常返回无内部路径的 500。API CORS 只允许本机 Web origin，请求体有上限。
@@ -124,7 +125,7 @@ standalone `da360_server.py` 和 combined `combined_server.py` 通过共享 rout
 ```text
 panoProfile=flight
 panoWidth=384 panoHeight=192 panoFace=96 panoVfov=180
-panoMs=20 depthMs=20 yopoMaxFrameAgeMs=250 panoFrameDelayMs=0 panoFacesPerSlice=2
+panoMs=20 depthMs=20 yopoMaxFrameAgeMs=250 panoFrameDelayMs=0 panoFacesPerSlice=3
 panoTopPoleGuard=10 panoBottomPoleGuard=2
 panoPreloadTimeoutMs=60000
 da360UploadScale=0.35
@@ -135,6 +136,7 @@ DA360_CHANNELS_LAST=0
 DA360_DEPTH_MODE=da360-metric
 
 ARRIVAL_DISTANCE_M=4.0
+ARRIVAL_SETTLE_SPEED_MPS=0.75 ARRIVAL_SETTLE_TIME_S=0.4
 collisionRadius=0.6
 droneScale=0.171
 ```
@@ -148,6 +150,7 @@ Capture profile 契约：
 - 活动导航期间切换到 `calibration` 必须拒绝；换目标会结束旧日志/请求 generation 并清除旧轨迹，但保持实际速度连续。
 - 旧 `panoCaptureAnyway=0` 只作为 calibration 的兼容映射；显式 `panoProfile` 优先。若当前 URL 仍有 legacy 参数，`location.reload()` 会保留它并再次进入 calibration。控制台接口为 `window.__getPanoramaCaptureProfile()` 与 `window.__setPanoramaCaptureProfile(profile)`；切换会 abort 在途 capture，但只改变当前页面运行态，不会清理 URL。
 - `yopoMaxFrameAgeMs=250` 是冻结 observation 的硬安全龄限；超过即丢弃轨迹。它不替代正式门禁的 capture-to-apply p95 ≤150ms。
+- Poly5 安装还要求年龄不超过 `min(0.25s, 0.25T)`，且当前实际状态与 fast-forward suffix 参考的位置/速度误差分别不超过 1.2m/3m/s；不允许通过平移障碍相关终点来修补陈旧轨迹。
 - 异步 freshness 分三层：请求源在发送前必须仍是最新完整 RGB；轨迹响应只要求同 goal/generation/mode 且不超过 250ms；深度 canvas 按递增 request ID 提交。因此流水化时 depth 可以是“最新可用帧”并比 RGB 落后一帧，但旧目标、旧 generation 或已被更新 depth 超越的响应永不绘制。
 - 每个 planning 请求只记录一个同步 control outcome（applied/blocked/rejected）；JPEG canvas 的 commit/error/stale 另记为 `mode=depth-preview` diagnostic，不能计入规划频率。
 - 650ms quiet×6 面本身就是 3.9s，叠加渲染/复制/投影后约 4.2s。旧 aggregate `render≈4.1s` 混入 tile wait，不是 GPU scene render 证据。
@@ -226,14 +229,14 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
 - calibration ID 和 service fingerprint 非空、全段稳定；service fingerprint 绑定 API version、DA360/YOPO checkpoint SHA 和 YOPO effective config SHA
 - 设置目标后的下一张完整帧进入 planning
 - 到达/取消后回 preview，深度仍更新
-- 3.9m 到达、4.1m 不到达、8.9m 不提前结束
+- 高速穿越4m球不提前结束；合格终端轨迹沿原 Poly5 到达后锁定实际位姿，并在无碰撞、三维速度≤0.75m/s连续0.4s才到达
 - 平均有效规划率 ≥15Hz、p95 规划间隔 ≤100ms
 - p95 capture-to-apply ≤150ms、physics update 间隔 ≤33.3ms、服务 p95 ≤50ms
 - 低空街谷无碰撞、NaN、旧轨迹复活
 
 截至 2026-08-10，上述真实门禁尚未完成。修复后一次 relative `/yopo/plan_full` 诊断为 DA360 44.6ms、端到端 63.3ms，但它未授权 YOPO，既不是统计样本也不能证明 15Hz。修复前基线约为 depth 3.1Hz、YOPO 2.9Hz；不要把 API/单元测试通过写成 15Hz 已达标。
 
-六面 capture 当前仍执行六次 Cesium scene render，每两面 `requestAnimationFrame` yield，并支持 AbortSignal；projector texture 在尺寸相同时使用 `texSubImage2D` 复用。timing 必须分别保留 `scene_render/tile_wait/wait_rerender/face_upload/project/scheduler`、HTTP header/body、DA360、YOPO、trajectory/depth apply，不能再用旧 aggregate `render` 归因。FlightLogger schema v2 记录真实轨迹安装回执、唯一 planning frame、drop reason、单调时间和 p95。相关自动测试已复验，但仍待 live Firefox/GPU benchmark；不能写成 15Hz 已通过。
+六面 capture 当前仍执行六次 Cesium scene render，默认每三面 `requestAnimationFrame` yield，并支持 AbortSignal；URL 可显式改回2做 A/B。projector texture 在尺寸相同时使用 `texSubImage2D` 复用。飞行期 planning 固定 `include_preview=0`；操作员深度预览约每2s从按身份索引的4帧LRU异步读取，latest-only且不占控制request gate。timing 必须分别保留 `scene_render/tile_wait/wait_rerender/face_upload/project/scheduler`、fetch/header/json、response bytes、DA360、YOPO、trajectory apply、preview fetch/decode/draw 和 gate hold，不能再用旧 aggregate `render` 归因。FlightLogger schema v2 记录真实轨迹安装回执、唯一 planning frame、选中候选、Poly5峰值、控制饱和、drop reason、单调时间和 p95。相关自动测试已复验，但仍待 live Firefox/GPU benchmark；不能写成 15Hz 已通过。
 
 门禁实现位于 `config/perception-sweep.json`、`scripts/evaluate_closed_loop.py` 和 `scripts/evaluate_perception_quality.py`。真实数据必须按该配置的候选顺序跑完并保存报告，不能凭 URL 参数或平均延迟口头选择配置。
 
@@ -241,7 +244,7 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
 
 ```bash
 ./launch-firefox-gpu.sh \
-'http://127.0.0.1:8080/?panoProfile=flight&panoPreloadRequired=0&panoWidth=384&panoHeight=192&panoFace=96&panoFacesPerSlice=2&panoVfov=180&panoJpeg=0.74&da360UploadScale=0.35&panoMs=20&depthMs=20&panoramaTileSse=512'
+'http://127.0.0.1:8080/?panoProfile=flight&panoPreloadRequired=0&panoWidth=384&panoHeight=192&panoFace=96&panoFacesPerSlice=3&panoVfov=180&panoJpeg=0.74&da360UploadScale=0.35&panoMs=20&depthMs=20&panoramaTileSse=512'
 ```
 
 先用 `window.__getPanoramaCaptureProfile()` 核对 `flight`，保存原始 timing/log；evaluator 命令必须显式或默认使用 `--warmup-frames 30 --min-duration-s 60 --min-planning-frames 900`。relative preview 可以用于性能归因，但绝不能通过正式 evaluator。

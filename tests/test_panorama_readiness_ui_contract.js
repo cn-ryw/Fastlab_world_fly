@@ -34,5 +34,11 @@ const yopoApply = main.slice(
     main.indexOf('// Setup click-to-goal'),
 );
 assert.doesNotMatch(yopoApply, /rgbTilesReady|rgbReadyFaces/);
+assert.match(yopoApply, /context\?\.commitIfFresh/);
+assert.match(yopoApply, /setYopoTrajectory\(endstate, trajTime, context\)/);
+assert.match(
+    yopoApply,
+    /invalidateYopoTrajectory\?\.\([\s\S]*trajectory-apply-deadline-exceeded[\s\S]*context/,
+);
 
 console.log('Panorama readiness UI contract: all assertions passed');

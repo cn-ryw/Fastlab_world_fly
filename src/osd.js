@@ -424,6 +424,9 @@ export class OSD {
         const targetSpeed = Number.isFinite(drone.targetGroundSpeed)
             ? drone.targetGroundSpeed
             : (Number.isFinite(drone.commandedGroundSpeed) ? drone.commandedGroundSpeed : 0);
+        const so3ReferenceSpeed = Number.isFinite(drone.commandedGroundSpeed)
+            ? drone.commandedGroundSpeed
+            : 0;
         const pilotCommandSpeed = Number.isFinite(drone.pilotGroundSpeedCommand)
             ? drone.pilotGroundSpeedCommand
             : targetSpeed;
@@ -444,7 +447,11 @@ export class OSD {
         } else if (mode === 'stabilized') {
             cue = 'LEVEL: roll/pitch = self-level angle | W/S = manual thrust | pilot holds altitude';
         } else if (mode === 'so3') {
-            cue = 'SO3 AUTO: G+scene / depth-circle click | sticks ignored | C cancel';
+            const nominalCruise = Number.isFinite(drone.so3CruiseMps)
+                ? drone.so3CruiseMps
+                : 15;
+            cue = `SO3 AUTO: GSPD ${groundSpeed.toFixed(1)}  POLY5 ${so3ReferenceSpeed.toFixed(1)}  ` +
+                `Cruise-${nominalCruise.toFixed(0)} policy context | C cancel`;
         } else {
             cue = 'FAILSAFE: invalid flight mode';
         }

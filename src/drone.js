@@ -75,6 +75,21 @@ const FAILSAFE_HOLD_REASONS = new Set([
 // radio_range. The external YOPO reference uses 4 m; using radio_range (9 m)
 // here caused a vehicle travelling at 5 m/s to be declared arrived at 8.94 m.
 export const ARRIVAL_DISTANCE_M = 4.0;
+export const ARRIVAL_SETTLE_SPEED_MPS = 0.75;
+export const ARRIVAL_SETTLE_TIME_S = 0.4;
+export const TERMINAL_TRACK_MAX_SPEED_MPS = 1.5;
+export const TERMINAL_ABORT_DISTANCE_M = 5.0;
+export const TERMINAL_DECELERATION_MAX_ENTRY_SPEED_MPS = 12.0;
+export const TERMINAL_DECELERATION_DESIGN_ACCELERATION_MPS2 = 12.0;
+export const TERMINAL_DECELERATION_TIMEOUT_S = 2.5;
+export const YOPO_MAX_APPLY_AGE_S = 0.25;
+export const YOPO_MAX_APPLY_AGE_FRACTION = 0.25;
+export const YOPO_MAX_SUFFIX_POSITION_ERROR_M = 1.2;
+export const YOPO_MAX_SUFFIX_VELOCITY_ERROR_MPS = 3.0;
+const TERMINAL_TRACK_MAX_ACCELERATION_MPS2 = 25.0;
+const TERMINAL_DECELERATION_COMMAND_LIMIT_MPS2 = 25.0;
+const TERMINAL_DECELERATION_MAX_TILT_DEG = 60.0;
+const TERMINAL_DECELERATION_ATTITUDE_RESPONSE_S = 0.075;
 
 // Reusable PlayCanvas math objects (avoid per-frame allocation)
 const _quat  = new pc.Quat();
@@ -233,6 +248,18 @@ export class Drone {
         // ---- Ideal controller state ----
         this._idealGoal = null;      // {x,y,z,yaw} or null
         this._arrivalDistanceM = ARRIVAL_DISTANCE_M;
+        this._terminalPhase = 'idle';
+        this._terminalSettledTimeS = 0;
+        this._terminalBrakeDistanceM = null;
+        this._terminalEndpointGoalDistanceM = null;
+        this._terminalTrajectoryEligible = false;
+        this._terminalCandidate = null;
+        this._terminalArrivalPending = false;
+        this._terminalDecelerationElapsedS = 0;
+        this._terminalDecelerationAnchor = null;
+        this._terminalPredictedStopGoalDistanceM = null;
+        this._trajectoryApplyPositionErrorM = null;
+        this._trajectoryApplyVelocityErrorMps = null;
 
         // ---- YOPO trajectory tracking ----
         this._trajectory = new YopoTrajectoryTracker();
@@ -296,9 +323,14 @@ export class Drone {
             source: 'controller',
             frame: 'sim-world-y-up',
             generation: null,
+            planningFrameId: null,
+            planningRequestId: null,
+            selectedCandidateId: null,
             createdSimTime: Number(this._simTimeS || 0),
             expirySimTime: null,
             referenceState: null,
+            referenceVelocity: { x: 0, y: 0, z: 0 },
+            referenceAcceleration: { x: 0, y: 0, z: 0 },
             actualState: {
                 position: { x: Number(this.x || 0), y: Number(this.y || 0), z: Number(this.z || 0) },
                 velocity: { x: Number(this.vx || 0), y: Number(this.vy || 0), z: Number(this.vz || 0) },
@@ -309,9 +341,38 @@ export class Drone {
             allocatedForce: { x: 0, y: 0, z: 0 },
             tiltDeg: 0,
             thrustGf: Number(this.thrustOutput || 0),
+            forceProjectionRatio: null,
+            projectionRatio: null,
             saturation: { horizontal: false, vertical: false, direct: false },
             antiWindup: { horizontal: false, vertical: false },
             trajectoryAgeS: null,
+            trackerAgeS: null,
+            trackerRemainingS: null,
+            trajectoryOriginalAgeS: null,
+            trajectoryRemainingS: null,
+            trajectoryApplyPositionErrorM: Number.isFinite(this._trajectoryApplyPositionErrorM)
+                ? this._trajectoryApplyPositionErrorM
+                : null,
+            trajectoryApplyVelocityErrorMps: Number.isFinite(this._trajectoryApplyVelocityErrorMps)
+                ? this._trajectoryApplyVelocityErrorMps
+                : null,
+            poly5PeakSpeedMps: null,
+            poly5PeakAccelerationMps2: null,
+            trajectoryEndpointState: null,
+            trajectoryEndpointGoalDistanceM: Number.isFinite(this._terminalEndpointGoalDistanceM)
+                ? this._terminalEndpointGoalDistanceM
+                : null,
+            terminalTrajectoryEligible: !!this._terminalTrajectoryEligible,
+            terminalPhase: this._terminalPhase || 'idle',
+            terminalSettledTimeS: Number(this._terminalSettledTimeS || 0),
+            terminalBrakeDistanceM: Number.isFinite(this._terminalBrakeDistanceM)
+                ? this._terminalBrakeDistanceM
+                : null,
+            terminalPredictedStopGoalDistanceM:
+                Number.isFinite(this._terminalPredictedStopGoalDistanceM)
+                    ? this._terminalPredictedStopGoalDistanceM
+                    : null,
+            terminalDecelerationElapsedS: Number(this._terminalDecelerationElapsedS || 0),
             fallbackReason: reason,
             overrunCount: Number(this._controlDiagnostics?.overrunCount || 0),
             overrunDroppedSeconds: Number(this._controlDiagnostics?.overrunDroppedSeconds || 0),
@@ -322,6 +383,8 @@ export class Drone {
         const diagnostics = this._controlDiagnostics || this._makeControlDiagnostics('unavailable');
         return Object.freeze({
             ...diagnostics,
+            referenceVelocity: Object.freeze({ ...diagnostics.referenceVelocity }),
+            referenceAcceleration: Object.freeze({ ...diagnostics.referenceAcceleration }),
             rawAcceleration: Object.freeze({ ...diagnostics.rawAcceleration }),
             limitedAcceleration: Object.freeze({ ...diagnostics.limitedAcceleration }),
             requestedForce: Object.freeze({ ...diagnostics.requestedForce }),
@@ -334,6 +397,9 @@ export class Drone {
                 velocity: Object.freeze({ ...diagnostics.actualState.velocity }),
             }) : null,
             referenceState: diagnostics.referenceState ? Object.freeze({ ...diagnostics.referenceState }) : null,
+            trajectoryEndpointState: diagnostics.trajectoryEndpointState
+                ? Object.freeze({ ...diagnostics.trajectoryEndpointState })
+                : null,
             ...(diagnostics.attitudeRateSetpoint ? {
                 attitudeRateSetpoint: Object.freeze({ ...diagnostics.attitudeRateSetpoint }),
             } : {}),
@@ -352,7 +418,10 @@ export class Drone {
             this._controlOverrunHoldRemaining,
             Math.max(0.1, Number(acceptedSeconds) || 0),
         );
-        this._latchSo3Hold('control-overrun', ControlCommandType.FAILSAFE_HOLD);
+        const terminalAborted = this._abortTerminalNavigation('control-overrun');
+        if (!terminalAborted) {
+            this._latchSo3Hold('control-overrun', ControlCommandType.FAILSAFE_HOLD);
+        }
         if (this.flightMode === 'so3' && this._trajectory.active) {
             this._trajectory.clear('control-overrun');
             this._navigationTransitionReason = 'control-overrun';
@@ -369,6 +438,182 @@ export class Drone {
         if (this._controlDiagnostics) this._controlDiagnostics.fallbackReason = reason;
     }
 
+    _resetTerminalNavigation(phase = 'idle') {
+        this._terminalPhase = phase;
+        this._terminalSettledTimeS = 0;
+        this._terminalBrakeDistanceM = null;
+        this._terminalEndpointGoalDistanceM = null;
+        this._terminalTrajectoryEligible = false;
+        this._terminalCandidate = null;
+        this._terminalArrivalPending = false;
+        this._terminalDecelerationElapsedS = 0;
+        this._terminalDecelerationAnchor = null;
+        this._terminalPredictedStopGoalDistanceM = null;
+        this._trajectoryApplyPositionErrorM = null;
+        this._trajectoryApplyVelocityErrorMps = null;
+    }
+
+    _latchTerminalCurrentHold(reason = 'terminal-settling') {
+        this._so3Hold = { x: this.x, y: this.y, z: this.z, yawDeg: this.yaw };
+        this._so3HoldCommandType = ControlCommandType.POSITION_VELOCITY_HOLD;
+        if (this._controlDiagnostics) this._controlDiagnostics.fallbackReason = reason;
+        return true;
+    }
+
+    _terminalStoppingEnvelope(position, velocity) {
+        if (!this._idealGoal || !position || !velocity) return null;
+        const values = [
+            position.x, position.y, position.z,
+            velocity.x, velocity.y, velocity.z,
+        ].map(Number);
+        if (!values.every(Number.isFinite)) return null;
+        const [x, y, z, vx, vy, vz] = values;
+        const speedMps = Math.hypot(vx, vy, vz);
+        const direction = speedMps > 1e-9
+            ? { x: vx / speedMps, y: vy / speedMps, z: vz / speedMps }
+            : { x: 0, y: 0, z: 0 };
+        const massKg = Math.max(0.001, this.mass / 1000);
+        const maximumThrustAccelerationMps2 = Math.max(0, this.maxThrust * G / 1000)
+            / massKg;
+        const minimumThrustCosine = Math.cos(TERMINAL_DECELERATION_MAX_TILT_DEG * DEG2RAD);
+        const supportsDeceleration = accelerationMps2 => {
+            const forceAcceleration = {
+                x: -direction.x * accelerationMps2,
+                y: G - direction.y * accelerationMps2,
+                z: -direction.z * accelerationMps2,
+            };
+            const magnitude = Math.hypot(
+                forceAcceleration.x,
+                forceAcceleration.y,
+                forceAcceleration.z,
+            );
+            return forceAcceleration.y > 0
+                && magnitude <= maximumThrustAccelerationMps2 + 1e-9
+                && forceAcceleration.y / Math.max(1e-9, magnitude)
+                    >= minimumThrustCosine - 1e-9;
+        };
+        let lowerAcceleration = 0;
+        let upperAcceleration = TERMINAL_DECELERATION_COMMAND_LIMIT_MPS2;
+        for (let iteration = 0; iteration < 48; iteration++) {
+            const middle = (lowerAcceleration + upperAcceleration) * 0.5;
+            if (supportsDeceleration(middle)) lowerAcceleration = middle;
+            else upperAcceleration = middle;
+        }
+        const availableDecelerationMps2 = lowerAcceleration;
+        const designDecelerationMps2 = Math.min(
+            TERMINAL_DECELERATION_DESIGN_ACCELERATION_MPS2,
+            availableDecelerationMps2 * 0.9,
+        );
+        const brakeDistanceM = speedMps <= 1e-9
+            ? 0
+            : designDecelerationMps2 > 1e-6
+                ? speedMps * TERMINAL_DECELERATION_ATTITUDE_RESPONSE_S
+                    + speedMps * speedMps / (2 * designDecelerationMps2)
+                : Infinity;
+        const scale = speedMps > 1e-9 ? brakeDistanceM / speedMps : 0;
+        const predictedStop = {
+            x: x + vx * scale,
+            y: y + vy * scale,
+            z: z + vz * scale,
+        };
+        const goalY = this._idealGoal.y == null ? y : this._idealGoal.y;
+        const predictedStopGoalDistanceM = Math.hypot(
+            predictedStop.x - this._idealGoal.x,
+            predictedStop.y - goalY,
+            predictedStop.z - this._idealGoal.z,
+        );
+        return {
+            speedMps,
+            brakeDistanceM,
+            availableDecelerationMps2,
+            designDecelerationMps2,
+            predictedStop: Object.freeze(predictedStop),
+            predictedStopGoalDistanceM,
+        };
+    }
+
+    _enterTerminalDeceleration() {
+        if (!this._idealGoal || !this._terminalCandidate) return false;
+        const goalY = this._idealGoal.y == null ? this.y : this._idealGoal.y;
+        const distanceM = Math.hypot(
+            this._idealGoal.x - this.x,
+            goalY - this.y,
+            this._idealGoal.z - this.z,
+        );
+        const envelope = this._terminalStoppingEnvelope(
+            { x: this.x, y: this.y, z: this.z },
+            { x: this.vx, y: this.vy, z: this.vz },
+        );
+        if (this.isColliding
+            || distanceM > this._arrivalDistanceM
+            || !envelope
+            || envelope.speedMps <= TERMINAL_TRACK_MAX_SPEED_MPS
+            || envelope.speedMps > TERMINAL_DECELERATION_MAX_ENTRY_SPEED_MPS
+            || envelope.predictedStopGoalDistanceM > TERMINAL_ABORT_DISTANCE_M) {
+            this._abortTerminalNavigation('terminal-deceleration-envelope-rejected');
+            return false;
+        }
+
+        this._terminalPhase = 'terminal-decelerating';
+        this._terminalSettledTimeS = 0;
+        this._terminalArrivalPending = false;
+        this._terminalDecelerationElapsedS = 0;
+        this._terminalBrakeDistanceM = envelope.brakeDistanceM;
+        this._terminalPredictedStopGoalDistanceM = envelope.predictedStopGoalDistanceM;
+        this._latchTerminalCurrentHold('terminal-decelerating');
+        this._terminalDecelerationAnchor = Object.freeze({ ...this._so3Hold });
+        this._replanRequested = false;
+        return true;
+    }
+
+    _abortTerminalNavigation(reason) {
+        if (this._terminalPhase !== 'terminal-track'
+            && this._terminalPhase !== 'terminal-decelerating'
+            && this._terminalPhase !== 'settling') {
+            return false;
+        }
+        if (this._trajectory.active) this._trajectory.clear(reason);
+        this._terminalPhase = this._idealGoal ? 'approach' : 'idle';
+        this._terminalSettledTimeS = 0;
+        this._terminalBrakeDistanceM = null;
+        this._terminalEndpointGoalDistanceM = null;
+        this._terminalTrajectoryEligible = false;
+        this._terminalCandidate = null;
+        this._terminalArrivalPending = false;
+        this._terminalDecelerationElapsedS = 0;
+        this._terminalDecelerationAnchor = null;
+        this._terminalPredictedStopGoalDistanceM = null;
+        this._latchSo3Hold(reason, ControlCommandType.FAILSAFE_HOLD);
+        this._navigationTransitionReason = reason;
+        this._replanRequested = !!this._idealGoal;
+        return true;
+    }
+
+    _enterTerminalSettling() {
+        if (!this._idealGoal) return false;
+        const goalY = this._idealGoal.y == null ? this.y : this._idealGoal.y;
+        const distanceM = Math.hypot(
+            this._idealGoal.x - this.x,
+            goalY - this.y,
+            this._idealGoal.z - this.z,
+        );
+        const speedMps = Math.hypot(this.vx, this.vy, this.vz);
+        if (this.isColliding
+            || distanceM > this._arrivalDistanceM
+            || speedMps > TERMINAL_TRACK_MAX_SPEED_MPS) {
+            this._abortTerminalNavigation('terminal-track-missed');
+            return false;
+        }
+        this._terminalPhase = 'settling';
+        this._terminalSettledTimeS = 0;
+        this._terminalArrivalPending = false;
+        this._terminalDecelerationElapsedS = 0;
+        this._terminalDecelerationAnchor = null;
+        this._latchTerminalCurrentHold('terminal-settling');
+        this._replanRequested = false;
+        return true;
+    }
+
     /** Set ideal goal (point-to-point, no YOPO trajectory). */
     setIdealGoal(goal) {
         // A goal change starts a new navigation generation.  Never keep
@@ -376,6 +621,7 @@ export class Drone {
         // goal while the next perception response is still in flight.
         this._clearYopoMotionState();
         this._idealGoal = goal ? { x: goal.x, y: goal.y, z: goal.z, yaw: goal.yaw } : null;
+        this._resetTerminalNavigation(goal ? 'approach' : 'idle');
         this._so3FixedYaw = goal ? this.yaw : null;
         this._so3YawSetpointDeg = this.yaw;
         this._latchSo3Hold(goal ? 'awaiting-trajectory' : 'goal-cleared');
@@ -400,6 +646,7 @@ export class Drone {
     cancelWaypoint() {
         this._idealGoal = null;
         this._clearYopoMotionState();
+        this._resetTerminalNavigation('idle');
         this._replanRequested = false;
         this._latchSo3Hold('cancelled');
         this._navigationState = 'cancelled';
@@ -414,38 +661,179 @@ export class Drone {
         // 切勿改成量主序 [px,py,pz, vx,vy,vz, ...]：那会把高度值填进 X 轴的
         // 终端速度、把加速度填进 Z 轴的终点位置，产生发散的参考轨迹。
         // 契约由 tests/test_yopo_endstate_layout.js 锁定。
+        // A terminal candidate is committed through its complete remaining
+        // suffix. Later responses cannot splice a different path into that
+        // obstacle-sensitive final segment or replace the settling hold.
+        if (this._terminalPhase === 'terminal-track'
+            || this._terminalPhase === 'terminal-decelerating'
+            || this._terminalPhase === 'settling'
+            || this._terminalPhase === 'arrived') {
+            return false;
+        }
+
         const previousReference = this._trajectory.active
             ? this._trajectory.referenceAt(this._trajectory.time)
             : this._trajectory.lastReference;
         const duration = trajTime == null ? 1.125 : Number(trajTime);
         const providedContext = context && typeof context === 'object' ? context : {};
-        const commandContext = Object.freeze({
-            ...providedContext,
-            source: typeof providedContext.source === 'string' ? providedContext.source : 'yopo',
-            frame: 'sim-world-y-up',
-            generation: providedContext.generation ?? null,
-            createdSimTime: this._simTimeS,
-            expirySimTime: this._simTimeS + (Number.isFinite(duration) ? duration : 0),
-        });
-        const checked = this._trajectory.install(endpoint, trajTime, {
+        const hasContextField = key => Object.prototype.hasOwnProperty.call(providedContext, key);
+        let startState = {
             x: this.x, y: this.y, z: this.z,
             vx: this.vx, vy: this.vy, vz: this.vz,
             ax: previousReference?.ax ?? 0,
             ay: previousReference?.ay ?? 0,
             az: previousReference?.az ?? 0,
-        }, commandContext);
-        if (!checked.valid) {
-            const now = globalThis.performance?.now?.() ?? Date.now();
-            if (this._lastYopoRejectReason !== checked.reason || now - (this._lastYopoRejectAt || 0) > 1000) {
-                console.warn(`[YOPO] rejected trajectory: ${checked.reason}`);
-                this._lastYopoRejectReason = checked.reason;
-                this._lastYopoRejectAt = now;
+        };
+        let initialTimeS = 0;
+        let createdSimTime = this._simTimeS;
+
+        if (hasContextField('captureActualState') && providedContext.captureActualState != null) {
+            const actual = providedContext.captureActualState;
+            const position = actual?.position;
+            const velocity = actual?.velocity;
+            const requiredCaptureValues = [
+                position?.x, position?.y, position?.z,
+                velocity?.x, velocity?.y, velocity?.z,
+            ].map(Number);
+            if (!actual || !position || !velocity || !requiredCaptureValues.every(Number.isFinite)) {
+                return this._rejectYopoTrajectory('captureActualState must contain finite position and velocity');
             }
-            this._trajectory.clear('trajectory-rejected');
-            this._latchSo3Hold('trajectory-rejected');
-            this._replanRequested = true;
-            return false;
+            const captureAcceleration = providedContext.captureReferenceState?.acceleration;
+            const accelerationValues = captureAcceleration
+                ? [captureAcceleration.x, captureAcceleration.y, captureAcceleration.z].map(Number)
+                : [0, 0, 0];
+            if (!accelerationValues.every(Number.isFinite)) {
+                return this._rejectYopoTrajectory(
+                    'captureReferenceState acceleration must be finite when provided',
+                );
+            }
+            startState = {
+                x: requiredCaptureValues[0],
+                y: requiredCaptureValues[1],
+                z: requiredCaptureValues[2],
+                vx: requiredCaptureValues[3],
+                vy: requiredCaptureValues[4],
+                vz: requiredCaptureValues[5],
+                ax: accelerationValues[0],
+                ay: accelerationValues[1],
+                az: accelerationValues[2],
+            };
+
+            if (hasContextField('captureSimTimeS') && providedContext.captureSimTimeS != null) {
+                const captureSimTimeS = Number(providedContext.captureSimTimeS);
+                if (!Number.isFinite(captureSimTimeS)) {
+                    return this._rejectYopoTrajectory('captureSimTimeS must be finite');
+                }
+                initialTimeS = this._simTimeS - captureSimTimeS;
+                createdSimTime = captureSimTimeS;
+            } else if (hasContextField('planningAgeS') && providedContext.planningAgeS != null) {
+                initialTimeS = Number(providedContext.planningAgeS);
+                if (!Number.isFinite(initialTimeS)) {
+                    return this._rejectYopoTrajectory('planningAgeS must be finite');
+                }
+                createdSimTime = this._simTimeS - initialTimeS;
+            } else if ((hasContextField('captureWallTimeMs') && providedContext.captureWallTimeMs != null)
+                || (hasContextField('applyWallTimeMs') && providedContext.applyWallTimeMs != null)) {
+                const captureWallTimeMs = Number(providedContext.captureWallTimeMs);
+                const applyWallTimeMs = Number(providedContext.applyWallTimeMs);
+                if (!Number.isFinite(captureWallTimeMs) || !Number.isFinite(applyWallTimeMs)) {
+                    return this._rejectYopoTrajectory(
+                        'captureWallTimeMs and applyWallTimeMs must both be finite',
+                    );
+                }
+                initialTimeS = (applyWallTimeMs - captureWallTimeMs) / 1000;
+                createdSimTime = this._simTimeS - initialTimeS;
+            }
+
+            // A sub-nanosecond lead can arise when clocks are sampled at an
+            // update boundary. Anything materially from the future is an
+            // invalid cross-clock context and is rejected instead of rewound.
+            if (initialTimeS < -1e-9) {
+                return this._rejectYopoTrajectory('trajectory capture time is in the future');
+            }
+            initialTimeS = Math.max(0, initialTimeS);
         }
+
+        const commandContext = Object.freeze({
+            ...providedContext,
+            source: typeof providedContext.source === 'string' ? providedContext.source : 'yopo',
+            frame: 'sim-world-y-up',
+            generation: providedContext.generation ?? null,
+            planningAgeS: initialTimeS,
+            createdSimTime,
+            expirySimTime: createdSimTime + (Number.isFinite(duration) ? duration : 0),
+        });
+        // Build into a private candidate tracker. A stale or dynamically
+        // inconsistent response must never destroy an older trajectory that is
+        // still inside its valid command envelope.
+        const candidate = new YopoTrajectoryTracker();
+        const checked = candidate.install(
+            endpoint,
+            trajTime,
+            startState,
+            commandContext,
+            { initialTimeS },
+        );
+        if (!checked.valid) {
+            return this._rejectYopoTrajectory(checked.reason);
+        }
+        const maximumApplyAgeS = Math.min(
+            YOPO_MAX_APPLY_AGE_S,
+            checked.trajTime * YOPO_MAX_APPLY_AGE_FRACTION,
+        );
+        if (initialTimeS > maximumApplyAgeS + 1e-12) {
+            return this._rejectYopoTrajectory(
+                `trajectory age ${initialTimeS.toFixed(3)}s exceeds apply limit ${maximumApplyAgeS.toFixed(3)}s`,
+            );
+        }
+
+        const suffixReference = checked.reference;
+        const applyPositionErrorM = Math.hypot(
+            this.x - suffixReference.x,
+            this.y - suffixReference.y,
+            this.z - suffixReference.z,
+        );
+        const applyVelocityErrorMps = Math.hypot(
+            this.vx - suffixReference.vx,
+            this.vy - suffixReference.vy,
+            this.vz - suffixReference.vz,
+        );
+        if (!Number.isFinite(applyPositionErrorM) || !Number.isFinite(applyVelocityErrorMps)) {
+            return this._rejectYopoTrajectory('trajectory suffix consistency error is non-finite');
+        }
+        if (applyPositionErrorM > YOPO_MAX_SUFFIX_POSITION_ERROR_M + 1e-12) {
+            return this._rejectYopoTrajectory(
+                `trajectory suffix position error ${applyPositionErrorM.toFixed(2)}m exceeds ${YOPO_MAX_SUFFIX_POSITION_ERROR_M}m`,
+            );
+        }
+        if (applyVelocityErrorMps > YOPO_MAX_SUFFIX_VELOCITY_ERROR_MPS + 1e-12) {
+            return this._rejectYopoTrajectory(
+                `trajectory suffix velocity error ${applyVelocityErrorMps.toFixed(2)}m/s exceeds ${YOPO_MAX_SUFFIX_VELOCITY_ERROR_MPS}m/s`,
+            );
+        }
+
+        candidate.context = Object.freeze({
+            ...commandContext,
+            maximumApplyAgeS,
+            suffixPositionErrorM: applyPositionErrorM,
+            suffixVelocityErrorMps: applyVelocityErrorMps,
+        });
+        candidate.metadata = Object.freeze({
+            ...candidate.metadata,
+            maximumApplyAgeS,
+            applyPositionErrorM,
+            applyVelocityErrorMps,
+        });
+        this._trajectory = candidate;
+        this._trajectoryApplyPositionErrorM = applyPositionErrorM;
+        this._trajectoryApplyVelocityErrorMps = applyVelocityErrorMps;
+        this._terminalEndpointGoalDistanceM = null;
+        this._terminalTrajectoryEligible = false;
+        this._terminalCandidate = null;
+        this._terminalBrakeDistanceM = null;
+        this._terminalPredictedStopGoalDistanceM = null;
+        this._terminalDecelerationElapsedS = 0;
+        this._terminalDecelerationAnchor = null;
         // 轨迹交接使用旧轨迹当前期望加速度作为新 Poly5 的初值，
         // 避免重规划边界上的加速度跳变。
         this._yopoPlanTriggered = true;  // 标记已有轨迹到达，允许到达判定
@@ -455,6 +843,96 @@ export class Drone {
         // 不清除 _idealGoal —— 目标是持久导航参考，轨迹是对它的连续逼近。
         // 到达判断依据实际位置，不在轨迹开始时丢弃目标。
         return true;
+    }
+
+    _matchesYopoTrajectoryContext(expectedContext, actualContext) {
+        if (expectedContext == null) return true;
+        if (!expectedContext || typeof expectedContext !== 'object'
+            || !actualContext || typeof actualContext !== 'object') {
+            return false;
+        }
+
+        // Compare only immutable planning identities. String normalization is
+        // intentional: the HTTP contract may serialize numeric frame and
+        // generation identifiers while the local request still holds numbers.
+        const identityAliases = [
+            ['goalId'],
+            ['generation'],
+            ['frameId', 'planningFrameId'],
+            ['requestId', 'planningRequestId'],
+            ['planningEpoch'],
+        ];
+        let compared = 0;
+        for (const aliases of identityAliases) {
+            const expectedKey = aliases.find(key => expectedContext[key] != null);
+            if (!expectedKey) continue;
+            compared++;
+            const actualKey = aliases.find(key => actualContext[key] != null);
+            if (!actualKey
+                || String(expectedContext[expectedKey]) !== String(actualContext[actualKey])) {
+                return false;
+            }
+        }
+        return compared > 0;
+    }
+
+    /**
+     * Fail closed after a consumer discovers that an already-installed plan
+     * missed its wall-clock apply deadline.
+     *
+     * expectedContext makes the invalidation compare-and-clear: a delayed
+     * rollback for request N can never erase a newer request N+1. Omitting it
+     * intentionally invalidates whichever YOPO command currently owns motion.
+     */
+    invalidateYopoTrajectory(reason = 'trajectory-invalidated', expectedContext = null) {
+        const failureReason = typeof reason === 'string' && reason.length > 0
+            ? reason
+            : 'trajectory-invalidated';
+        const ownsTerminalMotion = this._terminalPhase === 'terminal-track'
+            || this._terminalPhase === 'terminal-decelerating'
+            || this._terminalPhase === 'settling';
+        const hasCommand = this._trajectory.active || ownsTerminalMotion;
+        if (!hasCommand) return false;
+
+        const activeContext = this._trajectory.active
+            ? this._trajectory.context
+            : this._terminalCandidate?.context;
+        if (!this._matchesYopoTrajectoryContext(expectedContext, activeContext)) {
+            return false;
+        }
+
+        if (ownsTerminalMotion) {
+            return this._abortTerminalNavigation(failureReason);
+        }
+
+        this._trajectory.clear(failureReason);
+        this._terminalPhase = this._idealGoal ? 'approach' : 'idle';
+        this._terminalSettledTimeS = 0;
+        this._terminalBrakeDistanceM = null;
+        this._terminalEndpointGoalDistanceM = null;
+        this._terminalTrajectoryEligible = false;
+        this._terminalCandidate = null;
+        this._terminalArrivalPending = false;
+        this._latchSo3Hold(failureReason, ControlCommandType.FAILSAFE_HOLD);
+        this._navigationTransitionReason = failureReason;
+        this._replanRequested = !!this._idealGoal;
+        return true;
+    }
+
+    _rejectYopoTrajectory(reason, { preserveActive = true } = {}) {
+        const now = globalThis.performance?.now?.() ?? Date.now();
+        if (this._lastYopoRejectReason !== reason || now - (this._lastYopoRejectAt || 0) > 1000) {
+            console.warn(`[YOPO] rejected trajectory: ${reason}`);
+            this._lastYopoRejectReason = reason;
+            this._lastYopoRejectAt = now;
+        }
+        if (!preserveActive || !this._trajectory.active) {
+            this._trajectory.clear('trajectory-rejected');
+            this._latchSo3Hold('trajectory-rejected');
+        }
+        this._navigationTransitionReason = 'trajectory-rejected';
+        this._replanRequested = true;
+        return false;
     }
 
     setSpawnPoint(x, y, z) {
@@ -472,6 +950,7 @@ export class Drone {
         this._navigationTransitionReason = 'reset';
         this._replanRequested = false;
         this._so3FixedYaw = null;
+        this._resetTerminalNavigation('idle');
 
         this.x = this._spawnX; this.y = this._spawnY; this.z = this._spawnZ;
         this.vx = 0; this.vy = 0; this.vz = 0;
@@ -573,14 +1052,170 @@ export class Drone {
 
     }
 
-    /** 到达目标后刹车：对齐参考 test_yopo_ros.py 的 TRAJECTORY_STATUS_EMPTY + 位置保持 */
+    /** 到达后保持终端 Poly5 结束时锁定的实际位姿，不修改物理状态。 */
     _onArrival() {
         this._trajectory.clear('arrival');
-        this._latchSo3Hold('arrival');
+        if (!this._so3Hold) this._latchTerminalCurrentHold('arrival-settled');
+        this._terminalArrivalPending = false;
         this._replanRequested = false;
+        this._yopoPlanTriggered = false;
         this._idealGoal = null;
+        this._terminalPhase = 'arrived';
+        this._terminalSettledTimeS = ARRIVAL_SETTLE_TIME_S;
         this._navigationState = 'arrived';
-        this._navigationTransitionReason = 'arrival-distance';
+        this._navigationTransitionReason = 'arrival-settled';
+    }
+
+    _updateTerminalNavigation(dt, armed) {
+        if (!this._idealGoal
+            || this.flightMode !== 'so3'
+            || !armed
+            || !this._yopoPlanTriggered) {
+            return;
+        }
+
+        const goalY = this._idealGoal.y == null ? this.y : this._idealGoal.y;
+        const distanceM = Math.hypot(
+            this._idealGoal.x - this.x,
+            goalY - this.y,
+            this._idealGoal.z - this.z,
+        );
+        const speedMps = Math.hypot(this.vx, this.vy, this.vz);
+        const terminalOwnsMotion = this._terminalPhase === 'terminal-track'
+            || this._terminalPhase === 'terminal-decelerating'
+            || this._terminalPhase === 'settling';
+        if (terminalOwnsMotion && ![
+            this.x, this.y, this.z,
+            this.vx, this.vy, this.vz,
+            distanceM, speedMps,
+        ].every(Number.isFinite)) {
+            this._abortTerminalNavigation('non-finite-state');
+            return;
+        }
+
+        if (terminalOwnsMotion
+            && this.isColliding) {
+            this._abortTerminalNavigation('collision');
+            return;
+        }
+
+        if (this._terminalPhase === 'approach') {
+            const endpoint = this._trajectory.active ? this._trajectory.endpointState : null;
+            this._terminalEndpointGoalDistanceM = endpoint
+                ? Math.hypot(
+                    endpoint.x - this._idealGoal.x,
+                    endpoint.y - goalY,
+                    endpoint.z - this._idealGoal.z,
+                )
+                : null;
+            const endpointSpeedMps = endpoint
+                ? Math.hypot(endpoint.vx, endpoint.vy, endpoint.vz)
+                : Infinity;
+            const endpointStoppingEnvelope = endpoint
+                ? this._terminalStoppingEnvelope(
+                    { x: endpoint.x, y: endpoint.y, z: endpoint.z },
+                    { x: endpoint.vx, y: endpoint.vy, z: endpoint.vz },
+                )
+                : null;
+            this._terminalBrakeDistanceM = endpointStoppingEnvelope?.brakeDistanceM ?? null;
+            this._terminalPredictedStopGoalDistanceM =
+                endpointStoppingEnvelope?.predictedStopGoalDistanceM ?? null;
+            const suffixPositionErrorM = Number(
+                this._trajectory.context?.suffixPositionErrorM,
+            );
+            const suffixVelocityErrorMps = Number(
+                this._trajectory.context?.suffixVelocityErrorMps,
+            );
+            this._terminalTrajectoryEligible = !!endpoint
+                && !this.isColliding
+                && this._terminalEndpointGoalDistanceM <= this._arrivalDistanceM
+                && endpointSpeedMps <= TERMINAL_DECELERATION_MAX_ENTRY_SPEED_MPS
+                && endpointStoppingEnvelope
+                && endpointStoppingEnvelope.predictedStopGoalDistanceM
+                    <= TERMINAL_ABORT_DISTANCE_M
+                && Number(this._trajectory.maxAcceleration)
+                    <= TERMINAL_TRACK_MAX_ACCELERATION_MPS2 + 1e-9
+                && Number.isFinite(suffixPositionErrorM)
+                && suffixPositionErrorM <= YOPO_MAX_SUFFIX_POSITION_ERROR_M + 1e-9
+                && Number.isFinite(suffixVelocityErrorMps)
+                && suffixVelocityErrorMps <= YOPO_MAX_SUFFIX_VELOCITY_ERROR_MPS + 1e-9;
+            if (this._terminalTrajectoryEligible) {
+                this._terminalPhase = 'terminal-track';
+                this._terminalSettledTimeS = 0;
+                this._terminalCandidate = Object.freeze({
+                    context: this._trajectory.context,
+                    endpointState: this._trajectory.endpointState,
+                    endpointGoalDistanceM: this._terminalEndpointGoalDistanceM,
+                    maxSpeedMps: this._trajectory.maxSpeed,
+                    maxAccelerationMps2: this._trajectory.maxAcceleration,
+                    terminalSpeedMps: endpointSpeedMps,
+                    brakeDistanceM: endpointStoppingEnvelope.brakeDistanceM,
+                    predictedStop: endpointStoppingEnvelope.predictedStop,
+                    predictedStopGoalDistanceM:
+                        endpointStoppingEnvelope.predictedStopGoalDistanceM,
+                    suffixPositionErrorM,
+                    suffixVelocityErrorMps,
+                });
+                this._replanRequested = false;
+            }
+        }
+
+        if (this._terminalPhase === 'terminal-decelerating') {
+            this._terminalDecelerationElapsedS += dt;
+            if (distanceM > TERMINAL_ABORT_DISTANCE_M) {
+                this._abortTerminalNavigation('terminal-deceleration-outside-envelope');
+                return;
+            }
+            if (this._terminalDecelerationElapsedS
+                > TERMINAL_DECELERATION_TIMEOUT_S + 1e-12) {
+                this._abortTerminalNavigation('terminal-deceleration-timeout');
+                return;
+            }
+            if (speedMps <= TERMINAL_TRACK_MAX_SPEED_MPS
+                && distanceM <= this._arrivalDistanceM) {
+                this._enterTerminalSettling();
+            }
+            return;
+        }
+
+        if (this._terminalPhase !== 'settling') return;
+
+        if (distanceM > TERMINAL_ABORT_DISTANCE_M) {
+            this._abortTerminalNavigation('terminal-settling-outside-envelope');
+            return;
+        }
+        if (!this.isColliding
+            && distanceM <= this._arrivalDistanceM
+            && speedMps <= ARRIVAL_SETTLE_SPEED_MPS) {
+            this._terminalSettledTimeS += dt;
+            if (this._terminalSettledTimeS + 1e-12 >= ARRIVAL_SETTLE_TIME_S) {
+                this._terminalArrivalPending = true;
+            }
+        } else {
+            this._terminalSettledTimeS = 0;
+            this._terminalArrivalPending = false;
+        }
+    }
+
+    _finalizeTerminalArrivalAfterPhysics() {
+        if (!this._terminalArrivalPending || this._terminalPhase !== 'settling' || !this._idealGoal) {
+            return;
+        }
+        this._terminalArrivalPending = false;
+        const goalY = this._idealGoal.y == null ? this.y : this._idealGoal.y;
+        const distanceM = Math.hypot(
+            this._idealGoal.x - this.x,
+            goalY - this.y,
+            this._idealGoal.z - this.z,
+        );
+        const speedMps = Math.hypot(this.vx, this.vy, this.vz);
+        if (!this.isColliding
+            && distanceM <= this._arrivalDistanceM
+            && speedMps <= ARRIVAL_SETTLE_SPEED_MPS) {
+            this._onArrival();
+        } else {
+            this._terminalSettledTimeS = 0;
+        }
     }
 
     update(dt, input, collisionProvider) {
@@ -608,21 +1243,7 @@ export class Drone {
         this._simTimeS += dt;
         const velocityBeforeStep = { x: this.vx, y: this.vy, z: this.vz };
 
-        // 0a. 到达判定。radio_range=9m 是网络格点范围，不是到达容差。
-        // 到达半径与外部 YOPO 参考实现统一为 4m。
-        if (this._idealGoal) {
-            const g = this._idealGoal;
-            const d = Math.sqrt(
-                (g.x - this.x) ** 2 +
-                ((g.y != null ? g.y : this.y) - this.y) ** 2 +
-                (g.z - this.z) ** 2
-            );
-            if (d < this._arrivalDistanceM) {
-                this._onArrival();
-            }
-        }
-
-        // 0b. Handle flight-mode transitions (M key, RC channel, or dropdown).
+        // 0a. Handle flight-mode transitions (M key, RC channel, or dropdown).
         // readSettings() has already copied the latest dropdown value into
         // this.flightMode for this frame, so comparing against the cached
         // previous value detects a change on the first frame it becomes
@@ -631,6 +1252,11 @@ export class Drone {
             this._onFlightModeChanged(this._prevFlightMode, this.flightMode);
             this._prevFlightMode = this.flightMode;
         }
+
+        // 0b. Terminal braking and arrival use actual 3-D speed plus a
+        // continuous dwell. Merely crossing the 4 m sphere at speed is never
+        // considered arrival.
+        this._updateTerminalNavigation(dt, !!input.armed);
 
         // 1. Control law → updates orientation quaternion and thrustOutput
         if (!input.armed) {
@@ -702,6 +1328,7 @@ export class Drone {
 
         // 5. Collisions
         this._handleCollisions(collisionProvider, previousPosition, dt);
+        this._finalizeTerminalArrivalAfterPhysics();
 
         this._measuredAcceleration = {
             x: (this.vx - velocityBeforeStep.x) / dt,
@@ -850,6 +1477,7 @@ export class Drone {
         return Object.freeze({
             actualState: Object.freeze(actualState),
             referenceState: Object.freeze(referenceState),
+            simTimeS: this._simTimeS,
             yaw: this.getFixedYaw(),
         });
     }
@@ -1046,7 +1674,7 @@ export class Drone {
         return { right, up, backward, forward, horizontalRight };
     }
 
-    _trackDesiredAttitude(dt, desiredQuaternion, rateLimitsDeg = null) {
+    _trackDesiredAttitude(dt, desiredQuaternion, rateLimitsDeg = null, servoOptions = null) {
         const currentQuaternion = {
             x: this.orientation.x,
             y: this.orientation.y,
@@ -1056,14 +1684,27 @@ export class Drone {
         const targetRate = reducedQuaternionBodyRateSetpoint(
             currentQuaternion,
             desiredQuaternion,
-            rateLimitsDeg ? { rateLimitsDeg } : {},
+            {
+                ...(rateLimitsDeg ? { rateLimitsDeg } : {}),
+                ...(servoOptions?.gains ? { gains: servoOptions.gains } : {}),
+                ...(Number.isFinite(servoOptions?.yawWeight)
+                    ? { yawWeight: servoOptions.yawWeight }
+                    : {}),
+            },
         );
         const currentRate = {
             x: this.pitchRate * DEG2RAD,
             y: this.yawRate * DEG2RAD,
             z: this.rollRate * DEG2RAD,
         };
-        const actualRate = firstOrderRateServo(currentRate, targetRate, dt, 15);
+        const actualRate = firstOrderRateServo(
+            currentRate,
+            targetRate,
+            dt,
+            Number.isFinite(servoOptions?.rateBandwidth)
+                ? servoOptions.rateBandwidth
+                : 15,
+        );
         const nextQuaternion = integrateBodyRates(currentQuaternion, actualRate, dt);
         this.orientation.set(
             nextQuaternion.x,
@@ -1077,19 +1718,44 @@ export class Drone {
         return { targetRate, actualRate };
     }
 
-    _applyForceAttitude(dt, force, yawRad, maxThrustN, rateLimitsDeg = null) {
+    _applyForceAttitude(
+        dt,
+        force,
+        yawRad,
+        maxThrustN,
+        rateLimitsDeg = null,
+        servoOptions = null,
+    ) {
         const desiredQuaternion = desiredAttitudeFromForce(force, yawRad);
-        const rates = this._trackDesiredAttitude(dt, desiredQuaternion, rateLimitsDeg);
+        const rates = this._trackDesiredAttitude(
+            dt,
+            desiredQuaternion,
+            rateLimitsDeg,
+            servoOptions,
+        );
         // Projection uses the exact same post-servo attitude that the common
         // translational plant uses below; no cached pre-update body axis.
         const bodyUp = this._bodyBasis().up;
+        const requestedForceMagnitudeN = Math.hypot(force.x, force.y, force.z);
+        const projectedThrustN = force.x * bodyUp.x + force.y * bodyUp.y + force.z * bodyUp.z;
         const thrustN = Math.max(0, Math.min(
             maxThrustN,
-            force.x * bodyUp.x + force.y * bodyUp.y + force.z * bodyUp.z,
+            projectedThrustN,
         ));
         this.thrustOutput = thrustN / G * 1000;
         this.throttlePercent = maxThrustN > 0 ? thrustN / maxThrustN : 0;
-        return { desiredQuaternion, bodyUp, thrustN, ...rates };
+        const forceProjectionRatio = requestedForceMagnitudeN > 1e-9
+            ? Math.max(0, Math.min(1, thrustN / requestedForceMagnitudeN))
+            : 1;
+        return {
+            desiredQuaternion,
+            bodyUp,
+            thrustN,
+            projectedThrustN,
+            requestedForceMagnitudeN,
+            forceProjectionRatio,
+            ...rates,
+        };
     }
 
     _setControlDiagnostics(values) {
@@ -1119,7 +1785,9 @@ export class Drone {
     _controlFailsafeHold(dt, reason) {
         this._so3HoldCommandType = ControlCommandType.FAILSAFE_HOLD;
         const invalidatesActiveAutoTrajectory = this.flightMode === 'so3' && this._trajectory.active;
-        if (!this._so3Hold || this._controlDiagnostics?.fallbackReason !== reason) {
+        const terminalAborted = this._abortTerminalNavigation(reason);
+        if (!terminalAborted
+            && (!this._so3Hold || this._controlDiagnostics?.fallbackReason !== reason)) {
             if (this._trajectory.active) this._trajectory.clear(reason);
             this._latchSo3Hold(reason, ControlCommandType.FAILSAFE_HOLD);
         }
@@ -1533,7 +2201,12 @@ export class Drone {
                 vx: this._easyVelocitySetpoint.x,
                 vy: this._easyVelocitySetpoint.y,
                 vz: this._easyVelocitySetpoint.z,
+                ax: limitedAcceleration.x,
+                ay: limitedAcceleration.y,
+                az: limitedAcceleration.z,
             },
+            referenceVelocity: { ...this._easyVelocitySetpoint },
+            referenceAcceleration: { ...limitedAcceleration },
             rawAcceleration: requestedAcceleration,
             limitedAcceleration,
             requestedForce,
@@ -1545,6 +2218,8 @@ export class Drone {
                 direct: false,
             },
             antiWindup: { horizontal: horizontalAntiWindup, vertical: verticalSameDirection },
+            forceProjectionRatio: attitude.forceProjectionRatio,
+            projectionRatio: attitude.forceProjectionRatio,
             fallbackReason: null,
             attitudeRateSetpoint: attitude.targetRate,
         });
@@ -1683,7 +2358,7 @@ export class Drone {
         const yawDeg = this._isYawLockEnabled()
             ? (this._so3FixedYaw ?? hold.yawDeg)
             : this._so3YawSetpointDeg;
-        this._applyForceAttitude(
+        const attitude = this._applyForceAttitude(
             dt,
             allocation.force,
             yawDeg * DEG2RAD,
@@ -1700,12 +2375,24 @@ export class Drone {
         this.commandedGroundSpeed = 0;
         this.targetGroundSpeed = 0;
         this.pilotGroundSpeedCommand = 0;
+        const terminalCandidate = this._terminalCandidate;
+        const terminalContext = terminalCandidate?.context;
         this._setControlDiagnostics({
             commandType,
             source: commandType === ControlCommandType.FAILSAFE_HOLD ? 'failsafe' : 'yopo-hold',
-            createdSimTime: this._simTimeS,
-            expirySimTime: null,
-            referenceState: { x: hold.x, y: hold.y, z: hold.z, vx: 0, vy: 0, vz: 0 },
+            generation: terminalContext?.generation ?? null,
+            planningFrameId: terminalContext?.frameId ?? terminalContext?.planningFrameId ?? null,
+            planningRequestId: terminalContext?.requestId ?? terminalContext?.planningRequestId ?? null,
+            selectedCandidateId: terminalContext?.selectedCandidateId ?? null,
+            createdSimTime: terminalContext?.createdSimTime ?? this._simTimeS,
+            expirySimTime: terminalContext?.expirySimTime ?? null,
+            referenceState: {
+                x: hold.x, y: hold.y, z: hold.z,
+                vx: 0, vy: 0, vz: 0,
+                ax: 0, ay: 0, az: 0,
+            },
+            referenceVelocity: { x: 0, y: 0, z: 0 },
+            referenceAcceleration: { x: 0, y: 0, z: 0 },
             rawAcceleration: acceleration,
             limitedAcceleration,
             requestedForce,
@@ -1717,9 +2404,187 @@ export class Drone {
                 direct: false,
             },
             antiWindup: { horizontal: false, vertical: false },
+            forceProjectionRatio: attitude.forceProjectionRatio,
+            projectionRatio: attitude.forceProjectionRatio,
             trajectoryAgeS: null,
+            trajectoryApplyPositionErrorM: terminalCandidate?.suffixPositionErrorM
+                ?? this._trajectoryApplyPositionErrorM,
+            trajectoryApplyVelocityErrorMps: terminalCandidate?.suffixVelocityErrorMps
+                ?? this._trajectoryApplyVelocityErrorMps,
+            poly5PeakSpeedMps: terminalCandidate?.maxSpeedMps ?? null,
+            poly5PeakAccelerationMps2: terminalCandidate?.maxAccelerationMps2 ?? null,
+            trajectoryEndpointState: terminalCandidate?.endpointState ?? null,
+            trajectoryEndpointGoalDistanceM: terminalCandidate?.endpointGoalDistanceM
+                ?? this._terminalEndpointGoalDistanceM,
+            terminalTrajectoryEligible: !!terminalCandidate || this._terminalTrajectoryEligible,
             fallbackReason: reason,
         });
+    }
+
+    _controlTerminalDeceleration(dt) {
+        const anchor = this._terminalDecelerationAnchor || this._so3Hold;
+        if (!anchor) {
+            this._abortTerminalNavigation('terminal-deceleration-anchor-missing');
+            this._controlPositionHold(
+                dt,
+                ControlCommandType.FAILSAFE_HOLD,
+                'terminal-deceleration-anchor-missing',
+            );
+            return;
+        }
+
+        // This is a zero-velocity hold around the actual Poly5 endpoint, not a
+        // position command toward the navigation goal. Consequently the first
+        // braking force always opposes the terminal tangent and cannot create a
+        // new straight chord through an obstacle that the planner went around.
+        const rawAcceleration = {
+            x: -this.so3Kx * (this.x - anchor.x) - this.so3Kv * this.vx,
+            y: -this.so3KxVertical * (this.y - anchor.y) - this.so3KvVertical * this.vy,
+            z: -this.so3Kx * (this.z - anchor.z) - this.so3Kv * this.vz,
+        };
+        if (![rawAcceleration.x, rawAcceleration.y, rawAcceleration.z].every(Number.isFinite)) {
+            this._abortTerminalNavigation('non-finite-command');
+            this._controlPositionHold(dt, ControlCommandType.FAILSAFE_HOLD, 'non-finite-command');
+            return;
+        }
+        const limitedAcceleration = limitVector(
+            rawAcceleration,
+            TERMINAL_DECELERATION_COMMAND_LIMIT_MPS2,
+        );
+        const massKg = Math.max(0.001, this.mass / 1000);
+        const weightN = massKg * G;
+        const maxThrustN = Math.max(0, this.maxThrust * G / 1000);
+        const requestedForce = {
+            x: massKg * limitedAcceleration.x,
+            y: massKg * (G + limitedAcceleration.y),
+            z: massKg * limitedAcceleration.z,
+        };
+        const tiltLimited = limitTiltPreservingGravity(
+            requestedForce.x,
+            requestedForce.y,
+            requestedForce.z,
+            weightN,
+            TERMINAL_DECELERATION_MAX_TILT_DEG,
+        );
+        const allocation = capDirectForce(tiltLimited, maxThrustN);
+        const producedAcceleration = {
+            x: allocation.force.x / massKg,
+            y: allocation.force.y / massKg - G,
+            z: allocation.force.z / massKg,
+        };
+        const horizontalSaturated = Math.hypot(
+            producedAcceleration.x - rawAcceleration.x,
+            producedAcceleration.z - rawAcceleration.z,
+        ) > 1e-4;
+        const verticalSaturated = Math.abs(
+            producedAcceleration.y - rawAcceleration.y,
+        ) > 1e-4;
+        const yawDeg = this._isYawLockEnabled()
+            ? (this._so3FixedYaw ?? anchor.yawDeg)
+            : this._so3YawSetpointDeg;
+        const attitude = this._applyForceAttitude(
+            dt,
+            allocation.force,
+            yawDeg * DEG2RAD,
+            maxThrustN,
+            { roll: 220, pitch: 220, yaw: 120 },
+            {
+                gains: { roll: 8, pitch: 8, yaw: 2.8 },
+                yawWeight: 0.4,
+                rateBandwidth: 30,
+            },
+        );
+        const tiltDeg = Math.atan2(
+            Math.hypot(allocation.force.x, allocation.force.z),
+            Math.max(1e-9, allocation.force.y),
+        ) * RAD2DEG;
+        this.boostActive = false;
+        this.boostMultiplier = 1;
+        this.effectiveMaxSpeed = this.so3CruiseMps;
+        this.commandedGroundSpeed = 0;
+        this.targetGroundSpeed = 0;
+        this.pilotGroundSpeedCommand = 0;
+
+        const terminalCandidate = this._terminalCandidate;
+        const context = terminalCandidate?.context;
+        this._setControlDiagnostics({
+            commandType: ControlCommandType.POSITION_VELOCITY_HOLD,
+            source: 'terminal-deceleration',
+            generation: context?.generation ?? null,
+            planningFrameId: context?.frameId ?? context?.planningFrameId ?? null,
+            planningRequestId: context?.requestId ?? context?.planningRequestId ?? null,
+            selectedCandidateId: context?.selectedCandidateId ?? null,
+            createdSimTime: context?.createdSimTime ?? this._simTimeS,
+            expirySimTime: context?.expirySimTime ?? null,
+            referenceState: {
+                x: anchor.x, y: anchor.y, z: anchor.z,
+                vx: 0, vy: 0, vz: 0,
+                ax: 0, ay: 0, az: 0,
+            },
+            referenceVelocity: { x: 0, y: 0, z: 0 },
+            referenceAcceleration: { ...rawAcceleration },
+            rawAcceleration,
+            limitedAcceleration: producedAcceleration,
+            requestedForce,
+            allocatedForce: allocation.force,
+            tiltDeg,
+            saturation: {
+                horizontal: horizontalSaturated,
+                vertical: verticalSaturated,
+                direct: allocation.saturated || horizontalSaturated || verticalSaturated,
+            },
+            antiWindup: { horizontal: false, vertical: false },
+            forceProjectionRatio: attitude.forceProjectionRatio,
+            projectionRatio: attitude.forceProjectionRatio,
+            trajectoryAgeS: null,
+            trajectoryApplyPositionErrorM: terminalCandidate?.suffixPositionErrorM
+                ?? this._trajectoryApplyPositionErrorM,
+            trajectoryApplyVelocityErrorMps: terminalCandidate?.suffixVelocityErrorMps
+                ?? this._trajectoryApplyVelocityErrorMps,
+            poly5PeakSpeedMps: terminalCandidate?.maxSpeedMps ?? null,
+            poly5PeakAccelerationMps2: terminalCandidate?.maxAccelerationMps2 ?? null,
+            trajectoryEndpointState: terminalCandidate?.endpointState ?? null,
+            trajectoryEndpointGoalDistanceM: terminalCandidate?.endpointGoalDistanceM
+                ?? this._terminalEndpointGoalDistanceM,
+            terminalTrajectoryEligible: true,
+            fallbackReason: null,
+        });
+    }
+
+    _handleExpiredYopoTrajectory(dt) {
+        if (this._terminalPhase === 'terminal-track') {
+            const speedMps = Math.hypot(this.vx, this.vy, this.vz);
+            if (Number.isFinite(speedMps) && speedMps <= TERMINAL_TRACK_MAX_SPEED_MPS) {
+                const settled = this._enterTerminalSettling();
+                this._controlPositionHold(
+                    dt,
+                    settled
+                        ? ControlCommandType.POSITION_VELOCITY_HOLD
+                        : ControlCommandType.FAILSAFE_HOLD,
+                    settled ? 'terminal-settling' : 'terminal-track-missed',
+                );
+                return;
+            }
+            const decelerating = this._enterTerminalDeceleration();
+            if (decelerating) {
+                this._controlTerminalDeceleration(dt);
+            } else {
+                this._controlPositionHold(
+                    dt,
+                    ControlCommandType.FAILSAFE_HOLD,
+                    'terminal-deceleration-envelope-rejected',
+                );
+            }
+            return;
+        }
+        this._latchSo3Hold('trajectory-expired');
+        this._navigationTransitionReason = 'trajectory-expired';
+        this._replanRequested = true;
+        this._controlPositionHold(
+            dt,
+            ControlCommandType.FAILSAFE_HOLD,
+            'trajectory-expired',
+        );
     }
 
     _controlSO3(dt, _input, _collisionProvider) {
@@ -1731,16 +2596,11 @@ export class Drone {
         // tracking was paused while disarmed.
         if (this._trajectory.active
             && Number.isFinite(context?.expirySimTime)
-            && this._simTimeS >= context.expirySimTime - 1e-12) {
+            // expirySimTime is inclusive for the endpoint command sample. The
+            // following fixed step owns the transition to hold/terminal logic.
+            && this._simTimeS > context.expirySimTime + 1e-12) {
             this._trajectory.clear('trajectory-expired');
-            this._latchSo3Hold('trajectory-expired');
-            this._navigationTransitionReason = 'trajectory-expired';
-            this._replanRequested = true;
-            this._controlPositionHold(
-                dt,
-                ControlCommandType.FAILSAFE_HOLD,
-                'trajectory-expired',
-            );
+            this._handleExpiredYopoTrajectory(dt);
             return;
         }
         const elapsedEnvelopeTime = Number.isFinite(context?.createdSimTime)
@@ -1752,14 +2612,20 @@ export class Drone {
         const step = this._trajectory.advance(trackerAdvance);
         if (!step.active) {
             if (step.expired) {
-                this._latchSo3Hold('trajectory-expired');
-                this._navigationTransitionReason = 'trajectory-expired';
-                this._replanRequested = true;
+                this._handleExpiredYopoTrajectory(dt);
+                return;
             }
+            if (this._terminalPhase === 'terminal-decelerating') {
+                this._controlTerminalDeceleration(dt);
+                return;
+            }
+            const terminalReason = this._terminalPhase === 'settling'
+                ? 'terminal-settling'
+                : null;
             this._controlPositionHold(
                 dt,
-                step.expired ? ControlCommandType.FAILSAFE_HOLD : this._so3HoldCommandType,
-                step.expired ? 'trajectory-expired' : (this._controlDiagnostics?.fallbackReason || 'awaiting-trajectory'),
+                this._so3HoldCommandType,
+                terminalReason || this._controlDiagnostics?.fallbackReason || 'awaiting-trajectory',
             );
             return;
         }
@@ -1767,9 +2633,11 @@ export class Drone {
         const reference = step.reference;
         const rawAcceleration = { x: reference.ax, y: reference.ay, z: reference.az };
         if (![rawAcceleration.x, rawAcceleration.y, rawAcceleration.z].every(Number.isFinite)) {
-            this._trajectory.clear('non-finite-acceleration');
-            this._latchSo3Hold('non-finite-command');
-            this._replanRequested = true;
+            if (!this._abortTerminalNavigation('non-finite-command')) {
+                this._trajectory.clear('non-finite-acceleration');
+                this._latchSo3Hold('non-finite-command');
+                this._replanRequested = true;
+            }
             this._controlPositionHold(dt, ControlCommandType.FAILSAFE_HOLD, 'non-finite-command');
             return;
         }
@@ -1806,7 +2674,7 @@ export class Drone {
         const verticalSaturated = Math.abs(rawAcceleration.y - limitedAcceleration.y) > 1e-4
             || Math.abs(producedAcceleration.y - limitedAcceleration.y) > 1e-4;
         const yawDeg = this._updateSo3Yaw(dt, reference);
-        this._applyForceAttitude(
+        const attitude = this._applyForceAttitude(
             dt,
             allocation.force,
             yawDeg * DEG2RAD,
@@ -1826,9 +2694,14 @@ export class Drone {
             source: context?.source || 'yopo',
             frame: context?.frame || 'sim-world-y-up',
             generation: context?.generation ?? null,
+            planningFrameId: context?.frameId ?? context?.planningFrameId ?? null,
+            planningRequestId: context?.requestId ?? context?.planningRequestId ?? null,
+            selectedCandidateId: context?.selectedCandidateId ?? null,
             createdSimTime: context?.createdSimTime ?? this._simTimeS - this._trajectory.time,
             expirySimTime: context?.expirySimTime ?? this._simTimeS + (this._trajectory.duration - this._trajectory.time),
             referenceState: reference,
+            referenceVelocity: { x: reference.vx, y: reference.vy, z: reference.vz },
+            referenceAcceleration: { x: reference.ax, y: reference.ay, z: reference.az },
             rawAcceleration,
             limitedAcceleration,
             requestedForce,
@@ -1840,7 +2713,22 @@ export class Drone {
                 direct: allocation.saturated || horizontalSaturated || verticalSaturated,
             },
             antiWindup: { horizontal: false, vertical: false },
+            forceProjectionRatio: attitude.forceProjectionRatio,
+            projectionRatio: attitude.forceProjectionRatio,
             trajectoryAgeS: this._trajectory.time,
+            trackerAgeS: this._trajectory.time,
+            trackerRemainingS: Math.max(0, this._trajectory.duration - this._trajectory.time),
+            trajectoryOriginalAgeS: this._trajectory.initialTime,
+            trajectoryRemainingS: Math.max(0, this._trajectory.duration - this._trajectory.time),
+            trajectoryApplyPositionErrorM: context?.suffixPositionErrorM
+                ?? this._trajectoryApplyPositionErrorM,
+            trajectoryApplyVelocityErrorMps: context?.suffixVelocityErrorMps
+                ?? this._trajectoryApplyVelocityErrorMps,
+            poly5PeakSpeedMps: this._trajectory.maxSpeed,
+            poly5PeakAccelerationMps2: this._trajectory.maxAcceleration,
+            trajectoryEndpointState: this._trajectory.endpointState,
+            trajectoryEndpointGoalDistanceM: this._terminalEndpointGoalDistanceM,
+            terminalTrajectoryEligible: this._terminalTrajectoryEligible,
             fallbackReason: null,
         });
     }
@@ -1910,12 +2798,16 @@ export class Drone {
                     this._targetZ = this.z;
                     this._easyHorizontalState = 'brake';
                     this._easyVerticalState = 'brake';
-                } else if (this.flightMode === 'so3'
-                    && (!wasColliding || this._trajectory.active)) {
-                    this._trajectory.clear('collision');
-                    this._latchSo3Hold('collision');
-                    this._navigationTransitionReason = 'collision';
-                    this._replanRequested = true;
+                } else if (this.flightMode === 'so3') {
+                    const terminalAborted = this._abortTerminalNavigation('collision');
+                    if (!terminalAborted
+                        && this._terminalPhase !== 'arrived'
+                        && (!wasColliding || this._trajectory.active)) {
+                        this._trajectory.clear('collision');
+                        this._latchSo3Hold('collision');
+                        this._navigationTransitionReason = 'collision';
+                        this._replanRequested = true;
+                    }
                 }
             }
         }

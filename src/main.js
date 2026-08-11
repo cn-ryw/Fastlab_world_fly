@@ -875,7 +875,17 @@ function startFlight(viewMode = 'first') {
                 );
                 return false;
             }
-            if (!drone?.setYopoTrajectory(endstate, trajTime, context)) {
+            const installTrajectory = () => (
+                drone?.setYopoTrajectory(endstate, trajTime, context) === true
+            );
+            const rollbackLateTrajectory = () => drone?.invalidateYopoTrajectory?.(
+                'trajectory-apply-deadline-exceeded',
+                context,
+            ) === true;
+            const trajectoryInstalled = typeof context?.commitIfFresh === 'function'
+                ? context.commitIfFresh(installTrajectory, rollbackLateTrajectory)
+                : installTrajectory();
+            if (!trajectoryInstalled) {
                 console.warn(`[YOPO] invalid response rejected frameId=${context?.frameId ?? '-'}`);
                 return false;
             }
@@ -1100,7 +1110,13 @@ function updateFlight(dt) {
             ? drone._getYopoReference(drone._yopoTrackerTime || 0)
             : { x: drone.x, y: drone.y, z: drone.z }
             : (drone._idealGoal ? drone._idealGoal : { x: drone.x, y: drone.y, z: drone.z });
-        flightLogger.record(drone, ref?.x ?? drone.x, ref?.y ?? drone.y, ref?.z ?? drone.z);
+        flightLogger.record(
+            drone,
+            ref?.x ?? drone.x,
+            ref?.y ?? drone.y,
+            ref?.z ?? drone.z,
+            schedule,
+        );
     }
     const navigationTransition = drone.consumeNavigationTransition?.();
     if (navigationTransition?.state === 'arrived') {

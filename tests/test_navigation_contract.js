@@ -58,13 +58,59 @@ assert(
         'retargeting preserves the actual velocity state');
 }
 
-for (const [distance, shouldArrive] of [[3.9, true], [4.1, false], [8.9, false]]) {
+for (const distance of [3.9, 4.1, 8.9]) {
     const drone = new Drone();
     drone.x = 0; drone.y = 10; drone.z = 0;
     drone.setIdealGoal({ x: distance, y: 10, z: 0 });
     drone.update(1 / 60, { armed: false }, null);
-    assert((drone._idealGoal === null) === shouldArrive,
-        `${distance} m boundary should${shouldArrive ? '' : ' not'} arrive`);
+    assert(drone._idealGoal !== null,
+        `${distance} m must not arrive while disarmed and before any valid trajectory`);
+}
+
+// Crossing the 4 m sphere at speed neither arrives nor cuts away an
+// unexecutable final Poly5 to fly a straight goal chord.
+{
+    const drone = new Drone();
+    drone.x = 0; drone.y = 10; drone.z = 0;
+    drone.vx = 15;
+    drone.flightMode = 'so3';
+    drone._prevFlightMode = 'so3';
+    drone.setIdealGoal({ x: 3.9, y: 10, z: 0 });
+    assert(drone.setYopoTrajectory(
+        [2, 0, -20, 10, 0, 0, 0, 0, 0],
+        0.5,
+    ), 'high-speed arrival precondition trajectory is accepted');
+    drone.update(0.005, { armed: true }, null);
+    assert(drone._idealGoal !== null, 'high-speed 4 m crossing does not arrive');
+    assert(drone.getControlDiagnostics().terminalPhase === 'approach',
+        'high-speed candidate above the 25m/s2 peak remains planner-controlled');
+    assert(drone._trajectory.active,
+        'high-speed terminal proximity does not discard the obstacle-aware path');
+}
+
+// Arrival requires completion of the committed suffix followed by a continuous
+// 0.4 s collision-free stationary dwell at the goal.
+{
+    const drone = new Drone();
+    drone.x = 0; drone.y = 10; drone.z = 0;
+    drone.flightMode = 'so3';
+    drone._prevFlightMode = 'so3';
+    drone.setIdealGoal({ x: 0, y: 10, z: 0 });
+    assert(drone.setYopoTrajectory(
+        [0, 0, 0, 10, 0, 0, 0, 0, 0],
+        0.05,
+    ), 'settled arrival precondition trajectory is accepted');
+    for (let step = 0; step < 20 && drone._terminalPhase !== 'settling'; step++) {
+        drone.update(0.005, { armed: true }, null);
+    }
+    assert(drone._terminalPhase === 'settling',
+        'safe terminal Poly5 completes before dwell begins');
+    for (let step = 0; step < 79; step++) {
+        drone.update(0.005, { armed: true }, null);
+    }
+    assert(drone._idealGoal !== null, '0.395 s stationary dwell is not yet arrived');
+    drone.update(0.005, { armed: true }, null);
+    assert(drone._idealGoal === null, '0.4 s stationary dwell inside 4 m arrives');
 }
 
 {

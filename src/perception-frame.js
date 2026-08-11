@@ -75,6 +75,7 @@ export class PerceptionFrame {
     constructor({
         frameId,
         capturedAt,
+        captureSimTimeS = null,
         transform,
         rgb,
         actualState,
@@ -96,6 +97,9 @@ export class PerceptionFrame {
 
         this.frameId = id;
         this.capturedAt = finiteNumber(capturedAt, 'capturedAt');
+        this.captureSimTimeS = captureSimTimeS == null
+            ? null
+            : finiteNumber(captureSimTimeS, 'captureSimTimeS');
         this.transform = freezeTransform(transform);
         this.rgb = rgb;
         this.actualState = freezeState(actualState, 'actualState');
@@ -160,6 +164,9 @@ export function normalizePlanningState(state, yawFallback = 0) {
             actualState: freezeState(state.actualState, 'actualState'),
             referenceState: freezeState(state.referenceState || state.actualState, 'referenceState', true),
             yaw: finiteNumber(state.yaw ?? yawFallback, 'yaw'),
+            simTimeS: state.simTimeS == null
+                ? null
+                : finiteNumber(state.simTimeS, 'simTimeS'),
         });
     }
 
@@ -170,5 +177,8 @@ export function normalizePlanningState(state, yawFallback = 0) {
         actualState: freezeState(actualState, 'actualState'),
         referenceState: freezeState({ ...actualState, acceleration: { x: 0, y: 0, z: 0 } }, 'referenceState', true),
         yaw: finiteNumber(yawFallback || 0, 'yaw'),
+        simTimeS: state?.simTimeS == null
+            ? null
+            : finiteNumber(state.simTimeS, 'simTimeS'),
     });
 }

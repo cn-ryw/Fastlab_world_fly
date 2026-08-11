@@ -99,11 +99,28 @@ class FakeYopoRunner:
     def __init__(self):
         self.lock = threading.Lock()
         self.last_call = None
+        self.last_plan_diagnostics = None
         self.infer_calls = 0
 
     def infer(self, **kwargs):
         self.infer_calls += 1
         self.last_call = kwargs
+        self.last_plan_diagnostics = {
+            "selected_endstate_raw": [
+                -0.8, -0.6, -0.4, -0.2, 0.0, 0.2, 0.4, 0.6, 0.8
+            ],
+            "selected_candidate_id": 17,
+            "selected_action_id": 17,
+            "selected_lattice_id": 54,
+            "selected_score": np.float32(0.25),
+            "terminal_speed_mps": np.float32(99.0),
+            "terminal_acceleration_mps2": np.float32(99.0),
+            "endpoint_displacement_m": np.float32(99.0),
+            "trajectory_time_s": np.float32(99.0),
+            "candidate_count": 72,
+            "velocity_scale_mps": np.float32(16.0),
+            "acceleration_scale_mps2": np.float32(12.0),
+        }
         return np.arange(9, dtype=np.float32), 0.25, 1.125
 
 
@@ -135,6 +152,14 @@ class BackendContractTests(unittest.TestCase):
         )
         self.assertIn("loaded_config_path != config_path.resolve()", source)
 
+    def test_yopo_runner_enters_inference_mode_before_lattice_construction(self):
+        source = (SCRIPTS_DIR / "yopo_bridge.py").read_text(encoding="utf-8")
+        self.assertLess(
+            source.index('cfg["train"] = False'),
+            source.index("self.net = _load_model(model_path, device)"),
+        )
+        self.assertIn("self.state_transform.lattice_primitive.segment_time", source)
+
     def test_yopo_height_override_is_segment_bounded(self):
         source = (SCRIPTS_DIR / "yopo_bridge.py").read_text(encoding="utf-8")
         self.assertIn("YOPO_MAX_VERTICAL_ENDPOINT_STEP_M = 4.0", source)
@@ -148,12 +173,17 @@ class BackendContractTests(unittest.TestCase):
         old_yopo = combined_server.yopo_runner
         with combined_server._depth_cache_lock:
             old_cache = dict(combined_server._depth_cache)
+            old_preview_cache = list(combined_server._planning_preview_cache.items())
+            combined_server._planning_preview_cache.clear()
             combined_server._depth_cache.update({
                 "data": None,
                 "ts": 0,
                 "frame_id": None,
+                "goal_id": None,
+                "generation": None,
                 "depth_mode": None,
                 "calibration_id": None,
+                "projection_config": None,
             })
         combined_server.da360_runner = FakeDepthRunner()
         combined_server.yopo_runner = FakeYopoRunner()
@@ -169,6 +199,8 @@ class BackendContractTests(unittest.TestCase):
             with combined_server._depth_cache_lock:
                 combined_server._depth_cache.clear()
                 combined_server._depth_cache.update(old_cache)
+                combined_server._planning_preview_cache.clear()
+                combined_server._planning_preview_cache.update(old_preview_cache)
 
     def test_health_contract_is_shared(self):
         with self.clients() as clients:
@@ -436,9 +468,183 @@ class BackendContractTests(unittest.TestCase):
             )
             self.assertEqual(len(payload["endstate"]), 9)
             self.assertEqual(payload["traj_time"], 1.125)
+            diagnostics = payload["planning_diagnostics"]
+            self.assertEqual(diagnostics["schema_version"], 1)
+            self.assertEqual(diagnostics["selected_candidate_id"], 17)
+            self.assertEqual(diagnostics["selected_action_id"], 17)
+            self.assertEqual(diagnostics["selected_lattice_id"], 54)
+            self.assertEqual(diagnostics["candidate_count"], 72)
+            self.assertEqual(len(diagnostics["selected_endstate_raw"]), 9)
+            self.assertEqual(diagnostics["selected_score"], 0.25)
+            self.assertAlmostEqual(
+                diagnostics["terminal_speed_mps"], np.sqrt(66.0)
+            )
+            self.assertAlmostEqual(
+                diagnostics["terminal_acceleration_mps2"], np.sqrt(93.0)
+            )
+            self.assertEqual(diagnostics["trajectory_time_s"], 1.125)
+            self.assertNotIn("candidates", diagnostics)
+            self.assertLess(len(json.dumps(diagnostics)), 1024)
             call = combined_server.yopo_runner.last_call
             np.testing.assert_array_equal(call["pos"], [1.0, 2.0, 3.0])
             np.testing.assert_array_equal(call["reference_pos"], [4.0, 5.0, 6.0])
+
+    def test_metric_plan_full_fails_closed_without_required_candidate_diagnostics(self):
+        with self.clients() as clients:
+            combined_server.da360_runner.depth_mode = "da360-metric"
+            combined_server.da360_runner.calibration = {
+                "id": "calib-required-diagnostics",
+                "accuracy_accepted": True,
+            }
+            original_infer = combined_server.yopo_runner.infer
+
+            def infer_without_diagnostics(**kwargs):
+                result = original_infer(**kwargs)
+                combined_server.yopo_runner.last_plan_diagnostics = None
+                return result
+
+            query = (
+                "px=1&py=2&pz=3&rpx=4&rpy=5&rpz=6&"
+                "gx=10&gy=2&gz=4&vx=0&vy=0&vz=0&ax=0&ay=0&az=0&yaw=0"
+                "&frame_id=f-missing&goal_id=g-missing&generation=7&include_preview=0"
+            )
+            with patch.object(
+                    combined_server.yopo_runner,
+                    "infer",
+                    side_effect=infer_without_diagnostics):
+                response = clients["combined"].post(
+                    f"/yopo/plan_full?{query}",
+                    data=jpeg_bytes(),
+                    content_type="image/jpeg",
+                )
+            self.assertEqual(response.status_code, 500)
+            self.assertNotIn("endstate", response.get_json())
+
+    def test_plan_full_can_skip_preview_encoding_without_changing_trajectory(self):
+        with self.clients() as clients:
+            combined_server.da360_runner.depth_mode = "da360-metric"
+            combined_server.da360_runner.calibration = {
+                "id": "calib-lightweight",
+                "accuracy_accepted": True,
+            }
+            query = (
+                "px=1&py=2&pz=3&rpx=4&rpy=5&rpz=6&"
+                "gx=10&gy=2&gz=4&vx=0&vy=0&vz=0&ax=0&ay=0&az=0&yaw=0"
+                "&frame_id=f10&goal_id=g5&generation=6&include_preview=0"
+            )
+            with patch.object(
+                    combined_server, "depth_to_polar_scan",
+                    side_effect=AssertionError("polar preview must be skipped")), \
+                    patch.object(
+                        combined_server, "depth_to_color",
+                        side_effect=AssertionError("color preview must be skipped")), \
+                    patch.object(
+                        combined_server, "encode_image",
+                        side_effect=AssertionError("JPEG preview must be skipped")):
+                response = clients["combined"].post(
+                    f"/yopo/plan_full?{query}",
+                    data=jpeg_bytes(),
+                    content_type="image/jpeg",
+                )
+
+            self.assertEqual(response.status_code, 200)
+            payload = response.get_json()
+            self.assertIs(payload["preview_included"], False)
+            self.assertIs(payload["preview_available"], True)
+            self.assertEqual(payload["preview_endpoint"], "/yopo/preview")
+            self.assertNotIn("depth_image", payload)
+            self.assertNotIn("depth_scale", payload)
+            self.assertNotIn("polar_scan", payload)
+            self.assertEqual(len(payload["endstate"]), 9)
+            self.assertEqual(payload["traj_time"], 1.125)
+            self.assertEqual(payload["planning_diagnostics"]["candidate_count"], 72)
+            self.assertEqual(payload["timings_ms"]["polar_ms"], 0.0)
+            self.assertEqual(payload["timings_ms"]["color_encode_ms"], 0.0)
+            self.assertEqual(payload["timings_ms"]["preview_ms"], 0.0)
+            self.assertEqual(combined_server.yopo_runner.infer_calls, 1)
+
+            # N+1 replaces the legacy latest slot before the UI asks for N.
+            # The identity-keyed preview LRU must still retain N exactly.
+            next_query = query.replace("frame_id=f10", "frame_id=f11")
+            next_response = clients["combined"].post(
+                f"/yopo/plan_full?{next_query}",
+                data=jpeg_bytes(),
+                content_type="image/jpeg",
+            )
+            self.assertEqual(next_response.status_code, 200)
+            self.assertEqual(combined_server._depth_cache["frame_id"], "f11")
+
+            preview = clients["combined"].get(
+                "/yopo/preview?frame_id=f10&goal_id=g5&generation=6"
+            )
+            self.assertEqual(preview.status_code, 200)
+            preview_payload = preview.get_json()
+            self.assertIs(preview_payload["preview_included"], True)
+            self.assertEqual(preview_payload["preview_source"], "planning-cache")
+            self.assertEqual(preview_payload["frame_id"], "f10")
+            self.assertEqual(preview_payload["goal_id"], "g5")
+            self.assertEqual(preview_payload["generation"], "6")
+            self.assertTrue(
+                preview_payload["depth_image"].startswith("data:image/jpeg;base64,")
+            )
+            self.assertEqual(preview_payload["polar_scan"]["unit"], "metres")
+            self.assertEqual(combined_server.da360_runner.infer_calls, 2)
+
+            stale_preview = clients["combined"].get(
+                "/yopo/preview?frame_id=missing&goal_id=g5&generation=6"
+            )
+            self.assertEqual(stale_preview.status_code, 409)
+
+    def test_planning_preview_lru_is_identity_keyed_and_bounded(self):
+        with self.clients() as clients, patch.dict(
+                os.environ, {"YOPO_PREVIEW_CACHE_ENTRIES": "4"}):
+            combined_server.da360_runner.depth_mode = "da360-metric"
+            combined_server.da360_runner.calibration = {
+                "id": "calib-preview-lru",
+                "accuracy_accepted": True,
+            }
+            base_query = (
+                "px=1&py=2&pz=3&rpx=4&rpy=5&rpz=6&"
+                "gx=10&gy=2&gz=4&vx=0&vy=0&vz=0&ax=0&ay=0&az=0&yaw=0"
+                "&goal_id=g-lru&generation=9&include_preview=0"
+            )
+            for index in range(5):
+                response = clients["combined"].post(
+                    f"/yopo/plan_full?{base_query}&frame_id=f-lru-{index}",
+                    data=jpeg_bytes(),
+                    content_type="image/jpeg",
+                )
+                self.assertEqual(response.status_code, 200)
+
+            self.assertEqual(len(combined_server._planning_preview_cache), 4)
+            self.assertEqual(combined_server._depth_cache["frame_id"], "f-lru-4")
+            evicted = clients["combined"].get(
+                "/yopo/preview?frame_id=f-lru-0&goal_id=g-lru&generation=9"
+            )
+            self.assertEqual(evicted.status_code, 409)
+            retained = clients["combined"].get(
+                "/yopo/preview?frame_id=f-lru-1&goal_id=g-lru&generation=9"
+            )
+            self.assertEqual(retained.status_code, 200)
+            self.assertEqual(retained.get_json()["frame_id"], "f-lru-1")
+            self.assertEqual(len(combined_server._planning_preview_cache), 4)
+
+    def test_plan_full_rejects_invalid_preview_flag_before_gpu_work(self):
+        with self.clients() as clients:
+            query = (
+                "px=1&py=2&pz=3&rpx=4&rpy=5&rpz=6&"
+                "gx=10&gy=2&gz=4&vx=0&vy=0&vz=0&ax=0&ay=0&az=0&yaw=0"
+                "&frame_id=f10&goal_id=g5&generation=6&include_preview=sometimes"
+            )
+            response = clients["combined"].post(
+                f"/yopo/plan_full?{query}",
+                data=jpeg_bytes(),
+                content_type="image/jpeg",
+            )
+            self.assertEqual(response.status_code, 400)
+            self.assertIn("include_preview", response.get_json()["error"])
+            self.assertEqual(combined_server.da360_runner.infer_calls, 0)
+            self.assertEqual(combined_server.yopo_runner.infer_calls, 0)
 
     def test_unaccepted_metric_candidate_is_explicitly_experimental_but_runs_yopo(self):
         with self.clients() as clients:

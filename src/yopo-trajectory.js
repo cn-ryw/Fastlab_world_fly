@@ -344,6 +344,11 @@ export class YopoTrajectoryTracker {
         this.polynomials = null;
         this.duration = 0;
         this.time = 0;
+        this.initialTime = 0;
+        this.maxSpeed = null;
+        this.maxAcceleration = null;
+        this.endpointState = null;
+        this.metadata = null;
         this.context = null;
         this.lastReference = null;
         this.lastReason = reason;
@@ -353,18 +358,54 @@ export class YopoTrajectoryTracker {
         return !!this.polynomials;
     }
 
-    install(endpoint, trajTime, startState, context = null) {
+    install(endpoint, trajTime, startState, context = null, options = {}) {
         const checked = validateYopoTrajectory(endpoint, trajTime, startState);
         if (!checked.valid) return checked;
+        const initialTimeS = options?.initialTimeS == null
+            ? 0
+            : Number(options.initialTimeS);
+        if (!Number.isFinite(initialTimeS) || initialTimeS < 0) {
+            return { valid: false, reason: 'trajectory initial time must be finite and non-negative' };
+        }
+        if (initialTimeS >= checked.trajTime - TRAJECTORY_TIME_EPSILON_S) {
+            return {
+                valid: false,
+                reason: `trajectory is already expired at age ${initialTimeS.toFixed(3)}s`,
+            };
+        }
         this.polynomials = checked.polynomials;
         this.duration = checked.trajTime;
-        this.time = 0;
+        // Keep the polynomial in its original capture-time domain and sample
+        // only its remaining suffix. Re-fitting or translating the endpoint at
+        // apply time changes the path the planner actually authorized.
+        this.time = initialTimeS;
+        this.initialTime = initialTimeS;
+        this.maxSpeed = checked.maxSpeed;
+        this.maxAcceleration = checked.maxAcceleration;
+        this.endpointState = Object.freeze({
+            x: checked.values[0], vx: checked.values[1], ax: checked.values[2],
+            y: checked.values[3], vy: checked.values[4], ay: checked.values[5],
+            z: checked.values[6], vz: checked.values[7], az: checked.values[8],
+        });
+        this.metadata = Object.freeze({
+            initialTimeS,
+            durationS: checked.trajTime,
+            remainingTimeS: checked.trajTime - initialTimeS,
+            maxSpeedMps: checked.maxSpeed,
+            maxAccelerationMps2: checked.maxAcceleration,
+            endpointState: this.endpointState,
+        });
         this.context = context && typeof context === 'object'
             ? Object.freeze({ ...context })
             : null;
-        this.lastReference = sample(this.polynomials, 0);
+        this.lastReference = sample(this.polynomials, initialTimeS);
         this.lastReason = 'installed';
-        return checked;
+        return {
+            ...checked,
+            initialTimeS,
+            remainingTimeS: checked.trajTime - initialTimeS,
+            reference: this.lastReference,
+        };
     }
 
     referenceAt(time) {
@@ -376,14 +417,19 @@ export class YopoTrajectoryTracker {
     advance(dt) {
         if (!this.polynomials) return { active: false, expired: false, reference: null };
         const nextTime = this.time + Math.max(0, Number(dt) || 0);
-        if (nextTime >= this.duration - TRAJECTORY_TIME_EPSILON_S) {
+        // The endpoint sample is inclusive. At 200 Hz a 50 ms trajectory has
+        // ten command intervals; expiring when the tenth advance lands exactly
+        // on T would replace that last Poly5 command with hold one step early.
+        // A material jump past T (for example after a paused/stale envelope)
+        // still expires immediately instead of replaying the endpoint.
+        if (nextTime > this.duration + TRAJECTORY_TIME_EPSILON_S) {
             const reference = this.referenceAt(this.duration);
             this.lastReference = reference;
             this.clear('expired');
             this.lastReference = reference;
             return { active: false, expired: true, reference };
         }
-        this.time = nextTime;
+        this.time = Math.min(nextTime, this.duration);
         const reference = this.referenceAt(this.time);
         this.lastReference = reference;
         return { active: true, expired: false, reference };

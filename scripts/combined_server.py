@@ -5,8 +5,9 @@ DA360:  (/health, /depth, /depth/raw)
 YOPO:   (/yopo/health, /yopo/plan, /yopo/plan_full)
 
 /yopo/plan_full accepts a JPEG image (same as DA360 /depth) plus pose/goal.
-It always returns DA360 depth; YOPO runs only when the selected depth mode is
-explicitly authorized for planning (a structurally validated metric calibration).
+It returns a DA360 preview by default; ``include_preview=0`` omits preview-only
+fields. YOPO runs only when the selected depth mode is explicitly authorized
+for planning (a structurally validated metric calibration).
 """
 
 import argparse
@@ -17,6 +18,7 @@ import os
 import sys
 import threading
 import time
+from collections import OrderedDict
 from pathlib import Path
 
 # ── Path setup ──────────────────────────────────────────────────────────
@@ -59,25 +61,58 @@ _depth_cache = {
     "data": None,
     "ts": 0,
     "frame_id": None,
+    "goal_id": None,
+    "generation": None,
     "depth_mode": None,
     "calibration_id": None,
+    "projection_config": None,
 }
 _depth_cache_lock = threading.Lock()
+_planning_preview_cache = OrderedDict()
+
+
+def _depth_cache_entry(pred_depth, request_metadata):
+    """Freeze one inference result and its provenance for cache publication."""
+    calibration = getattr(da360_runner, "calibration", None)
+    projection_config = request_metadata.get("projection_config")
+    return {
+        "data": np.asarray(pred_depth, dtype=np.float32).copy(),
+        "ts": time.monotonic(),
+        "frame_id": request_metadata.get("frame_id"),
+        "goal_id": request_metadata.get("goal_id"),
+        "generation": request_metadata.get("generation"),
+        "depth_mode": getattr(da360_runner, "depth_mode", "da360-relative"),
+        "calibration_id": calibration.get("id") if calibration else None,
+        "projection_config": (
+            dict(projection_config) if isinstance(projection_config, dict) else None
+        ),
+    }
 
 
 def _cache_depth(pred_depth, request_metadata):
-    """Cache the latest preview for the legacy two-stage planning endpoint."""
-    calibration = getattr(da360_runner, "calibration", None)
+    """Publish the latest depth for the legacy two-stage planning endpoint."""
+    entry = _depth_cache_entry(pred_depth, request_metadata)
     with _depth_cache_lock:
-        _depth_cache["data"] = np.asarray(pred_depth, dtype=np.float32).copy()
-        _depth_cache["ts"] = time.monotonic()
-        _depth_cache["frame_id"] = request_metadata.get("frame_id")
-        _depth_cache["depth_mode"] = getattr(
-            da360_runner, "depth_mode", "da360-relative"
-        )
-        _depth_cache["calibration_id"] = (
-            calibration.get("id") if calibration else None
-        )
+        _depth_cache.update(entry)
+    return entry
+
+
+def _cache_planning_depth(pred_depth, request_metadata, identity):
+    """Publish latest legacy depth plus an identity-keyed bounded preview LRU."""
+    metadata = {**request_metadata, **identity}
+    entry = _depth_cache_entry(pred_depth, metadata)
+    key = tuple(str(identity[field]) for field in (
+        "frame_id", "goal_id", "generation"
+    ))
+    max_entries = max(1, min(16, env_int("YOPO_PREVIEW_CACHE_ENTRIES", 4)))
+    with _depth_cache_lock:
+        # Preserve `/yopo/plan`'s historical latest-frame semantics.
+        _depth_cache.update(entry)
+        _planning_preview_cache[key] = entry
+        _planning_preview_cache.move_to_end(key)
+        while len(_planning_preview_cache) > max_entries:
+            _planning_preview_cache.popitem(last=False)
+    return key
 
 
 register_depth_routes(
@@ -178,6 +213,23 @@ def _finite_float(value, field):
     return parsed
 
 
+def _request_flag(name, *, default):
+    """Parse a compact query/header flag without changing legacy defaults."""
+    value = request.args.get(name)
+    if value is None:
+        value = request.headers.get(
+            "X-" + "-".join(part.capitalize() for part in name.split("_"))
+        )
+    if value is None:
+        return bool(default)
+    token = str(value).strip().lower()
+    if token in {"1", "true", "yes", "on"}:
+        return True
+    if token in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} must be 0 or 1")
+
+
 def _validate_yopo_result(endstate, score, traj_time, actual_position=None):
     endstate = np.asarray(endstate, dtype=np.float32).reshape(-1)
     if endstate.size != 9 or not np.all(np.isfinite(endstate)):
@@ -202,6 +254,82 @@ def _validate_yopo_result(endstate, score, traj_time, actual_position=None):
                 "YOPO_MAX_ENDPOINT_DISPLACEMENT", 100.0):
             raise RuntimeError("YOPO endpoint displacement exceeds the safety envelope")
     return endstate, score, traj_time
+
+
+def _compact_planning_diagnostics(
+        raw_diagnostics, endstate, score, traj_time, actual_position=None):
+    """Whitelist and JSON-normalize diagnostics for the selected candidate."""
+    if not isinstance(raw_diagnostics, dict):
+        raise RuntimeError("YOPO selected-candidate diagnostics are missing")
+    diagnostics = {"schema_version": 1}
+
+    selected_raw = raw_diagnostics.get("selected_endstate_raw")
+    if selected_raw is None:
+        raise RuntimeError("YOPO selected_endstate_raw diagnostics are missing")
+    selected_raw = np.asarray(selected_raw, dtype=np.float64).reshape(-1)
+    if selected_raw.size != 9 or not np.all(np.isfinite(selected_raw)):
+        raise RuntimeError("YOPO returned invalid selected_endstate_raw diagnostics")
+    if np.any(selected_raw < -1.000001) or np.any(selected_raw > 1.000001):
+        raise RuntimeError("YOPO selected_endstate_raw diagnostics exceed tanh range")
+    diagnostics["selected_endstate_raw"] = selected_raw.tolist()
+
+    id_fields = (
+        "selected_candidate_id", "selected_action_id",
+        "selected_lattice_id", "candidate_count",
+    )
+    for field in id_fields:
+        if field not in raw_diagnostics:
+            raise RuntimeError(f"YOPO {field} diagnostics are missing")
+        value = raw_diagnostics[field]
+        if isinstance(value, bool):
+            raise RuntimeError(f"YOPO returned invalid {field} diagnostics")
+        try:
+            value = int(value)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise RuntimeError(f"YOPO returned invalid {field} diagnostics") from exc
+        if value < 0 or value > 1_000_000:
+            raise RuntimeError(f"YOPO returned invalid {field} diagnostics")
+        diagnostics[field] = value
+    candidate_count = diagnostics["candidate_count"]
+    if candidate_count <= 0:
+        raise RuntimeError("YOPO returned invalid candidate_count diagnostics")
+    for field in ("selected_candidate_id", "selected_action_id", "selected_lattice_id"):
+        if diagnostics[field] >= candidate_count:
+            raise RuntimeError(f"YOPO returned out-of-range {field} diagnostics")
+    if diagnostics["selected_candidate_id"] != diagnostics["selected_action_id"]:
+        raise RuntimeError("YOPO candidate/action diagnostics disagree")
+    if diagnostics["selected_lattice_id"] != (
+            candidate_count - 1 - diagnostics["selected_action_id"]):
+        raise RuntimeError("YOPO action/lattice diagnostics disagree")
+
+    for field in ("velocity_scale_mps", "acceleration_scale_mps2"):
+        if field not in raw_diagnostics:
+            raise RuntimeError(f"YOPO {field} diagnostics are missing")
+        try:
+            value = _finite_float(raw_diagnostics[field], field)
+        except ValueError as exc:
+            raise RuntimeError(f"YOPO returned invalid {field} diagnostics") from exc
+        if value <= 0:
+            raise RuntimeError(f"YOPO returned invalid {field} diagnostics")
+        diagnostics[field] = value
+
+    # These values are derived from the already validated public endstate so
+    # diagnostics cannot disagree with the trajectory consumed by the browser.
+    endstate = np.asarray(endstate, dtype=np.float64).reshape(9)
+    diagnostics.update({
+        "selected_score": float(score),
+        "terminal_speed_mps": float(np.linalg.norm(endstate[[1, 4, 7]])),
+        "terminal_acceleration_mps2": float(
+            np.linalg.norm(endstate[[2, 5, 8]])
+        ),
+        "trajectory_time_s": float(traj_time),
+    })
+    if actual_position is not None:
+        actual_position = np.asarray(actual_position, dtype=np.float64).reshape(3)
+        diagnostics["endpoint_displacement_m"] = float(np.linalg.norm(
+            endstate[[0, 3, 6]] - actual_position
+        ))
+    return diagnostics
 
 
 def _response_identity(mapping=None, *, required=False):
@@ -354,9 +482,9 @@ def yopo_plan():
         return jsonify({"error": "YOPO planning failed"}), 500
 
 
-@app.route("/yopo/plan_full", methods=["POST", "OPTIONS"])
-def yopo_plan_full():
-    """Return depth and, only when authorized, a one-shot YOPO trajectory."""
+@app.route("/yopo/preview", methods=["GET", "OPTIONS"])
+def yopo_cached_preview():
+    """Colorize the exact cached planning depth outside the control response."""
     if request.method == "OPTIONS":
         return ("", 204)
     if da360_runner is None:
@@ -364,6 +492,84 @@ def yopo_plan_full():
     try:
         started = time.perf_counter()
         identity = _response_identity(required=True)
+        current_depth_mode = getattr(
+            da360_runner, "depth_mode", "da360-relative"
+        )
+        calibration = getattr(da360_runner, "calibration", None)
+        current_calibration_id = calibration.get("id") if calibration else None
+        cache_key = tuple(identity[field] for field in (
+            "frame_id", "goal_id", "generation"
+        ))
+        with _depth_cache_lock:
+            cache_entry = _planning_preview_cache.get(cache_key)
+            if cache_entry is None:
+                return jsonify({"error": "planning preview identity is not cached"}), 409
+            cache_age = time.monotonic() - cache_entry["ts"]
+            if cache_age > env_float("YOPO_PREVIEW_CACHE_MAX_AGE", 1.0):
+                del _planning_preview_cache[cache_key]
+                return jsonify({"error": "cached planning preview is stale"}), 409
+            if cache_entry["depth_mode"] != current_depth_mode:
+                return jsonify({"error": "cached depth mode mismatch"}), 409
+            if cache_entry["calibration_id"] != current_calibration_id:
+                return jsonify({"error": "cached depth calibration mismatch"}), 409
+            _planning_preview_cache.move_to_end(cache_key)
+            # Entries are immutable after publication; retaining this reference
+            # avoids a second multi-megabyte copy while N+1 updates latest.
+            pred_depth = cache_entry["data"]
+            projection_config = cache_entry["projection_config"] or {}
+
+        t0 = time.perf_counter()
+        polar_scan = depth_to_polar_scan(
+            pred_depth,
+            current_depth_mode,
+            vertical_fov_deg=projection_config.get("verticalFovDeg", 180.0),
+        )
+        t_polar = time.perf_counter()
+        colored, depth_scale = depth_to_color(pred_depth)
+        if current_depth_mode == "da360-metric":
+            depth_scale["unit"] = "metres"
+        depth_jpeg = encode_image(
+            colored, "jpeg", env_int("DA360_JPEG_QUALITY", 72)
+        )
+        completed = time.perf_counter()
+        payload = {
+            "api_version": API_VERSION,
+            "preview_included": True,
+            "preview_source": "planning-cache",
+            "depth_mode": current_depth_mode,
+            "calibration_id": current_calibration_id,
+            "depth_image": depth_jpeg,
+            "depth_scale": depth_scale,
+            "polar_scan": polar_scan,
+            "latency_ms": (completed - started) * 1000.0,
+            "timings_ms": {
+                "polar_ms": (t_polar - t0) * 1000.0,
+                "color_encode_ms": (completed - t_polar) * 1000.0,
+                "preview_ms": (completed - t0) * 1000.0,
+            },
+        }
+        payload.update(identity)
+        return jsonify(payload)
+    except (KeyError, TypeError, ValueError) as exc:
+        return jsonify({"error": str(exc)}), 400
+    except HTTPException:
+        raise
+    except Exception as exc:  # pylint: disable=broad-except
+        print(f"[YOPO preview] failed: {exc}", file=sys.stderr)
+        return jsonify({"error": "YOPO preview failed"}), 500
+
+
+@app.route("/yopo/plan_full", methods=["POST", "OPTIONS"])
+def yopo_plan_full():
+    """Return optional depth preview and an authorized one-shot trajectory."""
+    if request.method == "OPTIONS":
+        return ("", 204)
+    if da360_runner is None:
+        return jsonify({"error": "DA360 not initialized"}), 503
+    try:
+        started = time.perf_counter()
+        identity = _response_identity(required=True)
+        include_preview = _request_flag("include_preview", default=True)
 
         # Validate all state before spending GPU time on the image.
         def query_number(name, header):
@@ -396,27 +602,37 @@ def yopo_plan_full():
         t_decode = time.perf_counter()
         pred_depth = _infer_configured_depth(da360_runner, image, request_metadata)
         t1 = time.perf_counter()
+        _cache_planning_depth(pred_depth, request_metadata, identity)
 
-        # 生成小 JPEG 深度图供前端显示（原项目做法，~6KB，不塞 1.3MB depth_array）
-        polar_scan = depth_to_polar_scan(
-            pred_depth,
-            getattr(da360_runner, "depth_mode", "da360-relative"),
-            vertical_fov_deg=(
-                request_metadata.get("projection_config") or {}
-            ).get("verticalFovDeg", 180.0),
-        )
-        t_polar = time.perf_counter()
-        colored, depth_scale = depth_to_color(pred_depth)
-        if getattr(da360_runner, "depth_mode", "da360-relative") == "da360-metric":
-            depth_scale["unit"] = "metres"
-        depth_jpeg = encode_image(colored, "jpeg", env_int("DA360_JPEG_QUALITY", 72))
-        t_color = time.perf_counter()
+        # The planning path only needs pred_depth. Most frames can omit the UI
+        # preview and avoid polar reduction, colorization, JPEG/base64 work and
+        # their response bytes. Missing include_preview keeps the old contract.
+        polar_scan = depth_scale = depth_jpeg = None
+        t_polar = t1
+        t_color = t1
+        if include_preview:
+            polar_scan = depth_to_polar_scan(
+                pred_depth,
+                getattr(da360_runner, "depth_mode", "da360-relative"),
+                vertical_fov_deg=(
+                    request_metadata.get("projection_config") or {}
+                ).get("verticalFovDeg", 180.0),
+            )
+            t_polar = time.perf_counter()
+            colored, depth_scale = depth_to_color(pred_depth)
+            if getattr(da360_runner, "depth_mode", "da360-relative") == "da360-metric":
+                depth_scale["unit"] = "metres"
+            depth_jpeg = encode_image(
+                colored, "jpeg", env_int("DA360_JPEG_QUALITY", 72)
+            )
+            t_color = time.perf_counter()
 
         # 2. Only structurally validated metric depth may authorize a trajectory.
         # Relative DA360 remains useful as a live preview, but scale-normalized
         # depth must never be silently fed to a metric-trained YOPO policy.
         planning_authorized, planning_reason = _planning_authorization()
         endstate = score = traj_time = None
+        raw_planning_diagnostics = None
         if planning_authorized:
             with yopo_runner.lock:
                 endstate, score, traj_time = yopo_runner.infer(
@@ -430,16 +646,28 @@ def yopo_plan_full():
                     goal=np.array([goal_x, goal_y, goal_z], dtype=np.float32),
                     yaw=drone_yaw,
                 )
+                raw_planning_diagnostics = getattr(
+                    yopo_runner, "last_plan_diagnostics", None
+                )
+                if isinstance(raw_planning_diagnostics, dict):
+                    raw_planning_diagnostics = dict(raw_planning_diagnostics)
             endstate, score, traj_time = _validate_yopo_result(
                 endstate, score, traj_time, [pose_x, pose_y, pose_z]
+            )
+            planning_diagnostics = _compact_planning_diagnostics(
+                raw_planning_diagnostics,
+                endstate,
+                score,
+                traj_time,
+                [pose_x, pose_y, pose_z],
             )
         t2 = time.perf_counter()
         calibration = getattr(da360_runner, "calibration", None)
         resp_payload = {
             "api_version": API_VERSION,
-            "depth_image": depth_jpeg,
-            "depth_scale": depth_scale,
-            "polar_scan": polar_scan,
+            "preview_included": include_preview,
+            "preview_available": True,
+            "preview_endpoint": "/yopo/preview",
             "depth_mode": getattr(da360_runner, "depth_mode", "da360-relative"),
             "calibration_id": calibration.get("id") if calibration else None,
             "calibration_accuracy_accepted": calibration.get("accuracy_accepted")
@@ -460,6 +688,7 @@ def yopo_plan_full():
                 "da360_ms": (t1 - t_decode) * 1000.0,
                 "polar_ms": (t_polar - t1) * 1000.0,
                 "color_encode_ms": (t_color - t_polar) * 1000.0,
+                "preview_ms": (t_color - t1) * 1000.0,
                 "yopo_ms": (t2 - t_color) * 1000.0,
             },
             "planning_origin": {
@@ -472,6 +701,13 @@ def yopo_plan_full():
                 "endstate": endstate.tolist(),
                 "score": float(score),
                 "traj_time": traj_time,
+                "planning_diagnostics": planning_diagnostics,
+            })
+        if include_preview:
+            resp_payload.update({
+                "depth_image": depth_jpeg,
+                "depth_scale": depth_scale,
+                "polar_scan": polar_scan,
             })
         resp_payload.update(identity)
         resp = jsonify(resp_payload)
@@ -482,6 +718,7 @@ def yopo_plan_full():
             f"polar={1000*(t_polar-t1):.1f}ms "
             f"color+jpeg={1000*(t_color-t_polar):.0f}ms "
             f"yopo={1000*(t2-t_color):.0f}ms "
+            f"preview={include_preview} "
             f"authorized={planning_authorized} reason={planning_reason} "
             f"json={1000*(t3-t2):.0f}ms total={1000*(t3-started):.0f}ms",
             flush=True,

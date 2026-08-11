@@ -1,4 +1,4 @@
-/** Six-face capture yields after every two faces and honors AbortSignal. */
+/** Six-face capture yields between configurable face slices and honors AbortSignal. */
 let yieldCount = 0;
 globalThis.window = {
     location: { search: '', hostname: '127.0.0.1' },
@@ -276,8 +276,9 @@ for (const [facesPerSlice, expectedYields] of [[2, 2], [3, 1], [6, 0]]) {
     if (!flightOptions.captureAnyway
         || flightOptions.frameDelayMs !== 0
         || flightOptions.tileTimeoutMs !== 0
-        || flightOptions.tileQuietMs !== 0) {
-        throw new Error('flight profile must force a zero-wait capture');
+        || flightOptions.tileQuietMs !== 0
+        || flightOptions.facesPerSlice !== 3) {
+        throw new Error('flight profile must force zero-wait capture with the 3-face A/B default');
     }
     const flightPreloadOptions = flightSensor.getCaptureOptions({ preload: true });
     if (flightPreloadOptions.captureAnyway

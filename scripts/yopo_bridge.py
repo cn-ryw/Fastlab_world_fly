@@ -194,6 +194,11 @@ class YopoRunner:
         self.model_path = model_path
         self.device = device
 
+        # Match the authoritative ROS inference contract before YopoNetwork
+        # constructs StateTransform/LatticePrimitive.  In training mode the
+        # primitive silently ignores cfg["velocity"] and always uses the
+        # training scales, which is incorrect for runtime profiles.
+        cfg["train"] = False
         self.net = _load_model(model_path, device)
         actual_checkpoint_sha256 = _sha256_file(model_path)
         expected_checkpoint_sha256 = os.environ.get("YOPO_MODEL_SHA256", "").strip().lower()
@@ -255,10 +260,13 @@ class YopoRunner:
         self.min_dis = cfg["depth_min_m"]
         self.mask_valid_threshold = cfg["depth_mask_threshold"]
         self.fixed_height = cfg["fixed_height"]
-        self.traj_time = 2 * cfg["radio_range"] / cfg["vel_max_train"]
         self.Rotation_bc = R.from_euler("z", 0, degrees=True).as_matrix()  # identity
 
         self.state_transform = StateTransform()
+        self.traj_time = float(
+            self.state_transform.lattice_primitive.segment_time
+        )
+        self.last_plan_diagnostics = None
         self._warmup()
 
     def _warmup(self):
@@ -285,6 +293,10 @@ class YopoRunner:
         score    : float
         traj_time : float
         """
+        # Never let a failed inference expose diagnostics from the previous
+        # request to a caller that snapshots this field under the runner lock.
+        self.last_plan_diagnostics = None
+
         # 1. preprocess depth
         if depth_arr.shape[0] != self.height or depth_arr.shape[1] != self.width:
             import cv2
@@ -393,6 +405,49 @@ class YopoRunner:
             yopo_result[6], yopo_result[7], yopo_result[8],  # py, vy, ay = YOPO z → sim y
             yopo_result[3], yopo_result[4], yopo_result[5],  # pz, vz, az = YOPO y → sim z
         ], dtype=np.float32)
+
+        # Compact, selected-candidate-only metadata. ``selected_endstate_raw``
+        # is the nine-value normalized network output before lattice decoding:
+        # [yaw_offset, pitch_offset, radial, vpx, vpy, vpz, apx, apy, apz].
+        # NumPy scalars/arrays are converted here so the HTTP layer never has
+        # to serialize framework-specific values or all candidate tensors.
+        selected_endstate_raw = np.asarray(
+            endstate_flat[action_id], dtype=np.float64
+        ).reshape(9)
+        terminal_velocity = result[[1, 4, 7]].astype(np.float64)
+        terminal_acceleration = result[[2, 5, 8]].astype(np.float64)
+        endpoint_displacement = (
+            result[[0, 3, 6]].astype(np.float64)
+            - np.asarray(pos, dtype=np.float64).reshape(3)
+        )
+        diagnostic_values = np.concatenate([
+            selected_endstate_raw,
+            terminal_velocity,
+            terminal_acceleration,
+            endpoint_displacement,
+            np.array([score, self.traj_time], dtype=np.float64),
+        ])
+        if not np.all(np.isfinite(diagnostic_values)):
+            raise RuntimeError("YOPO selected candidate diagnostics are non-finite")
+        primitive = self.state_transform.lattice_primitive
+        self.last_plan_diagnostics = {
+            "selected_endstate_raw": selected_endstate_raw.tolist(),
+            "selected_candidate_id": int(action_id),
+            "selected_action_id": int(action_id),
+            "selected_lattice_id": int(lattice_id),
+            "selected_score": float(score),
+            "terminal_speed_mps": float(np.linalg.norm(terminal_velocity)),
+            "terminal_acceleration_mps2": float(
+                np.linalg.norm(terminal_acceleration)
+            ),
+            "endpoint_displacement_m": float(
+                np.linalg.norm(endpoint_displacement)
+            ),
+            "trajectory_time_s": float(self.traj_time),
+            "candidate_count": int(traj_num),
+            "velocity_scale_mps": float(primitive.vel_max),
+            "acceleration_scale_mps2": float(primitive.acc_max),
+        }
 
         return result, score, self.traj_time
 

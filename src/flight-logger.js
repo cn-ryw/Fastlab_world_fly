@@ -107,6 +107,107 @@ function sanitizeResolvedUrl(value) {
     }
 }
 
+function roundedFinite(value, digits = 4) {
+    if (
+        value === null
+        || value === undefined
+        || (typeof value === 'string' && value.trim() === '')
+    ) return null;
+    const number = Number(value);
+    if (!Number.isFinite(number)) return null;
+    const scale = 10 ** digits;
+    return Math.round(number * scale) / scale;
+}
+
+function nonNegativeSafeIntegerOrNull(value) {
+    if (
+        value === null
+        || value === undefined
+        || (typeof value === 'string' && value.trim() === '')
+    ) return null;
+    const number = Number(value);
+    return Number.isSafeInteger(number) && number >= 0 ? number : null;
+}
+
+function diagnosticVector(vector) {
+    if (!vector || typeof vector !== 'object') return null;
+    return {
+        x: roundedFinite(vector.x),
+        y: roundedFinite(vector.y),
+        z: roundedFinite(vector.z),
+    };
+}
+
+function compactControlDiagnostics(drone) {
+    if (!drone || typeof drone.getControlDiagnostics !== 'function') return null;
+    let diagnostics;
+    try {
+        diagnostics = drone.getControlDiagnostics();
+    } catch {
+        return null;
+    }
+    if (!diagnostics || typeof diagnostics !== 'object') return null;
+    const reference = diagnostics.referenceState;
+    return {
+        commandType: diagnostics.commandType ?? null,
+        source: diagnostics.source ?? null,
+        frame: diagnostics.frame ?? 'sim-world-y-up',
+        generation: diagnostics.generation ?? null,
+        planningFrameId: diagnostics.planningFrameId ?? null,
+        planningRequestId: diagnostics.planningRequestId ?? null,
+        selectedCandidateId: diagnostics.selectedCandidateId ?? null,
+        terminalPhase: diagnostics.terminalPhase ?? null,
+        fallbackReason: diagnostics.fallbackReason ?? null,
+        referencePosition: reference ? diagnosticVector(reference.position || reference) : null,
+        referenceVelocity: reference ? diagnosticVector({
+            x: reference.velocity?.x ?? reference.vx,
+            y: reference.velocity?.y ?? reference.vy,
+            z: reference.velocity?.z ?? reference.vz,
+        }) : null,
+        referenceAcceleration: reference ? diagnosticVector({
+            x: reference.acceleration?.x ?? reference.ax,
+            y: reference.acceleration?.y ?? reference.ay,
+            z: reference.acceleration?.z ?? reference.az,
+        }) : null,
+        rawAcceleration: diagnosticVector(diagnostics.rawAcceleration),
+        limitedAcceleration: diagnosticVector(diagnostics.limitedAcceleration),
+        requestedForce: diagnosticVector(diagnostics.requestedForce),
+        allocatedForce: diagnosticVector(diagnostics.allocatedForce),
+        projectionRatio: roundedFinite(diagnostics.projectionRatio),
+        tiltDeg: roundedFinite(diagnostics.tiltDeg, 3),
+        thrustGf: roundedFinite(diagnostics.thrustGf, 2),
+        saturation: diagnostics.saturation ? {
+            horizontal: diagnostics.saturation.horizontal === true,
+            vertical: diagnostics.saturation.vertical === true,
+            direct: diagnostics.saturation.direct === true,
+        } : null,
+        antiWindup: diagnostics.antiWindup ? {
+            horizontal: diagnostics.antiWindup.horizontal === true,
+            vertical: diagnostics.antiWindup.vertical === true,
+        } : null,
+        trajectoryAgeS: roundedFinite(diagnostics.trajectoryAgeS),
+        trajectoryOriginalAgeS: roundedFinite(diagnostics.trajectoryOriginalAgeS),
+        trajectoryRemainingS: roundedFinite(diagnostics.trajectoryRemainingS),
+        trajectoryApplyPositionErrorM: roundedFinite(
+            diagnostics.trajectoryApplyPositionErrorM,
+        ),
+        trajectoryApplyVelocityErrorMps: roundedFinite(
+            diagnostics.trajectoryApplyVelocityErrorMps,
+        ),
+        poly5PeakSpeedMps: roundedFinite(diagnostics.poly5PeakSpeedMps),
+        poly5PeakAccelerationMps2: roundedFinite(
+            diagnostics.poly5PeakAccelerationMps2,
+        ),
+        trajectoryEndpointGoalDistanceM: roundedFinite(
+            diagnostics.trajectoryEndpointGoalDistanceM,
+        ),
+        terminalTrajectoryEligible: diagnostics.terminalTrajectoryEligible === true,
+        terminalSettledTimeS: roundedFinite(diagnostics.terminalSettledTimeS),
+        overrunCount: nonNegativeSafeIntegerOrNull(diagnostics.overrunCount),
+        overrunDroppedSeconds: roundedFinite(diagnostics.overrunDroppedSeconds, 6),
+    };
+}
+
 export class FlightLogger {
     constructor() {
         this._recording = false;
@@ -125,6 +226,7 @@ export class FlightLogger {
         this._planningApplyTimes = [];
         this._appliedPlanningFrames = new Set();
         this._dropReasons = {};
+        this._dropReasonsByMode = {};
         this._physicsUpdateIntervals = [];
         this._lastPhysicsUpdateAt = null;
         this._navigationIdentity = null;
@@ -148,6 +250,7 @@ export class FlightLogger {
         this._planningApplyTimes = [];
         this._appliedPlanningFrames = new Set();
         this._dropReasons = {};
+        this._dropReasonsByMode = {};
         this._physicsUpdateIntervals = [];
         this._lastPhysicsUpdateAt = null;
         this._navigationIdentity = navigation?.goalId != null
@@ -161,7 +264,7 @@ export class FlightLogger {
         console.log('[FlightLog] recording started, goal:', goal);
     }
 
-    /** 记录一次 DA360 深度推理的性能指标 */
+    /** 记录一次已返回给 UI 的深度预览延迟；规划吞吐以 uniquePlanningHz 为准。 */
     recordDepth(latencyMs) {
         if (!this._recording) return;
         this._depthCount++;
@@ -204,6 +307,11 @@ export class FlightLogger {
                 || item.outcome
                 || 'unknown';
             this._dropReasons[reason] = (this._dropReasons[reason] || 0) + 1;
+            const mode = String(item.mode || 'unknown');
+            if (!this._dropReasonsByMode[mode]) this._dropReasonsByMode[mode] = {};
+            this._dropReasonsByMode[mode][reason] = (
+                this._dropReasonsByMode[mode][reason] || 0
+            ) + 1;
             return;
         }
         if (item.mode === 'planning') {
@@ -217,7 +325,7 @@ export class FlightLogger {
     }
 
     /** Record one frame. Call from updateFlight(). */
-    record(drone, refX, refY, refZ) {
+    record(drone, refX, refY, refZ, schedule = null) {
         if (!this._recording || !drone) return;
         const now = performance.now();
         const t = (now - this._startTime) / 1000;
@@ -225,6 +333,7 @@ export class FlightLogger {
             this._physicsUpdateIntervals.push(now - this._lastPhysicsUpdateAt);
         }
         this._lastPhysicsUpdateAt = now;
+        const control = compactControlDiagnostics(drone);
         this._frames.push({
             recordedAtMs: now,
             t: Math.round(t * 1000) / 1000,
@@ -246,6 +355,17 @@ export class FlightLogger {
             thrust:     Math.round(drone.thrustOutput || 0),
             groundSpeed: Math.round((drone.groundSpeed || 0) * 100) / 100,
             mode: drone.flightMode || '',
+            control,
+            scheduler: schedule ? {
+                steps: Number(schedule.steps) || 0,
+                frameSeconds: roundedFinite(schedule.frameSeconds, 6),
+                simulatedThisFrameSeconds: roundedFinite(
+                    schedule.simulatedThisFrameSeconds,
+                    6,
+                ),
+                droppedSeconds: roundedFinite(schedule.droppedSeconds, 6),
+                totalDroppedSeconds: roundedFinite(schedule.totalDroppedSeconds, 6),
+            } : null,
         });
         // YOPO 轨迹跟踪帧计数
         if (drone._yopoPolyX) this._yopoTrackerCount++;
@@ -296,9 +416,48 @@ export class FlightLogger {
         const rgbTileErrorPlanningFrames = uniqueAuthorizedPlanningMetrics.filter(
             item => item.rgbTileError === true || item.rgbReadinessReason === 'tile-error'
         ).length;
-        const metricValues = key => authorizedPlanningMetrics
-            .map(item => Number(item[key]))
+        const finiteValues = (items, key) => items
+            .map(item => item?.[key])
+            .filter(value => value !== null && value !== undefined && value !== '')
+            .map(Number)
             .filter(Number.isFinite);
+        const metricValues = key => finiteValues(authorizedPlanningMetrics, key);
+        const committedDepthPreviewMetrics = this._perceptionMetrics.filter(item => (
+            item.mode === 'depth-preview'
+            && item.outcome === 'applied'
+            && item.depthPreviewCommitted === true
+        ));
+        const previewMetricValues = key => finiteValues(committedDepthPreviewMetrics, key);
+        const controlFrames = this._frames
+            .map(frame => frame.control)
+            .filter(control => control && typeof control === 'object');
+        const controlMetricValues = key => finiteValues(controlFrames, key);
+        const maxOrNull = values => values.length > 0
+            ? values.reduce((maximum, value) => Math.max(maximum, value), -Infinity)
+            : null;
+        const terminalPhaseCounts = {};
+        for (const control of controlFrames) {
+            const phase = String(control.terminalPhase || 'unknown');
+            terminalPhaseCounts[phase] = (terminalPhaseCounts[phase] || 0) + 1;
+        }
+        const directSaturationFrames = controlFrames.filter(
+            control => control.saturation?.direct === true
+        ).length;
+        const horizontalSaturationFrames = controlFrames.filter(
+            control => control.saturation?.horizontal === true
+        ).length;
+        const verticalSaturationFrames = controlFrames.filter(
+            control => control.saturation?.vertical === true
+        ).length;
+        const horizontalArwFrames = controlFrames.filter(
+            control => control.antiWindup?.horizontal === true
+        ).length;
+        const verticalArwFrames = controlFrames.filter(
+            control => control.antiWindup?.vertical === true
+        ).length;
+        const schedulerFrames = this._frames
+            .map(frame => frame.scheduler)
+            .filter(schedule => schedule && typeof schedule === 'object');
         const planningIntervals = this._planningApplyTimes.slice(1).map(
             (time, index) => time - this._planningApplyTimes[index]
         );
@@ -323,6 +482,10 @@ export class FlightLogger {
             duration_s: Math.round(duration * 100) / 100,
             arrived,
             perf: {
+                depthPreviewHz: Math.round(this._depthCount / duration * 10) / 10,
+                depthPreviewCount: this._depthCount,
+                depthPreviewLatencyAvgMs: avgDepthLatency,
+                // Compatibility aliases retained for existing log readers.
                 depthHz: Math.round(this._depthCount / duration * 10) / 10,
                 depthCount: this._depthCount,
                 depthLatencyAvgMs: avgDepthLatency,
@@ -342,7 +505,17 @@ export class FlightLogger {
                     : null,
                 planningIntervalP95Ms: percentile(planningIntervals, 0.95),
                 captureToApplyP95Ms: percentile(metricValues('captureToApplyMs'), 0.95),
+                captureToApplyDisplacementP95M: percentile(
+                    metricValues('captureToApplyDisplacementM'),
+                    0.95,
+                ),
                 frameAgeP95Ms: percentile(metricValues('frameAgeMs'), 0.95),
+                ageAtFetchStartP95Ms: percentile(metricValues('ageAtFetchStartMs'), 0.95),
+                ageAtResponseHeadersP95Ms: percentile(
+                    metricValues('ageAtResponseHeadersMs'),
+                    0.95,
+                ),
+                ageAtJsonParsedP95Ms: percentile(metricValues('ageAtJsonParsedMs'), 0.95),
                 captureP95Ms: percentile(metricValues('captureMs'), 0.95),
                 renderP95Ms: percentile(metricValues('renderMs'), 0.95),
                 sceneRenderP95Ms: percentile(metricValues('sceneRenderMs'), 0.95),
@@ -352,13 +525,70 @@ export class FlightLogger {
                 projectP95Ms: percentile(metricValues('projectMs'), 0.95),
                 jpegP95Ms: percentile(metricValues('jpegMs'), 0.95),
                 networkP95Ms: percentile(metricValues('networkMs'), 0.95),
+                responseBytesP95: percentile(metricValues('responseBytes'), 0.95),
+                requestGateHoldP95Ms: percentile(metricValues('gateWaitMs'), 0.95),
                 serverP95Ms: percentile(metricValues('serverMs'), 0.95),
                 da360P95Ms: percentile(metricValues('da360Ms'), 0.95),
                 yopoP95Ms: percentile(metricValues('yopoMs'), 0.95),
                 applyP95Ms: percentile(metricValues('applyMs'), 0.95),
+                depthDecodeP95Ms: percentile(previewMetricValues('depthDecodeMs'), 0.95),
+                depthDrawP95Ms: percentile(previewMetricValues('depthDrawMs'), 0.95),
+                selectedTerminalSpeedP95Mps: percentile(
+                    metricValues('terminalSpeedMps'),
+                    0.95,
+                ),
+                selectedTerminalAccelerationP95Mps2: percentile(
+                    metricValues('terminalAccelerationMps2'),
+                    0.95,
+                ),
+                selectedEndpointDisplacementP95M: percentile(
+                    metricValues('endpointDisplacementM'),
+                    0.95,
+                ),
+                controlDirectSaturationPercent: controlFrames.length > 0
+                    ? Math.round(directSaturationFrames / controlFrames.length * 1000) / 10
+                    : null,
+                controlHorizontalSaturationPercent: controlFrames.length > 0
+                    ? Math.round(horizontalSaturationFrames / controlFrames.length * 1000) / 10
+                    : null,
+                controlVerticalSaturationPercent: controlFrames.length > 0
+                    ? Math.round(verticalSaturationFrames / controlFrames.length * 1000) / 10
+                    : null,
+                controlHorizontalArwPercent: controlFrames.length > 0
+                    ? Math.round(horizontalArwFrames / controlFrames.length * 1000) / 10
+                    : null,
+                controlVerticalArwPercent: controlFrames.length > 0
+                    ? Math.round(verticalArwFrames / controlFrames.length * 1000) / 10
+                    : null,
+                controlProjectionRatioP05: percentile(
+                    controlMetricValues('projectionRatio'),
+                    0.05,
+                ),
+                poly5PeakAccelerationMaxMps2: maxOrNull(controlMetricValues(
+                    'poly5PeakAccelerationMps2'
+                )),
+                poly5PeakSpeedMaxMps: maxOrNull(controlMetricValues('poly5PeakSpeedMps')),
+                trajectoryApplyPositionErrorP95M: percentile(
+                    controlMetricValues('trajectoryApplyPositionErrorM'),
+                    0.95,
+                ),
+                trajectoryApplyVelocityErrorP95Mps: percentile(
+                    controlMetricValues('trajectoryApplyVelocityErrorMps'),
+                    0.95,
+                ),
+                controlOverrunCountMax: maxOrNull(controlMetricValues('overrunCount')),
+                controlOverrunDroppedSecondsMax: maxOrNull(controlMetricValues(
+                    'overrunDroppedSeconds'
+                )),
+                schedulerTotalDroppedSecondsMax: maxOrNull(finiteValues(
+                    schedulerFrames,
+                    'totalDroppedSeconds',
+                )),
+                terminalPhaseCounts,
                 physicsUpdateIntervalP95Ms: percentile(this._physicsUpdateIntervals, 0.95),
                 flightLoopIntervalP95Ms: percentile(this._physicsUpdateIntervals, 0.95),
                 droppedByReason: this._dropReasons,
+                droppedByModeReason: this._dropReasonsByMode,
                 crossSessionPerceptionDropped: this._crossSessionPerceptionDropped,
                 calibrationIds,
             },

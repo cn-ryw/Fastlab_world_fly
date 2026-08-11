@@ -12,11 +12,13 @@ const planning = normalizePlanningState({
         acceleration: { x: 0.1, y: 0.2, z: 0.3 },
     },
     yaw: 12,
+    simTimeS: 4.25,
 });
 
 const frame = new PerceptionFrame({
     frameId: 7,
     capturedAt: 123.5,
+    captureSimTimeS: planning.simTimeS,
     transform: {
         position: { x: 0, y: 2, z: -1 },
         rotation: { x: 0, y: 12, z: 0 },
@@ -44,6 +46,7 @@ assert.deepEqual(observation.referencePosition, { x: 10, y: 20, z: 30 }, 'goal d
 assert.deepEqual(observation.velocity, { x: 4, y: 5, z: 6 }, 'observation keeps actual velocity');
 assert.deepEqual(observation.acceleration, { x: 0.1, y: 0.2, z: 0.3 }, 'observation uses reference acceleration');
 assert.equal(frame.captureProfile, 'calibration', 'capture profile is frozen with RGB provenance');
+assert.equal(frame.captureSimTimeS, 4.25, 'capture simulation time is frozen with RGB provenance');
 assert.equal(frame.rgbTilesReady, false);
 assert.equal(frame.rgbReadyFaces, 2);
 assert.equal(frame.rgbTotalFaces, 6);
@@ -62,5 +65,12 @@ assert.throws(() => new PerceptionFrame({
 
 const legacy = normalizePlanningState({ x: 1, y: 2, z: 3, vx: 4, vy: 5, vz: 6 }, 20);
 assert.deepEqual(legacy.referenceState.position, { x: 1, y: 2, z: 3 }, 'legacy flat pose remains compatible');
+assert.equal(legacy.simTimeS, null, 'legacy state without a simulation clock remains compatible');
+
+assert.throws(() => normalizePlanningState({
+    actualState: planning.actualState,
+    referenceState: planning.referenceState,
+    simTimeS: Number.NaN,
+}, 0), /simTimeS/, 'non-finite simulation time is rejected');
 
 console.log('\nPerceptionFrame contract: all passed');

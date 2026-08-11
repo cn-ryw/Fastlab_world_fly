@@ -67,6 +67,8 @@ third_party/DA360/checkpoints/DA360_large.pth
 5. SO3 模式下按住 `G` 点击场景或雷达设置目标；`G`+滚轮修改目标高度；`C` 取消。
 
 到达阈值为 **4.0m**，来自权威 YOPO `traj_opt.yaml`。`radio_range` 不是到达距离。
+终端候选不会被目标点直线环截断，而是沿原 Poly5 执行到底；随后须在无碰撞条件下将三维速度降到
+0.75m/s以内并连续稳定0.4s，才报告 arrived。
 
 ## DA360 深度状态
 
@@ -95,10 +97,11 @@ combined 服务与 standalone DA360 服务共享 API v2 深度契约：
 | `POST /depth` | JPEG → 深度预览 JPEG 与轻量 metadata |
 | `POST /depth/raw` | JPEG → raw `pred_disp`、相对深度、valid mask 和 metadata 的 NPZ |
 | `GET /yopo/health` | YOPO 模型、配置和 checkpoint 指纹 |
-| `POST /yopo/plan_full` | JPEG + 完整状态 → 深度 JPEG 和 identity；仅授权模式返回 YOPO endstate |
+| `POST /yopo/plan_full` | JPEG + 完整状态 → identity 与 YOPO endstate；兼容调用可用 `include_preview=1` 附带深度预览，飞行链固定使用 `0` |
+| `GET /yopo/preview` | 按 frame/goal/generation 读取最近 4 个规划帧之一的缓存深度预览，不重复运行 DA360 |
 | `POST /yopo/plan` | 兼容/离线调试路径；relative 模式返回 409，不能绕过授权 |
 
-`/yopo/plan_full` 使用 `frame_id/goal_id/generation` 防止旧响应覆盖新会话。前端 `PerceptionFrame` 将 RGB、采集 transform、实际状态、参考状态、yaw、capture profile 和投影配置绑定为不可变快照，避免把旧 RGB 与新位姿配对。所有 JPEG 深度请求还会用 `X-Projection-Config` 发送该帧的 ERP、上传尺寸和 JPEG 指纹；metric 模式在 GPU 推理前逐字段与 accepted calibration 核对。
+`/yopo/plan_full` 使用 `frame_id/goal_id/generation` 防止旧响应覆盖新会话。前端 `PerceptionFrame` 将 RGB、采集 transform、模拟时钟、实际状态、参考状态、yaw、capture profile 和投影配置绑定为不可变快照，避免把旧 RGB 与新位姿配对。回包后按捕获时域 fast-forward 原 Poly5；安装年龄不得超过 `min(0.25s, 0.25T)`，应用状态相对 suffix 参考的位置/速度误差分别不得超过 1.2m/3m/s。规划响应保留兼容的顶层 `endstate/score/traj_time`，并附带 `planning_diagnostics.schema_version=1` 的选中候选诊断。顶层 `endstate` 才是 sim Y-up 世界系轴主序 `[px,vx,ax, py,vy,ay, pz,vz,az]`；`selected_endstate_raw` 是网络 tanh 后、lattice 解码前的9个无量纲系数，不是物理endstate。candidate ID 等同 CNN flatten action ID，lattice ID 是反序格点 ID，score 是越低越优的组合代价而非置信度；`terminal_speed_mps` 是三维速度模长。所有 JPEG 深度请求还会用 `X-Projection-Config` 发送该帧的 ERP、上传尺寸和 JPEG 指纹；metric 模式在 GPU 推理前逐字段与 accepted calibration 核对。
 
 ## 当前默认值
 
@@ -109,17 +112,17 @@ combined 服务与 standalone DA360 服务共享 API v2 深度契约：
 | `panoProfile` | `flight` |
 | ERP 输出 | 384×192 |
 | `panoFace` | 96 |
-| `panoFacesPerSlice` | 2 |
+| `panoFacesPerSlice` | 3 |
 | `panoMs` | 20ms |
 | `depthMs` | 20ms |
-| `yopoMaxFrameAgeMs` | 250ms（轨迹应用硬上限） |
+| `yopoMaxFrameAgeMs` | 250ms（冻结帧绝对硬上限；单段还限制为不超过 25% 时域） |
 | `panoFrameDelayMs` | 0ms |
 | `da360UploadScale` | 0.35 |
 | `DA360_INPUT_SCALE` | 0.46（约 476×238） |
 | `DA360_RESAMPLE` | bicubic |
 | `DA360_CHANNELS_LAST` | 0 |
 | `DA360_DEPTH_MODE` | da360-metric（`start-all.sh` 默认） |
-| 到达距离 | 4.0m |
+| 到达条件 | 合格终端 Poly5 完整执行后，≤4.0m、无碰撞、三维速度≤0.75m/s并持续0.4s |
 | 碰撞半径 | 0.6m |
 
 URL 参数示例：
@@ -260,7 +263,7 @@ evaluator v2 会先丢弃 30 个合法唯一 planning frames，再要求至少 6
 
 物理时间戳还必须覆盖至少 95% 的 planning 计量窗口，并满足最小帧数 `ceil(measurementDurationMs × 0.95 / 33.3ms) + 1`；窗口恰为 60s 时至少需要 1713 个 physics frames，不能用首尾两个时间戳伪造 p95。`da360-relative`、只收到服务响应、重复帧、矛盾回执、session 越界或指纹漂移都会 fail closed；因此当前 relative 模式不可能被误报成 15Hz 通过。
 
-六面 capture 仍是六次 Cesium scene render，并按 `panoFacesPerSlice=2` 向浏览器调度器 yield；projector texture 在尺寸不变时改用 `texSubImage2D` 复用。timing 现拆为 `scene_render`、`tile_wait`、`wait_rerender`、`face_upload`、`project`、`scheduler`、HTTP body/header、DA360、YOPO 和 trajectory/depth apply。它们只提供归因证据，不证明吞吐达标。2026-08-09 修复前日志只有约 3.1Hz depth、2.9Hz YOPO；当前已加载人工批准的 sim-to-sim metric 标定，但尚未在真实 Firefox+GPU+城市 tiles 上证明 15Hz 或完成低空闭环验收。
+六面 capture 仍是六次 Cesium scene render，默认按 `panoFacesPerSlice=3` 分成两批，保留一个浏览器调度边界；URL 可显式改回 2 做 A/B。projector texture 在尺寸不变时改用 `texSubImage2D` 复用。飞行期 planning 固定 `include_preview=0`，轨迹安装后立即释放 request gate；操作员深度图约每 2s 从按 frame/goal/generation 索引的 4 帧 LRU 读取，后台 latest-only 合并且不重复运行 DA360。2s 周期用于降低单线程服务中 CPU 着色/JPEG 对规划 p95 的影响，不是控制门禁。timing 现拆为 capture/render/scheduler、fetch/header/json、response bytes、DA360、YOPO、trajectory apply、preview fetch/decode/draw 和 gate hold。它们只提供归因证据，不证明吞吐达标；当前代码仍须用真实 Firefox+GPU+城市 tiles 重新验证 15Hz 与 150ms 门槛。
 
 流水化不会再因 RGB N+1 先完成就丢弃仍新鲜的规划响应 N：轨迹应用只核对 goal/generation/mode 和 250ms 硬龄限；canvas 则按递增 request ID 显示最新可用 depth。因此画面允许比当前 RGB 落后一帧，日志用 `depthPreviewLagFrames/depthPreviewAgeMs` 明示，而旧会话或已被更新 depth 超越的结果仍 fail closed。规划 control outcome 在 JPEG 解码前同步记录且每请求唯一；随后画面成功、失败或 stale 只产生 `mode=depth-preview` diagnostic，不进入 15Hz 规划计数。
 
@@ -268,7 +271,7 @@ evaluator v2 会先丢弃 30 个合法唯一 planning frames，再要求至少 6
 
 ```bash
 ./launch-firefox-gpu.sh \
-'http://127.0.0.1:8080/?panoProfile=flight&panoPreloadRequired=0&panoWidth=384&panoHeight=192&panoFace=96&panoFacesPerSlice=2&panoVfov=180&panoJpeg=0.74&da360UploadScale=0.35&panoMs=20&depthMs=20&panoramaTileSse=512'
+'http://127.0.0.1:8080/?panoProfile=flight&panoPreloadRequired=0&panoWidth=384&panoHeight=192&panoFace=96&panoFacesPerSlice=3&panoVfov=180&panoJpeg=0.74&da360UploadScale=0.35&panoMs=20&depthMs=20&panoramaTileSse=512'
 ```
 
 如果当前地址仍含旧 `panoCaptureAnyway=0`，单独执行 `location.reload()` 会原样保留查询参数，页面仍会进入 `calibration`。最稳妥的做法是直接打开上面的显式 `panoProfile=flight` URL；也可在当前 Firefox 控制台执行下列命令，删除 legacy/别名参数、写入显式 flight profile 后跳转：

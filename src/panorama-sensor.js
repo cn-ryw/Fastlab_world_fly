@@ -74,6 +74,20 @@ const DEPTH_INTERVAL_MS = urlNumber('depthMs', 20, 16, 10000);
 // A response may legitimately arrive after the next RGB capture completes,
 // but never apply a trajectory from an arbitrarily old frozen observation.
 const YOPO_MAX_FRAME_AGE_MS = urlNumber('yopoMaxFrameAgeMs', 250, 50, 250);
+// Do not spend GPU time on a frame whose remaining hard-age envelope is too
+// small for the accepted 50 ms service budget plus JSON/apply overhead.  This
+// is deliberately not URL-configurable: it may reject earlier, but it can
+// never relax the 250 ms trajectory-install limit.
+const YOPO_MIN_FETCH_REMAINING_MS = 55;
+// Reserve callback/accounting headroom so a trajectory accepted just under the
+// hard observation limit cannot be logged/applied just over it.
+const YOPO_APPLY_DEADLINE_RESERVE_MS = 2;
+// Planning needs the compact control response at full rate. A cached preview
+// still consumes the Flask service thread for color/JPEG encoding, so sample it
+// at only 0.5 Hz: at 15 Hz planning this affects at most one request in ~30 and
+// stays outside the p95 control cadence.
+const PLANNING_PREVIEW_INTERVAL_MS = 2000;
+const STALE_LOG_SUMMARY_INTERVAL_MS = 2000;
 // DA360 超时：含冷启动首次推理裕度
 const DA360_TIMEOUT_MS = urlNumber('da360TimeoutMs', 20000, 2000, 60000);
 const DA360_UPLOAD_SCALE = urlNumber('da360UploadScale', 0.35, 0.05, 1);
@@ -92,7 +106,10 @@ const PANORAMA_BOTTOM_POLE_GUARD = urlNumber('panoBottomPoleGuard', 2, 0, 45);
 const PANORAMA_FRAME_DELAY_MS = urlNumber('panoFrameDelayMs', 0, 0, 1000);
 const PANORAMA_FACE_TILE_TIMEOUT_MS = urlNumber('panoFaceTileTimeoutMs', 6000, 0, 10000);
 const PANORAMA_FACE_TILE_QUIET_MS = urlNumber('panoFaceTileQuietMs', 650, 0, 5000);
-const PANORAMA_FACES_PER_SLICE = Math.round(urlNumber('panoFacesPerSlice', 2, 1, 6));
+// Three faces per slice removes one RAF yield from every six-face capture while
+// retaining a scheduling boundary between the two halves.  `panoFacesPerSlice`
+// remains the A/B rollback knob.
+const PANORAMA_FACES_PER_SLICE = Math.round(urlNumber('panoFacesPerSlice', 3, 1, 6));
 const PANORAMA_PRELOAD_FRAME_DELAY_MS = urlNumber(
     'panoPreloadFrameDelayMs',
     Math.max(96, PANORAMA_FRAME_DELAY_MS),
@@ -144,9 +161,218 @@ function getYopoEndpoint() {
     return `http://${host}:${port}/yopo/plan_full`;
 }
 
+function getYopoPreviewEndpoint() {
+    const params = new URLSearchParams(window.location.search);
+    const host = params.get('da360Host') || window.location.hostname || '127.0.0.1';
+    const port = params.get('da360Port') || '5688';
+    return `http://${host}:${port}/yopo/preview`;
+}
+
 function shortError(error) {
     const message = error && error.message ? error.message : String(error || 'error');
     return message.length > 52 ? `${message.slice(0, 49)}...` : message;
+}
+
+function abortErrorFromSignal(signal, fallback = 'request aborted') {
+    const error = new Error(String(signal?.reason || fallback));
+    error.name = 'AbortError';
+    return error;
+}
+
+/**
+ * Await work that cannot necessarily consume an AbortSignal itself (notably
+ * canvas.toBlob()).  The losing promise remains safely observed, while the
+ * request owner can release its gate as soon as the session/deadline aborts.
+ */
+function awaitWithAbort(value, signal) {
+    if (!signal) return Promise.resolve(value);
+    if (signal.aborted) return Promise.reject(abortErrorFromSignal(signal));
+    return new Promise((resolve, reject) => {
+        let settled = false;
+        const finish = (callback, result) => {
+            if (settled) return;
+            settled = true;
+            signal.removeEventListener('abort', onAbort);
+            callback(result);
+        };
+        const onAbort = () => finish(reject, abortErrorFromSignal(signal));
+        signal.addEventListener('abort', onAbort, { once: true });
+        Promise.resolve(value).then(
+            result => finish(resolve, result),
+            error => finish(reject, error),
+        );
+    });
+}
+
+function finiteNumberOrNull(value) {
+    if (value === null || value === undefined || value === '') return null;
+    const number = Number(value);
+    return Number.isFinite(number) ? number : null;
+}
+
+function safeIntegerOrNull(value) {
+    if (value === null || value === undefined || value === '') return null;
+    const number = Number(value);
+    return Number.isSafeInteger(number) ? number : null;
+}
+
+function frozenNumberArray(value, expectedLength = null) {
+    if (!Array.isArray(value)) return null;
+    if (expectedLength !== null && value.length !== expectedLength) return null;
+    const numbers = value.map(Number);
+    if (!numbers.every(Number.isFinite)) return null;
+    return Object.freeze(numbers);
+}
+
+const PLANNING_DIAGNOSTICS_SCHEMA_VERSION = 1;
+const NORMALIZED_ENDSTATE_TOLERANCE = 1e-5;
+
+function emptyPlanningDiagnostics(selectedEndstate = null) {
+    return Object.freeze({
+        planningDiagnostics: null,
+        planningDiagnosticsSchemaVersion: null,
+        selectedCandidateId: null,
+        selectedActionId: null,
+        selectedLatticeId: null,
+        selectedScore: null,
+        selectedEndstate,
+        selectedRawEndstate: null,
+        terminalSpeedMps: null,
+        terminalAccelerationMps2: null,
+        endpointDisplacementM: null,
+        trajectoryTimeS: null,
+        candidateCount: null,
+        velocityScaleMps: null,
+        accelerationScaleMps2: null,
+    });
+}
+
+function normalizePlanningDiagnostics(payload) {
+    const raw = payload?.planning_diagnostics;
+    const selectedEndstate = frozenNumberArray(payload?.endstate, 9);
+    const planningAuthorized = payload?.planning_authorized === true;
+    if (raw === null || raw === undefined) {
+        if (planningAuthorized) {
+            throw new Error('authorized planning response missing planning_diagnostics v1');
+        }
+        return emptyPlanningDiagnostics(selectedEndstate);
+    }
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+        throw new Error('planning_diagnostics must be an object');
+    }
+    const source = raw;
+    const planningDiagnosticsSchemaVersion = source.schema_version;
+    if (planningDiagnosticsSchemaVersion !== PLANNING_DIAGNOSTICS_SCHEMA_VERSION) {
+        throw new Error(
+            `unsupported planning_diagnostics schema_version=${source.schema_version ?? 'missing'}`
+        );
+    }
+    const selectedRawEndstate = frozenNumberArray(
+        source.selected_endstate_raw ?? source.selected_raw_endstate,
+        9,
+    );
+    const selectedCandidateId = safeIntegerOrNull(source.selected_candidate_id);
+    const selectedActionId = safeIntegerOrNull(source.selected_action_id);
+    const selectedLatticeId = safeIntegerOrNull(source.selected_lattice_id);
+    const selectedScore = finiteNumberOrNull(source.selected_score);
+    const terminalSpeedMps = finiteNumberOrNull(source.terminal_speed_mps);
+    const terminalAccelerationMps2 = finiteNumberOrNull(
+        source.terminal_acceleration_mps2,
+    );
+    const endpointDisplacementM = finiteNumberOrNull(source.endpoint_displacement_m);
+    const trajectoryTimeS = finiteNumberOrNull(source.trajectory_time_s);
+    const candidateCount = safeIntegerOrNull(source.candidate_count);
+    const velocityScaleMps = finiteNumberOrNull(source.velocity_scale_mps);
+    const accelerationScaleMps2 = finiteNumberOrNull(
+        source.acceleration_scale_mps2,
+    );
+    if (!selectedRawEndstate) {
+        throw new Error('planning_diagnostics selected_endstate_raw must contain 9 finite values');
+    }
+    if (selectedRawEndstate.some(
+        value => Math.abs(value) > 1 + NORMALIZED_ENDSTATE_TOLERANCE
+    )) {
+        throw new Error('planning_diagnostics selected_endstate_raw is outside normalized [-1,1]');
+    }
+    if ([selectedCandidateId, selectedActionId, selectedLatticeId, candidateCount]
+        .some(value => value === null)) {
+        throw new Error('planning_diagnostics candidate/action/lattice/count must be safe integers');
+    }
+    if ([
+        selectedScore,
+        terminalSpeedMps,
+        terminalAccelerationMps2,
+        endpointDisplacementM,
+        trajectoryTimeS,
+        velocityScaleMps,
+        accelerationScaleMps2,
+    ].some(value => value === null)) {
+        throw new Error('planning_diagnostics missing/non-finite number');
+    }
+    if (selectedScore < 0
+        || terminalSpeedMps < 0
+        || terminalAccelerationMps2 < 0
+        || endpointDisplacementM < 0) {
+        throw new Error('planning_diagnostics negative score/terminal metric');
+    }
+    if (trajectoryTimeS <= 0 || velocityScaleMps <= 0 || accelerationScaleMps2 <= 0) {
+        throw new Error('planning_diagnostics time/scale must be positive');
+    }
+    if (candidateCount <= 0
+        || selectedCandidateId < 0
+        || selectedActionId < 0
+        || selectedLatticeId < 0
+        || selectedCandidateId >= candidateCount
+        || selectedActionId >= candidateCount
+        || selectedLatticeId >= candidateCount) {
+        throw new Error('planning_diagnostics candidate/action/lattice IDs are out of range');
+    }
+    if (selectedCandidateId !== selectedActionId
+        || selectedLatticeId !== candidateCount - 1 - selectedActionId) {
+        throw new Error('planning_diagnostics candidate/action/lattice/count are inconsistent');
+    }
+    const planningDiagnostics = Object.freeze({
+        schema_version: planningDiagnosticsSchemaVersion,
+        selected_endstate_raw: selectedRawEndstate,
+        selected_candidate_id: selectedCandidateId,
+        selected_action_id: selectedActionId,
+        selected_lattice_id: selectedLatticeId,
+        selected_score: selectedScore,
+        terminal_speed_mps: terminalSpeedMps,
+        terminal_acceleration_mps2: terminalAccelerationMps2,
+        endpoint_displacement_m: endpointDisplacementM,
+        trajectory_time_s: trajectoryTimeS,
+        candidate_count: candidateCount,
+        velocity_scale_mps: velocityScaleMps,
+        acceleration_scale_mps2: accelerationScaleMps2,
+    });
+    return Object.freeze({
+        planningDiagnostics,
+        planningDiagnosticsSchemaVersion,
+        selectedCandidateId,
+        selectedActionId,
+        selectedLatticeId,
+        selectedScore,
+        selectedEndstate,
+        selectedRawEndstate,
+        terminalSpeedMps,
+        terminalAccelerationMps2,
+        endpointDisplacementM,
+        trajectoryTimeS,
+        candidateCount,
+        velocityScaleMps,
+        accelerationScaleMps2,
+    });
+}
+
+function responseContentLength(response) {
+    const headerValue = response?.headers?.get?.('Content-Length');
+    const headerLength = Number(headerValue);
+    if (Number.isSafeInteger(headerLength) && headerLength >= 0) return headerLength;
+    // Never stringify the parsed depth preview again on the control-critical
+    // path merely to estimate bytes. Same-origin production responses expose
+    // Content-Length; mocks/proxies that omit it are reported as unknown.
+    return null;
 }
 
 async function sha256Blob(blob) {
@@ -347,6 +573,7 @@ export class PanoramaSensor {
         this.lastCaptureStartTime = 0;
         this.lastCaptureTime = 0;
         this.lastDepthTime = 0;
+        this._lastDepthRequestStartedAt = -Infinity;
         this.hasRgb = false;
         this.hasDepth = false;
         this._depthLatency = '';
@@ -364,7 +591,16 @@ export class PanoramaSensor {
         this._depthAbortController = null;
         this._activeDepthRequest = null;
         this._depthRequestSequence = 0;
+        this._depthCatchupQueued = false;
+        this._depthCatchupTimer = null;
+        this._depthCatchupDeadlineAt = null;
         this._lastRenderedRequestId = 0;
+        this._latestDepthPreviewRequestId = 0;
+        this._pendingDepthPreviewJob = null;
+        this._depthPreviewWorkerRunning = false;
+        this._depthPreviewWorkerPromise = Promise.resolve();
+        this._lastPlanningPreviewFetchAt = -Infinity;
+        this._staleLogBuckets = new Map();
         this._depthPolarFrame = null;
         this._rgbFrameId = 0;
         this._rgbReadiness = Object.freeze({
@@ -419,6 +655,7 @@ export class PanoramaSensor {
         if (!this.active) {
             this._abortActiveCapture('sensor-inactive');
             this._abortCalibrationCapture('sensor-inactive');
+            this._cancelDepthCatchup();
         }
         this._applyVisibility();
     }
@@ -460,12 +697,16 @@ export class PanoramaSensor {
         const retainedDepth = this.hasDepth;
         this._abortActiveCapture('sensor-reset');
         this._abortActiveDepthRequest('sensor-reset');
+        this._invalidateQueuedDepthPreviews();
+        this._staleLogBuckets.clear();
         this._calibrationGeneration++;
         this._abortCalibrationCapture('sensor-reset');
         this.capturing = false;
         this.lastCaptureStartTime = 0;
         this.lastCaptureTime = 0;
         this.lastDepthTime = 0;
+        this._lastDepthRequestStartedAt = -Infinity;
+        this._cancelDepthCatchup();
         this.hasRgb = false;
         this._lastDepthArray = null;
         this._yopoGeneration++;   // 取消/到达时递增，使在途响应过期
@@ -496,6 +737,7 @@ export class PanoramaSensor {
         this._lastRequestedFrameId = -1;
         this._minimumRequestFrameId = 1;
         this._forceNextDepthRequest = true;
+        this._lastPlanningPreviewFetchAt = -Infinity;
         if (this.rgbCanvas) this._drawPlaceholder(this.rgbCanvas, 'RGB PANORAMA');
         // reset() may teleport the vehicle back to spawn. A previously drawn
         // JPEG can remain as a visual placeholder, but an ego-centred obstacle
@@ -523,6 +765,7 @@ export class PanoramaSensor {
         this._planningEpoch++;
         this._abortActiveDepthRequest(reason);
         this._abortActiveCapture(reason);
+        this._invalidateQueuedDepthPreviews();
         this._minimumRequestFrameId = this._rgbFrameId + 1;
         this.lastCaptureStartTime = -Infinity;
         this._forceNextDepthRequest = true;
@@ -653,6 +896,7 @@ export class PanoramaSensor {
         const frame = new PerceptionFrame({
             frameId: context.frameId,
             capturedAt: context.capturedAt,
+            captureSimTimeS: planningState.simTimeS,
             transform: context.transform,
             rgb: encoded.blob,
             actualState: planningState.actualState,
@@ -883,6 +1127,11 @@ export class PanoramaSensor {
         // console output records each distinct terminal/wait/error state once
         // per goal generation, plus the periodic segmented [depth] summary.
         if (outcome === 'ok' && reason === 'request-started') return;
+        // High-rate planning-age drops are summarized by `_markStale` on a
+        // time window.  Suppressing this state line prevents alternating
+        // ready/stale transitions from bypassing ordinary de-duplication; the
+        // UI fields above still update for every event.
+        if (outcome === 'stale' && reason === 'stale:planning-frame-too-old') return;
         const rawLogReason = reason || outcome;
         const logReason = /^trajectory-ready:depth-lag-\d+-frames$/.test(rawLogReason)
             ? 'trajectory-ready:depth-lag'
@@ -951,7 +1200,8 @@ export class PanoramaSensor {
             this._setDepthState('planning', 'awaiting-pose');
             return false;
         }
-        return this._forceNextDepthRequest || now - this.lastDepthTime >= DEPTH_INTERVAL_MS;
+        return this._forceNextDepthRequest
+            || now - this._lastDepthRequestStartedAt >= DEPTH_INTERVAL_MS;
     }
 
     _isRequestNavigationCurrent(request) {
@@ -969,13 +1219,28 @@ export class PanoramaSensor {
         return request.requestId >= this._lastRenderedRequestId;
     }
 
+    // Depth-preview decoding intentionally outlives the network request gate.
+    // Its ownership check therefore uses the immutable navigation identity,
+    // not `_activeDepthRequest`, while still preventing an old goal/epoch from
+    // drawing into the current session.
+    _isDepthPreviewSessionCurrent(request) {
+        if (!request) return false;
+        if (request.generation !== this._yopoGeneration) return false;
+        if (request.planningEpoch !== this._planningEpoch) return false;
+        if (request.goalId !== this._goalId) return false;
+        if (request.mode !== this._desiredDepthMode()) return false;
+        return true;
+    }
+
     _isRequestSourceCurrent(request) {
         return this._isRequestSessionCurrent(request)
             && request.frameId === this._rgbFrameId;
     }
 
     _canCommitDepthPreview(request) {
-        return this._isRequestNavigationCurrent(request)
+        return this._isDepthPreviewSessionCurrent(request)
+            && (request.mode !== 'planning'
+                || request.requestId === this._latestDepthPreviewRequestId)
             && request.requestId > this._lastRenderedRequestId;
     }
 
@@ -986,6 +1251,106 @@ export class PanoramaSensor {
             && String(payload?.generation ?? '') === String(request.generation);
     }
 
+    _invokeObserver(label, callback, args = []) {
+        if (typeof callback !== 'function') {
+            return Object.freeze({ available: false, succeeded: false, value: undefined });
+        }
+        try {
+            return Object.freeze({
+                available: true,
+                succeeded: true,
+                value: callback.apply(this, args),
+            });
+        } catch (error) {
+            reportUserError(`${label} observer failed`, error, {
+                key: `panorama-observer-${String(label).toLowerCase().replace(/[^a-z0-9]+/g, '-')}`,
+                intervalMs: 3000,
+            });
+            return Object.freeze({ available: true, succeeded: false, value: undefined });
+        }
+    }
+
+    _emitPerceptionMetrics(metrics) {
+        return this._invokeObserver(
+            'Perception metrics',
+            this.onPerceptionMetrics,
+            [metrics],
+        ).succeeded;
+    }
+
+    _requestStageMetrics(request, now = performance.now()) {
+        const captureTimings = request?.frameContext?.captureTimings || null;
+        const timing = (...keys) => {
+            for (const key of keys) {
+                const value = finiteNumberOrNull(captureTimings?.[key]);
+                if (value !== null) return value;
+            }
+            return null;
+        };
+        const fetchStartedAtMs = finiteNumberOrNull(request?.fetchStartedAtMs);
+        const responseHeadersAtMs = finiteNumberOrNull(request?.responseHeadersAtMs);
+        const payloadParsedAtMs = finiteNumberOrNull(request?.payloadParsedAtMs);
+        const elapsed = (end, start) => end === null || start === null
+            ? null
+            : Math.max(0, end - start);
+        const planningMetadata = request?.planningMetadata
+            || emptyPlanningDiagnostics(
+                frozenNumberArray(request?.parsedEndstate, 9)
+            );
+        const observedSchemaVersion = safeIntegerOrNull(
+            request?.planningDiagnosticsSchemaVersionObserved
+        );
+        const gateAcquiredAt = finiteNumberOrNull(request?.gateAcquiredAt);
+        const gateWaitMs = finiteNumberOrNull(request?.gateWaitMs)
+            ?? (gateAcquiredAt === null ? null : Math.max(0, now - gateAcquiredAt));
+        return Object.freeze({
+            captureProfile: request?.frameContext?.captureProfile ?? null,
+            captureMs: timing('total'),
+            renderMs: timing('render'),
+            sceneRenderMs: timing('scene_render'),
+            tileWaitMs: timing('tile_wait'),
+            waitRerenderMs: timing('wait_rerender'),
+            faceUploadMs: timing('face_upload'),
+            projectMs: timing('project'),
+            schedulerYieldMs: timing('scheduler', 'scheduler_yield'),
+            jpegMs: finiteNumberOrNull(request?.jpegMs),
+            ageAtRequestStartMs: finiteNumberOrNull(request?.ageAtRequestStartMs),
+            ageAtFetchStartMs: finiteNumberOrNull(request?.ageAtFetchStartMs),
+            ageAtResponseHeadersMs: finiteNumberOrNull(request?.ageAtResponseHeadersMs),
+            ageAtJsonParsedMs: finiteNumberOrNull(request?.ageAtJsonParsedMs),
+            ageBudgetRemainingMs: finiteNumberOrNull(request?.ageBudgetRemainingMs),
+            planningFetchReserveMs: request?.mode === 'planning'
+                ? YOPO_MIN_FETCH_REMAINING_MS
+                : null,
+            planningApplyReserveMs: request?.mode === 'planning'
+                ? YOPO_APPLY_DEADLINE_RESERVE_MS
+                : null,
+            applyDeadlineWallTimeMs: finiteNumberOrNull(
+                request?.hardApplyDeadlineWallTimeMs
+            ),
+            fetchStarted: request?.fetchStarted === true,
+            fetchStartedAtMs,
+            responseHeadersAtMs,
+            payloadParsedAtMs,
+            responseHeadersMs: elapsed(responseHeadersAtMs, fetchStartedAtMs),
+            fetchToHeadersMs: elapsed(responseHeadersAtMs, fetchStartedAtMs),
+            httpBodyMs: elapsed(payloadParsedAtMs, responseHeadersAtMs),
+            responseJsonMs: elapsed(payloadParsedAtMs, responseHeadersAtMs),
+            networkMs: elapsed(payloadParsedAtMs, fetchStartedAtMs),
+            responseBytes: Number.isSafeInteger(request?.responseBytes)
+                ? request.responseBytes
+                : null,
+            gateWaitMs,
+            serverMs: finiteNumberOrNull(request?.serverMs),
+            da360Ms: finiteNumberOrNull(request?.da360Ms),
+            yopoMs: finiteNumberOrNull(request?.yopoMs),
+            serverTimings: request?.serverTimings || null,
+            ...planningMetadata,
+            planningDiagnosticsSchemaVersion: observedSchemaVersion
+                ?? planningMetadata.planningDiagnosticsSchemaVersion,
+        });
+    }
+
     _abortActiveDepthRequest(reason) {
         const request = this._activeDepthRequest;
         if (!request) return;
@@ -994,15 +1359,136 @@ export class PanoramaSensor {
         if (controller && !controller.signal.aborted) controller.abort(reason);
     }
 
+    _armDepthRequestDeadline(request) {
+        const now = performance.now();
+        const serviceDeadlineAt = now + DA360_TIMEOUT_MS;
+        let deadlineAt = serviceDeadlineAt;
+        let reason = 'timeout';
+        if (request.mode === 'planning'
+            && Number.isFinite(request.networkDeadlineWallTimeMs)
+            && request.networkDeadlineWallTimeMs <= deadlineAt) {
+            deadlineAt = request.networkDeadlineWallTimeMs;
+            reason = 'planning-deadline';
+        }
+        request.timeoutDeadlineAt = deadlineAt;
+        request.timeoutReason = reason;
+        request.timeoutHandle = window.setTimeout(() => {
+            if (this._activeDepthRequest !== request) return;
+            request.abortReason = reason;
+            if (!request.controller.signal.aborted) request.controller.abort(reason);
+        }, Math.max(0, deadlineAt - now));
+    }
+
+    _releaseDepthRequest(request) {
+        if (this._activeDepthRequest !== request) return false;
+        if (request.timeoutHandle !== null && request.timeoutHandle !== undefined) {
+            window.clearTimeout(request.timeoutHandle);
+            request.timeoutHandle = null;
+        }
+        request.gateReleasedAt = performance.now();
+        request.gateWaitMs = request.gateReleasedAt - request.gateAcquiredAt;
+        this._activeDepthRequest = null;
+        this._depthAbortController = null;
+        this.depthPending = false;
+        this._depthGate = false;
+        this._queueLatestDepthRequest();
+        return true;
+    }
+
+    _enqueueDepthPreview(request, run) {
+        this._latestDepthPreviewRequestId = request.requestId;
+        this._pendingDepthPreviewJob = Object.freeze({ request, run });
+        if (this._depthPreviewWorkerRunning) return this._depthPreviewWorkerPromise;
+
+        this._depthPreviewWorkerRunning = true;
+        const worker = (async () => {
+            try {
+                while (this._pendingDepthPreviewJob) {
+                    const job = this._pendingDepthPreviewJob;
+                    this._pendingDepthPreviewJob = null;
+                    // Coalesce queued previews before decode.  A newer job that
+                    // arrives during decode is also checked by the commit gate.
+                    if (job.request.requestId !== this._latestDepthPreviewRequestId) continue;
+                    try {
+                        await job.run();
+                    } catch (error) {
+                        // Preview/UI observers are outside the control path. A
+                        // faulty decoder or observer must not reject the worker
+                        // promise or prevent the newest queued preview running.
+                        reportUserError('Planning depth preview worker failed', error, {
+                            key: 'planning-depth-preview-worker', intervalMs: 3000,
+                        });
+                    }
+                }
+            } finally {
+                this._depthPreviewWorkerRunning = false;
+                if (this._pendingDepthPreviewJob) {
+                    this._enqueueDepthPreview(
+                        this._pendingDepthPreviewJob.request,
+                        this._pendingDepthPreviewJob.run,
+                    );
+                }
+            }
+        })();
+        this._depthPreviewWorkerPromise = worker;
+        return worker;
+    }
+
+    async _waitForDepthPreviewIdle() {
+        while (this._depthPreviewWorkerRunning || this._pendingDepthPreviewJob) {
+            await this._depthPreviewWorkerPromise;
+        }
+    }
+
+    _invalidateQueuedDepthPreviews() {
+        this._pendingDepthPreviewJob = null;
+    }
+
+    _logStaleSummary(request, reason) {
+        const key = `${request?.goalId || '-'}|${request?.generation ?? '-'}|`
+            + `${request?.planningEpoch ?? '-'}|${reason}`;
+        const now = performance.now();
+        const prior = this._staleLogBuckets.get(key) || {
+            count: 0,
+            lastLogAt: -Infinity,
+            firstAt: now,
+        };
+        prior.count++;
+        const shouldLog = now - prior.lastLogAt >= STALE_LOG_SUMMARY_INTERVAL_MS;
+        if (shouldLog) {
+            console.log(
+                `[depth-stale] mode=${request?.mode || this._desiredDepthMode()} `
+                + `goalId=${request?.goalId || '-'} frameId=${request?.frameId ?? this._rgbFrameId} `
+                + `generation=${request?.generation ?? this._yopoGeneration} reason=${reason} `
+                + `count=${prior.count}`
+            );
+            prior.count = 0;
+            prior.firstAt = now;
+            prior.lastLogAt = now;
+        }
+        this._staleLogBuckets.set(key, prior);
+    }
+
     _markStale(request, reason) {
+        const completedAt = performance.now();
         const desiredMode = this._desiredDepthMode();
-        this._setDepthState(desiredMode, `stale:${reason}`, { outcome: 'stale' });
-        console.log(
-            `[depth] mode=${request?.mode || desiredMode} goalId=${request?.goalId || '-'} ` +
-            `frameId=${request?.frameId ?? this._rgbFrameId} generation=${request?.generation ?? this._yopoGeneration} ` +
-            `reason=stale:${reason}`
-        );
-        this.onPerceptionMetrics?.({
+        // An old request may finish after setYopoGoal/resetYopoGoal advanced the
+        // navigation identity.  Preserve its diagnostic with the frozen request
+        // identity, but never let it overwrite the new session's UI state.
+        const ownsCurrentUi = !request || this._isDepthPreviewSessionCurrent(request);
+        if (ownsCurrentUi) {
+            this._setDepthState(desiredMode, `stale:${reason}`, { outcome: 'stale' });
+        }
+        if (reason === 'planning-frame-too-old') {
+            this._logStaleSummary(request, reason);
+        } else {
+            console.log(
+                `[depth] mode=${request?.mode || desiredMode} goalId=${request?.goalId || '-'} ` +
+                `frameId=${request?.frameId ?? this._rgbFrameId} generation=${request?.generation ?? this._yopoGeneration} ` +
+                `reason=stale:${reason}`
+            );
+        }
+        this._emitPerceptionMetrics(Object.freeze({
             frameId: request?.frameId ?? null,
             goalId: request?.goalId ?? null,
             generation: request?.generation ?? this._yopoGeneration,
@@ -1010,14 +1496,47 @@ export class PanoramaSensor {
             outcome: 'stale',
             dropReason: reason,
             frameAgeMs: request?.frameContext
-                ? performance.now() - request.frameContext.capturedAt
+                ? completedAt - request.frameContext.capturedAt
                 : null,
+            ...this._requestStageMetrics(request, completedAt),
             ...this._rgbMetrics(request?.frameContext),
-        });
+        }));
     }
 
-    _queueLatestDepthRequest() {
-        if (this._depthCatchupQueued || !this._shouldRequestDepth()) return;
+    _cancelDepthCatchup() {
+        if (this._depthCatchupTimer !== null) {
+            window.clearTimeout(this._depthCatchupTimer);
+            this._depthCatchupTimer = null;
+        }
+        this._depthCatchupDeadlineAt = null;
+    }
+
+    _queueLatestDepthRequest(now = performance.now()) {
+        if (!this.hasRgb || this._depthGate || this.depthPending) return;
+        if (this._rgbFrameId <= this._lastRequestedFrameId) return;
+        if (this._rgbFrameId < this._minimumRequestFrameId) return;
+        if (this._yopoGoal && !this._yopoPose) return;
+
+        const earliestStartAt = this._forceNextDepthRequest
+            ? now
+            : this._lastDepthRequestStartedAt + DEPTH_INTERVAL_MS;
+        if (now < earliestStartAt) {
+            if (this._depthCatchupTimer !== null
+                && this._depthCatchupDeadlineAt <= earliestStartAt) {
+                return;
+            }
+            this._cancelDepthCatchup();
+            this._depthCatchupDeadlineAt = earliestStartAt;
+            this._depthCatchupTimer = window.setTimeout(() => {
+                this._depthCatchupTimer = null;
+                this._depthCatchupDeadlineAt = null;
+                this._queueLatestDepthRequest();
+            }, Math.max(1, Math.ceil(earliestStartAt - now)));
+            return;
+        }
+
+        this._cancelDepthCatchup();
+        if (this._depthCatchupQueued) return;
         this._depthCatchupQueued = true;
         queueMicrotask(() => {
             this._depthCatchupQueued = false;
@@ -1125,11 +1644,13 @@ export class PanoramaSensor {
 
             if (this._shouldRequestDepth(this.lastCaptureTime)) {
                 this._requestDepth(this.rgbCanvas);
+            } else {
+                this._queueLatestDepthRequest(this.lastCaptureTime);
             }
         } catch (error) {
             if (error?.name === 'AbortError' || captureController.signal.aborted) {
                 this._setRgbStatus(`stale · ${captureController.signal.reason || 'capture-aborted'}`);
-                this.onPerceptionMetrics?.({
+                this._emitPerceptionMetrics(Object.freeze({
                     captureId,
                     outcome: 'stale',
                     dropReason: String(captureController.signal.reason || 'capture-aborted'),
@@ -1138,7 +1659,7 @@ export class PanoramaSensor {
                     goalId: this._goalId,
                     generation: this._yopoGeneration,
                     ...this._rgbMetrics(),
-                });
+                }));
                 return;
             }
             reportUserError('Panorama capture failed', error, {
@@ -1199,8 +1720,20 @@ export class PanoramaSensor {
         });
     }
 
-    async _decodeAndCommitDepthImage(source, request, { markStale = true } = {}) {
+    async _decodeAndCommitDepthImage(
+        source,
+        request,
+        {
+            markStale = true,
+            timings = null,
+            commitPolarFrame = false,
+            polarFrame = null,
+        } = {},
+    ) {
+        const decodeStartedAt = performance.now();
         const decoded = await decodeDepthImageSource(source, globalThis);
+        const decodedAt = performance.now();
+        if (timings) timings.depthDecodeMs = decodedAt - decodeStartedAt;
         try {
             if (!this._canCommitDepthPreview(request)) {
                 if (markStale) {
@@ -1214,7 +1747,12 @@ export class PanoramaSensor {
             if (!this.depthCanvas) throw new Error('depth canvas unavailable');
             const ctx = this.depthCanvas.getContext('2d', { alpha: false });
             if (!ctx || typeof ctx.drawImage !== 'function') throw new Error('depth canvas context unavailable');
+            const drawStartedAt = performance.now();
             ctx.drawImage(decoded, 0, 0, this.depthCanvas.width, this.depthCanvas.height);
+            if (timings) timings.depthDrawMs = performance.now() - drawStartedAt;
+            // Canvas pixels and their numerical polar projection share the same
+            // latest/session gate and become visible in one synchronous commit.
+            if (commitPolarFrame) this._depthPolarFrame = polarFrame;
             this._lastRenderedRequestId = request.requestId;
             this.hasDepth = true;
             return true;
@@ -1239,6 +1777,12 @@ export class PanoramaSensor {
             this._setDepthState(mode, 'awaiting-complete-rgb-frame');
             return false;
         }
+        const gateAcquiredAt = performance.now();
+        this._cancelDepthCatchup();
+        this._lastDepthRequestStartedAt = gateAcquiredAt;
+        const hardApplyDeadlineWallTimeMs = mode === 'planning'
+            ? frameContext.capturedAt + YOPO_MAX_FRAME_AGE_MS
+            : null;
         const request = {
             requestId: ++this._depthRequestSequence,
             frameId: frameContext.frameId,
@@ -1249,26 +1793,68 @@ export class PanoramaSensor {
             goal: this._yopoGoal ? { ...this._yopoGoal } : null,
             frameContext,
             perceptionFrame: null,
-            controller: null,
+            controller: new AbortController(),
             abortReason: null,
+            timeoutHandle: null,
+            timeoutDeadlineAt: null,
+            timeoutReason: null,
+            hardApplyDeadlineWallTimeMs,
+            networkDeadlineWallTimeMs: mode === 'planning'
+                ? hardApplyDeadlineWallTimeMs - YOPO_APPLY_DEADLINE_RESERVE_MS
+                : null,
+            gateAcquiredAt,
+            gateReleasedAt: null,
+            gateWaitMs: null,
+            fetchStarted: false,
+            includePreview: mode !== 'planning',
+            previewRequested: mode !== 'planning',
+            ageAtRequestStartMs: gateAcquiredAt - frameContext.capturedAt,
+            ageAtFetchStartMs: null,
+            ageAtResponseHeadersMs: null,
+            ageAtJsonParsedMs: null,
+            ageBudgetRemainingMs: null,
+            jpegMs: null,
+            fetchStartedAtMs: null,
+            responseHeadersAtMs: null,
+            payloadParsedAtMs: null,
+            responseBytes: null,
+            serverMs: null,
+            da360Ms: null,
+            yopoMs: null,
+            serverTimings: null,
+            parsedEndstate: null,
+            planningDiagnosticsSchemaVersionObserved: null,
+            planningMetadata: null,
         };
-        this._depthReqStart = performance.now();
+        this._depthReqStart = request.gateAcquiredAt;
         this._lastRequestedFrameId = request.frameId;
         this._forceNextDepthRequest = false;
         this._depthGate = true;
         this.depthPending = true;
         this._activeDepthRequest = request;
+        this._depthAbortController = request.controller;
+        this._armDepthRequestDeadline(request);
         this._setDepthState(mode, 'request-started');
 
-        let timeout = null;
         let tA = performance.now();
         let tB = tA;
 
         try {
-            const materialized = await this._materializePerceptionFrame(frameContext);
+            request.ageBudgetRemainingMs = YOPO_MAX_FRAME_AGE_MS
+                - request.ageAtRequestStartMs;
+            if (request.mode === 'planning'
+                && request.ageBudgetRemainingMs <= YOPO_MIN_FETCH_REMAINING_MS) {
+                this._markStale(request, 'planning-frame-too-old');
+                return false;
+            }
+            const materialized = await awaitWithAbort(
+                this._materializePerceptionFrame(frameContext),
+                request.controller.signal,
+            );
             const frame = materialized.frame;
             request.perceptionFrame = frame;
             this._perceptionFrame = frame;
+            request.jpegMs = finiteNumberOrNull(materialized.jpegMs);
             const blob = frame.rgb;
             tB = performance.now();
             if (!this._isRequestSourceCurrent(request)) {
@@ -1276,13 +1862,23 @@ export class PanoramaSensor {
                 return false;
             }
 
-            const controller = new AbortController();
-            request.controller = controller;
-            this._depthAbortController = controller;
-            timeout = window.setTimeout(() => {
-                request.abortReason = 'timeout';
-                controller.abort('timeout');
-            }, DA360_TIMEOUT_MS);
+            const fetchBudgetCheckedAt = performance.now();
+            request.ageAtFetchStartMs = fetchBudgetCheckedAt - frame.capturedAt;
+            request.ageBudgetRemainingMs = YOPO_MAX_FRAME_AGE_MS - request.ageAtFetchStartMs;
+            if (request.mode === 'planning'
+                && request.ageBudgetRemainingMs <= YOPO_MIN_FETCH_REMAINING_MS) {
+                this._markStale(request, 'planning-frame-too-old');
+                return false;
+            }
+
+            if (request.mode === 'planning') {
+                request.includePreview = false;
+                request.previewRequested = fetchBudgetCheckedAt - this._lastPlanningPreviewFetchAt
+                    >= PLANNING_PREVIEW_INTERVAL_MS;
+                if (request.previewRequested) {
+                    this._lastPlanningPreviewFetchAt = fetchBudgetCheckedAt;
+                }
+            }
 
             let url, body, headers;
             const projectionHeader = JSON.stringify(frame.projectionConfig);
@@ -1303,6 +1899,10 @@ export class PanoramaSensor {
                     frame_id: String(request.frameId),
                     goal_id: String(request.goalId),
                     generation: String(request.generation),
+                    // Control responses are always compact. Operator preview
+                    // is fetched later from the exact cached planning depth on
+                    // an independent latest-only worker.
+                    include_preview: '0',
                 }).toString();
                 url = `${getYopoEndpoint()}?${qs}`;  // /yopo/plan_full
                 headers = {
@@ -1320,11 +1920,49 @@ export class PanoramaSensor {
             }
 
             const fetchStartedAt = performance.now();
-            const response = await fetch(url, { method: 'POST', headers, body, signal: controller.signal });
+            request.fetchStarted = true;
+            request.fetchStartedAtMs = fetchStartedAt;
+            request.ageAtFetchStartMs = fetchStartedAt - frame.capturedAt;
+            request.ageBudgetRemainingMs = YOPO_MAX_FRAME_AGE_MS - request.ageAtFetchStartMs;
+            if (request.mode === 'planning'
+                && request.ageBudgetRemainingMs <= YOPO_MIN_FETCH_REMAINING_MS) {
+                request.fetchStarted = false;
+                this._markStale(request, 'planning-frame-too-old');
+                return false;
+            }
+            const response = await awaitWithAbort(fetch(url, {
+                method: 'POST',
+                headers,
+                body,
+                signal: request.controller.signal,
+            }), request.controller.signal);
             const responseHeadersAt = performance.now();
+            request.responseHeadersAtMs = responseHeadersAt;
+            request.ageAtResponseHeadersMs = responseHeadersAt - frame.capturedAt;
             if (!response.ok) throw new Error(`HTTP ${response.status}`);
-            const payload = await response.json();
+            const payload = await awaitWithAbort(
+                response.json(),
+                request.controller.signal,
+            );
             const payloadParsedAt = performance.now();
+            request.payloadParsedAtMs = payloadParsedAt;
+            request.ageAtJsonParsedMs = payloadParsedAt - frame.capturedAt;
+            request.responseBytes = responseContentLength(response);
+            request.serverMs = finiteNumberOrNull(payload.latency_ms);
+            request.da360Ms = finiteNumberOrNull(
+                payload.timings_ms?.da360_ms ?? payload.timings_ms?.infer_ms
+            );
+            request.yopoMs = finiteNumberOrNull(payload.timings_ms?.yopo_ms);
+            request.serverTimings = payload.timings_ms
+                && typeof payload.timings_ms === 'object'
+                ? Object.freeze({ ...payload.timings_ms })
+                : null;
+            request.parsedEndstate = Array.isArray(payload.endstate)
+                ? [...payload.endstate]
+                : null;
+            request.planningDiagnosticsSchemaVersionObserved = safeIntegerOrNull(
+                payload.planning_diagnostics?.schema_version
+            );
             const responseSessionCurrent = request.mode === 'planning'
                 ? this._isRequestNavigationCurrent(request)
                 : this._isRequestSessionCurrent(request);
@@ -1336,11 +1974,15 @@ export class PanoramaSensor {
                 this._markStale(request, 'response-identity-mismatch');
                 return false;
             }
-            if (!payload.depth_image) throw new Error('response missing depth_image');
-
-            let polarScan = normalizeDepthPolarScan(payload.polar_scan);
-            if (polarScan && polarScan.depthMode !== payload.depth_mode) {
-                throw new Error('polar scan depth mode does not match response depth mode');
+            // Normalize diagnostics as soon as an identity-matched response is
+            // available. Later provenance/apply failures must retain the
+            // parsed planner evidence instead of collapsing it to null.
+            const planningMetadata = normalizePlanningDiagnostics(payload);
+            request.planningMetadata = planningMetadata;
+            const previewIncluded = typeof payload.depth_image === 'string'
+                && payload.depth_image.length > 0;
+            if (request.mode !== 'planning' && !previewIncluded) {
+                throw new Error('response missing depth_image');
             }
             const captureRotation = frame.transform?.rotation;
             const capturePosition = frame.transform?.position;
@@ -1348,7 +1990,6 @@ export class PanoramaSensor {
                 && [captureRotation.x, captureRotation.y, captureRotation.z].every(Number.isFinite)
                 && Math.abs(captureRotation.x) <= 1e-3
                 && Math.abs(captureRotation.z) <= 1e-3;
-            if (!captureIsLeveled || !capturePosition) polarScan = null;
 
             this._depthLatency = Number.isFinite(Number(payload.latency_ms))
                 ? `${Math.round(Number(payload.latency_ms))}ms`
@@ -1375,16 +2016,114 @@ export class PanoramaSensor {
             let trajectoryApplied = request.mode === 'planning' ? false : null;
             let trajectoryAppliedAt = null;
             let trajectoryApplyMs = 0;
+            let applyWallTimeMs = null;
+            let applyActualState = null;
+            let captureToApplyDelta = null;
+            let captureToApplyDisplacementM = null;
+            let applyDeadlineExceeded = false;
 
             if (request.mode === 'planning') {
                 if (planningAuthorized && !payload.endstate) {
                     throw new Error('authorized planning response missing endstate');
                 }
                 if (planningAuthorized && payload.endstate) {
-                    if (performance.now() - frame.capturedAt > YOPO_MAX_FRAME_AGE_MS) {
+                    const candidateApplyWallTimeMs = performance.now();
+                    request.ageBudgetRemainingMs = YOPO_MAX_FRAME_AGE_MS
+                        - (candidateApplyWallTimeMs - frame.capturedAt);
+                    if (candidateApplyWallTimeMs - frame.capturedAt
+                        >= YOPO_MAX_FRAME_AGE_MS - YOPO_APPLY_DEADLINE_RESERVE_MS) {
                         this._markStale(request, 'planning-frame-too-old');
                         return false;
                     }
+                    applyWallTimeMs = candidateApplyWallTimeMs;
+                    applyActualState = this._nextPlanningState?.actualState || null;
+                    const capturePositionState = frame.actualState?.position;
+                    const applyPositionState = applyActualState?.position;
+                    if (capturePositionState && applyPositionState) {
+                        const dx = Number(applyPositionState.x) - Number(capturePositionState.x);
+                        const dy = Number(applyPositionState.y) - Number(capturePositionState.y);
+                        const dz = Number(applyPositionState.z) - Number(capturePositionState.z);
+                        if ([dx, dy, dz].every(Number.isFinite)) {
+                            captureToApplyDelta = Object.freeze({ x: dx, y: dy, z: dz });
+                            captureToApplyDisplacementM = Math.hypot(dx, dy, dz);
+                        }
+                    }
+                    let commitFailureReason = null;
+                    let commitDepth = 0;
+                    let commitTransactionFailed = false;
+                    const pendingCommitRollbacks = [];
+                    const rollbackPendingCommits = () => {
+                        while (pendingCommitRollbacks.length > 0) {
+                            const rollback = pendingCommitRollbacks.pop();
+                            try {
+                                rollback();
+                            } catch (error) {
+                                reportUserError('YOPO trajectory rollback failed', error, {
+                                    key: 'yopo-trajectory-rollback',
+                                    intervalMs: 3000,
+                                });
+                            }
+                        }
+                    };
+                    const commitIfFresh = (mutation, rollback = null) => {
+                        const rootCommit = commitDepth === 0;
+                        if (rootCommit) {
+                            pendingCommitRollbacks.length = 0;
+                            commitTransactionFailed = false;
+                        }
+                        let localSucceeded = false;
+                        commitDepth++;
+                        try {
+                            if (typeof mutation !== 'function') {
+                                commitFailureReason = 'trajectory-commit-callback-invalid';
+                                commitTransactionFailed = true;
+                                return false;
+                            }
+                            if (rollback !== null && typeof rollback !== 'function') {
+                                commitFailureReason = 'trajectory-rollback-callback-invalid';
+                                commitTransactionFailed = true;
+                                return false;
+                            }
+                            if (performance.now() >= request.hardApplyDeadlineWallTimeMs) {
+                                commitFailureReason = 'trajectory-apply-deadline-exceeded';
+                                commitTransactionFailed = true;
+                                return false;
+                            }
+                            // Arm recovery before entering user/controller code:
+                            // a callback that mutates and then throws is still a
+                            // failed transaction that must be compare-and-cleared.
+                            if (rollback) pendingCommitRollbacks.push(rollback);
+                            const committed = mutation() === true;
+                            if (performance.now() >= request.hardApplyDeadlineWallTimeMs) {
+                                // A cooperative consumer supplies a compare-and-
+                                // clear rollback so a mutation that itself crosses
+                                // the hard boundary cannot remain published. The
+                                // rollback must be synchronous and scoped to this
+                                // immutable request identity; a newer N+1 command
+                                // must never be cleared by late N accounting.
+                                commitFailureReason = 'trajectory-apply-deadline-exceeded';
+                                commitTransactionFailed = true;
+                                rollbackPendingCommits();
+                                return false;
+                            }
+                            if (!committed) commitTransactionFailed = true;
+                            if (commitTransactionFailed) return false;
+                            localSucceeded = true;
+                            return true;
+                        } finally {
+                            commitDepth--;
+                            if (rootCommit) {
+                                if (!localSucceeded || commitTransactionFailed) {
+                                    rollbackPendingCommits();
+                                } else {
+                                    // The outer post-check is the transaction's
+                                    // commit point. Inner rollbacks remain armed
+                                    // until this exact point.
+                                    pendingCommitRollbacks.length = 0;
+                                }
+                            }
+                        }
+                    };
                     const context = Object.freeze({
                         mode: request.mode,
                         goalId: request.goalId,
@@ -1402,41 +2141,51 @@ export class PanoramaSensor {
                         planningAuthorized: true,
                         planningReason: payload.planning_reason || null,
                         timings: payload.timings_ms || null,
+                        captureSimTimeS: finiteNumberOrNull(frame.captureSimTimeS),
+                        captureActualState: frame.actualState || null,
+                        captureReferenceState: frame.referenceState || null,
+                        captureWallTimeMs: frame.capturedAt,
+                        applyWallTimeMs,
+                        applyDeadlineWallTimeMs: request.hardApplyDeadlineWallTimeMs,
+                        commitIfFresh,
+                        planningAgeS: (applyWallTimeMs - frame.capturedAt) / 1000,
+                        applyActualState,
+                        captureToApplyDelta,
+                        captureToApplyDisplacementM,
+                        planningOrigin: payload.planning_origin || null,
+                        ...planningMetadata,
                         ...this._rgbMetrics(frameContext),
                     });
                     const trajectoryApplyStartedAt = performance.now();
-                    trajectoryApplied = this.onYopoResult
-                        ? this.onYopoResult(payload.endstate, payload.traj_time, context) === true
-                        : false;
+                    let applyObserver = null;
+                    trajectoryApplied = commitIfFresh(() => {
+                        applyObserver = this._invokeObserver(
+                            'YOPO trajectory',
+                            this.onYopoResult,
+                            [payload.endstate, payload.traj_time, context],
+                        );
+                        return applyObserver.succeeded && applyObserver.value === true;
+                    });
                     trajectoryAppliedAt = performance.now();
                     trajectoryApplyMs = trajectoryAppliedAt - trajectoryApplyStartedAt;
+                    applyDeadlineExceeded = commitFailureReason
+                        === 'trajectory-apply-deadline-exceeded';
                     if (trajectoryApplied) {
-                        if (this.onYopoLatency) this.onYopoLatency(payload.latency_ms);
+                        this._invokeObserver(
+                            'YOPO latency',
+                            this.onYopoLatency,
+                            [payload.latency_ms],
+                        );
                     } else {
-                        finalReason = this.onYopoResult
-                            ? 'trajectory-apply-rejected'
-                            : 'trajectory-handler-unavailable';
+                        finalReason = commitFailureReason
+                            || (!applyObserver?.available
+                                ? 'trajectory-handler-unavailable'
+                                : !applyObserver.succeeded
+                                ? 'trajectory-handler-error'
+                                : 'trajectory-apply-rejected');
                     }
                 }
             }
-
-            // Commit only after identity, trust and planning-age validation.
-            // A blocked relative response remains a valid preview, but an
-            // expired or inconsistent response cannot replace this outline.
-            this._depthPolarFrame = polarScan
-                ? Object.freeze({
-                    scan: polarScan,
-                    frameId: request.frameId,
-                    requestId: request.requestId,
-                    capturedAt: frame.capturedAt,
-                    captureYawDeg: captureRotation.y,
-                    capturePosition: Object.freeze({
-                        x: capturePosition.x,
-                        y: capturePosition.y,
-                        z: capturePosition.z,
-                    }),
-                })
-                : null;
 
             const makeMetrics = ({
                 outcome,
@@ -1444,6 +2193,8 @@ export class PanoramaSensor {
                 depthPreviewCommitted = null,
                 depthCommittedAt = null,
                 depthCommitStartedAt = null,
+                depthDecodeMs = null,
+                depthDrawMs = null,
             }) => {
                 const metricAppliedAt = trajectoryAppliedAt
                     || depthCommittedAt
@@ -1469,6 +2220,8 @@ export class PanoramaSensor {
                             ? payload.calibration_accuracy_accepted
                             : null,
                     serviceFingerprint: payload.service_fingerprint || null,
+                    previewRequested: request.previewRequested,
+                    previewIncluded,
                     depthPreviewError,
                     depthPreviewCommitted,
                     depthPreviewLagFrames: Math.max(
@@ -1476,36 +2229,27 @@ export class PanoramaSensor {
                         this._rgbFrameId - request.frameId,
                     ),
                     depthPreviewAgeMs: metricAppliedAt - frame.capturedAt,
-                    captureProfile: frameContext.captureProfile,
-                    captureMs: Number(frameContext.captureTimings?.total || 0),
-                    renderMs: Number(frameContext.captureTimings?.render || 0),
-                    sceneRenderMs: Number(frameContext.captureTimings?.scene_render || 0),
-                    tileWaitMs: Number(frameContext.captureTimings?.tile_wait || 0),
-                    waitRerenderMs: Number(frameContext.captureTimings?.wait_rerender || 0),
-                    faceUploadMs: Number(frameContext.captureTimings?.face_upload || 0),
-                    projectMs: Number(frameContext.captureTimings?.project || 0),
-                    schedulerYieldMs: Number(
-                        frameContext.captureTimings?.scheduler
-                        ?? frameContext.captureTimings?.scheduler_yield
-                        ?? 0
-                    ),
-                    jpegMs: Number(materialized.jpegMs || 0),
-                    responseHeadersMs: responseHeadersAt - fetchStartedAt,
-                    httpBodyMs: payloadParsedAt - responseHeadersAt,
-                    networkMs: payloadParsedAt - fetchStartedAt,
-                    serverMs: Number(payload.latency_ms || 0),
-                    da360Ms: Number(
-                        payload.timings_ms?.da360_ms
-                        ?? payload.timings_ms?.infer_ms
-                        ?? 0
-                    ),
-                    yopoMs: Number(payload.timings_ms?.yopo_ms || 0),
+                    ...this._requestStageMetrics(request, metricAppliedAt),
+                    applyDeadlineExceeded,
                     depthCommitMs,
+                    depthDecodeMs,
+                    depthDrawMs,
                     trajectoryApplyMs,
                     applyMs: trajectoryApplied ? trajectoryApplyMs : depthCommitMs,
                     captureToApplyMs: metricAppliedAt - frame.capturedAt,
                     frameAgeMs: metricAppliedAt - frame.capturedAt,
-                    serverTimings: payload.timings_ms || null,
+                    captureSimTimeS: finiteNumberOrNull(frame.captureSimTimeS),
+                    captureWallTimeMs: frame.capturedAt,
+                    applyWallTimeMs,
+                    planningAgeS: applyWallTimeMs == null
+                        ? null
+                        : (applyWallTimeMs - frame.capturedAt) / 1000,
+                    captureActualState: frame.actualState || null,
+                    captureReferenceState: frame.referenceState || null,
+                    applyActualState,
+                    captureToApplyDelta,
+                    captureToApplyDisplacementM,
+                    planningOrigin: payload.planning_origin || null,
                     ...this._rgbMetrics(frameContext),
                 });
             };
@@ -1513,138 +2257,283 @@ export class PanoramaSensor {
                 ? 'applied'
                 : !planningAuthorized
                 ? 'blocked'
+                : applyDeadlineExceeded
+                ? 'stale'
                 : trajectoryApplied
                 ? 'applied'
                 : 'rejected';
-            // Emit every planning control outcome synchronously. Optional JPEG
-            // decoding may yield to a goal change; it is a separate display
-            // diagnostic and must not move/replace this navigation event.
-            const planningControlMetricsEmitted = request.mode === 'planning';
-            if (planningControlMetricsEmitted) {
-                this.onPerceptionMetrics?.(makeMetrics({ outcome }));
-            }
-
-            // Depth preview is useful UI, but it must not define planning
-            // success or delay the trajectory-application timestamp.
-            const depthCommitStartedAt = performance.now();
-            let depthPreviewError = null;
-            let depthPreviewCommitted = false;
-            try {
-                depthPreviewCommitted = await this._decodeAndCommitDepthImage(
-                    payload.depth_image,
-                    request,
-                    { markStale: request.mode !== 'planning' },
-                );
-                if (!depthPreviewCommitted) {
-                    if (request.mode !== 'planning') return false;
-                    depthPreviewError = 'stale:image-decoded-after-session-change';
+            const makePolarFrame = (previewPayload = payload) => {
+                let polarScan = normalizeDepthPolarScan(previewPayload.polar_scan);
+                if (polarScan && polarScan.depthMode !== previewPayload.depth_mode) {
+                    throw new Error('polar scan depth mode does not match response depth mode');
                 }
-            } catch (error) {
-                if (request.mode !== 'planning') throw error;
-                depthPreviewError = shortError(error);
-                reportUserError('Planning depth preview decode failed', error, {
-                    key: 'planning-depth-preview', intervalMs: 3000,
-                });
-            }
-            const depthCommittedAt = performance.now();
-            const depthPreviewLagFrames = Math.max(0, this._rgbFrameId - request.frameId);
-            // A new frame/goal may arrive while the optional JPEG is decoding.
-            // Never let the old preview overwrite the new session's UI state,
-            // but retain the already completed trajectory-install evidence.
-            if (this._isRequestSessionCurrent(request)) {
-                this._setDepthState(
-                    request.mode,
-                    finalReason
-                        ? `${outcome}:${finalReason}`
-                        : trajectoryApplied
-                        ? (depthPreviewError
-                            ? 'trajectory-ready:depth-preview-error'
-                            : depthPreviewLagFrames > 0
-                            ? `trajectory-ready:depth-lag-${depthPreviewLagFrames}-frames`
-                            : 'trajectory-ready')
-                        : 'depth-ready',
-                    { outcome, latencyMs: Number(payload.latency_ms) },
-                );
-            }
-            const appliedAt = trajectoryAppliedAt || depthCommittedAt;
-
-            // 帧率打点 + 限速诊断
-            const now = performance.now();
-            this._depthFpsCount++;
-            this._depthCycleSum += now - this._depthReqStart;
-            if (now - this._depthFpsTimer > 2000) {
-                const fps = this._depthFpsCount / ((now - this._depthFpsTimer) / 1000);
+                if (!captureIsLeveled || !capturePosition) polarScan = null;
+                return polarScan
+                    ? Object.freeze({
+                        scan: polarScan,
+                        frameId: request.frameId,
+                        requestId: request.requestId,
+                        capturedAt: frame.capturedAt,
+                        captureYawDeg: captureRotation.y,
+                        capturePosition: Object.freeze({
+                            x: capturePosition.x,
+                            y: capturePosition.y,
+                            z: capturePosition.z,
+                        }),
+                    })
+                    : null;
+            };
+            const recordCycle = (completedAt, applyDurationMs) => {
+                const depthPreviewLagFrames = Math.max(0, this._rgbFrameId - request.frameId);
+                this._depthFpsCount++;
+                this._depthCycleSum += completedAt - this._depthReqStart;
+                if (completedAt - this._depthFpsTimer <= 2000) return;
+                const fps = this._depthFpsCount
+                    / ((completedAt - this._depthFpsTimer) / 1000);
                 const avgCycle = this._depthCycleSum / Math.max(1, this._depthFpsCount);
                 console.log(
-                    `[depth] ${fps.toFixed(1)}Hz mode=${request.mode} goalId=${request.goalId || '-'} ` +
-                    `frameId=${request.frameId} generation=${request.generation} ` +
-                    `rgbTiles=${frameContext.rgbReadyFaces}/${frameContext.rgbTotalFaces} ` +
-                    `depthLag=${depthPreviewLagFrames}f ` +
-                    `reason=${finalReason ? `${outcome}:${finalReason}` : 'ok'} ` +
-                    `capture=${Math.round(frameContext.captureTimings?.total || 0)}ms ` +
-                    `render=${Math.round(frameContext.captureTimings?.render || 0)}ms ` +
-                    `scene=${Math.round(frameContext.captureTimings?.scene_render || 0)}ms ` +
-                    `tileWait=${Math.round(frameContext.captureTimings?.tile_wait || 0)}ms ` +
-                    `waitRender=${Math.round(frameContext.captureTimings?.wait_rerender || 0)}ms ` +
-                    `upload=${Math.round(frameContext.captureTimings?.face_upload || 0)}ms ` +
-                    `project=${Math.round(frameContext.captureTimings?.project || 0)}ms ` +
-                    `jpeg=${Math.round(materialized.jpegMs || tB - tA)}ms ` +
-                    `headers=${Math.round(responseHeadersAt - fetchStartedAt)}ms ` +
-                    `body=${Math.round(payloadParsedAt - responseHeadersAt)}ms ` +
-                    `da360=${Math.round(payload.timings_ms?.da360_ms ?? payload.timings_ms?.infer_ms ?? 0)}ms ` +
-                    `yopo=${Math.round(payload.timings_ms?.yopo_ms || 0)}ms ` +
-                    `apply=${Math.round(trajectoryApplied ? trajectoryApplyMs : depthCommittedAt - depthCommitStartedAt)}ms ` +
-                    `age=${Math.round(appliedAt - frame.capturedAt)}ms ` +
-                    `avgCycle=${avgCycle.toFixed(0)}ms`
+                    `[depth] ${fps.toFixed(1)}Hz mode=${request.mode} goalId=${request.goalId || '-'} `
+                    + `frameId=${request.frameId} generation=${request.generation} `
+                    + `rgbTiles=${frameContext.rgbReadyFaces}/${frameContext.rgbTotalFaces} `
+                    + `depthLag=${depthPreviewLagFrames}f `
+                    + `reason=${finalReason ? `${outcome}:${finalReason}` : 'ok'} `
+                    + `capture=${Math.round(frameContext.captureTimings?.total || 0)}ms `
+                    + `render=${Math.round(frameContext.captureTimings?.render || 0)}ms `
+                    + `scene=${Math.round(frameContext.captureTimings?.scene_render || 0)}ms `
+                    + `tileWait=${Math.round(frameContext.captureTimings?.tile_wait || 0)}ms `
+                    + `waitRender=${Math.round(frameContext.captureTimings?.wait_rerender || 0)}ms `
+                    + `upload=${Math.round(frameContext.captureTimings?.face_upload || 0)}ms `
+                    + `project=${Math.round(frameContext.captureTimings?.project || 0)}ms `
+                    + `jpeg=${Math.round(materialized.jpegMs || tB - tA)}ms `
+                    + `headers=${Math.round(responseHeadersAt - fetchStartedAt)}ms `
+                    + `body=${Math.round(payloadParsedAt - responseHeadersAt)}ms `
+                    + `bytes=${request.responseBytes ?? '-'} `
+                    + `gate=${Math.round(request.gateWaitMs ?? completedAt - request.gateAcquiredAt)}ms `
+                    + `da360=${Math.round(payload.timings_ms?.da360_ms ?? payload.timings_ms?.infer_ms ?? 0)}ms `
+                    + `yopo=${Math.round(payload.timings_ms?.yopo_ms || 0)}ms `
+                    + `apply=${Math.round(applyDurationMs || 0)}ms `
+                    + `age=${Math.round((trajectoryAppliedAt || completedAt) - frame.capturedAt)}ms `
+                    + `avgCycle=${avgCycle.toFixed(0)}ms`
                 );
-                this._depthFpsTimer = now; this._depthFpsCount = 0; this._depthCycleSum = 0;
-            }
-            const requestStillOwned = request.mode === 'planning'
-                ? this._isRequestNavigationCurrent(request)
-                : this._isRequestSessionCurrent(request);
-            if (requestStillOwned) {
-                this.lastDepthTime = performance.now();
-                if (depthPreviewCommitted && this.onDepthResult) {
-                    this.onDepthResult(payload.latency_ms);
+                this._depthFpsTimer = completedAt;
+                this._depthFpsCount = 0;
+                this._depthCycleSum = 0;
+            };
+
+            if (request.mode === 'planning') {
+                // The compact trajectory response is the control product.  Set
+                // state and release the single-request gate before any base64
+                // decode or canvas draw belonging only to the operator preview.
+                if (this._isRequestSessionCurrent(request)) {
+                    this._setDepthState(
+                        request.mode,
+                        finalReason
+                            ? `${outcome}:${finalReason}`
+                            : trajectoryApplied ? 'trajectory-ready' : 'depth-ready',
+                        { outcome, latencyMs: Number(payload.latency_ms) },
+                    );
                 }
+                this.lastDepthTime = performance.now();
+                this._releaseDepthRequest(request);
+                this._emitPerceptionMetrics(makeMetrics({ outcome }));
+                recordCycle(performance.now(), trajectoryApplyMs);
+
+                const emitDisplayMetrics = ({
+                    depthPreviewCommitted,
+                    depthPreviewError,
+                    depthCommitStartedAt,
+                    depthCommittedAt,
+                    depthDecodeMs = null,
+                    depthDrawMs = null,
+                    previewWasIncluded = false,
+                    previewFetchMs = null,
+                    previewResponseBytes = null,
+                }) => {
+                    const displayOutcome = depthPreviewCommitted
+                        ? 'applied'
+                        : depthPreviewError?.startsWith('stale:') ? 'stale' : 'error';
+                    const displayMetrics = makeMetrics({
+                        outcome: displayOutcome,
+                        depthPreviewError,
+                        depthPreviewCommitted,
+                        depthCommittedAt,
+                        depthCommitStartedAt,
+                        depthDecodeMs,
+                        depthDrawMs,
+                    });
+                    this._emitPerceptionMetrics(Object.freeze({
+                        ...displayMetrics,
+                        mode: 'depth-preview',
+                        outcome: displayOutcome,
+                        planningAuthorized: null,
+                        trajectoryApplied: null,
+                        trajectoryAppliedAtMs: null,
+                        dropReason: depthPreviewError,
+                        previewIncluded: previewWasIncluded,
+                        previewFetchMs,
+                        previewResponseBytes,
+                        applyMs: displayMetrics.depthCommitMs,
+                        captureToApplyMs: depthCommittedAt - frame.capturedAt,
+                        frameAgeMs: depthCommittedAt - frame.capturedAt,
+                        depthPreviewAgeMs: depthCommittedAt - frame.capturedAt,
+                    }));
+                };
+
+                if (!applyDeadlineExceeded && request.previewRequested) {
+                    // `_releaseDepthRequest()` queued the next compact planning
+                    // request first. Queue this UI-only worker afterwards so
+                    // preview fetch/colorization can never extend or reacquire
+                    // the single control gate.
+                    queueMicrotask(() => this._enqueueDepthPreview(request, async () => {
+                        const depthCommitStartedAt = performance.now();
+                        const previewTimings = {};
+                        let depthPreviewCommitted = false;
+                        let depthPreviewError = null;
+                        let previewPayload = previewIncluded ? payload : null;
+                        let previewFetchMs = null;
+                        let previewResponseBytes = null;
+                        try {
+                            if (!this._isDepthPreviewSessionCurrent(request)) {
+                                throw new Error('stale:preview-session-changed-before-fetch');
+                            }
+                            if (!previewPayload && payload.preview_available === true) {
+                                const previewFetchStartedAt = performance.now();
+                                const previewController = new AbortController();
+                                const previewTimeout = window.setTimeout(
+                                    () => previewController.abort('preview-timeout'),
+                                    Math.min(2000, DA360_TIMEOUT_MS),
+                                );
+                                try {
+                                    const previewQuery = new URLSearchParams({
+                                        frame_id: String(request.frameId),
+                                        goal_id: String(request.goalId),
+                                        generation: String(request.generation),
+                                    }).toString();
+                                    const previewResponse = await awaitWithAbort(
+                                        fetch(`${getYopoPreviewEndpoint()}?${previewQuery}`, {
+                                            method: 'GET',
+                                            signal: previewController.signal,
+                                        }),
+                                        previewController.signal,
+                                    );
+                                    previewResponseBytes = responseContentLength(previewResponse);
+                                    if (!previewResponse.ok) {
+                                        throw new Error(`preview HTTP ${previewResponse.status}`);
+                                    }
+                                    previewPayload = await awaitWithAbort(
+                                        previewResponse.json(),
+                                        previewController.signal,
+                                    );
+                                } finally {
+                                    window.clearTimeout(previewTimeout);
+                                    previewFetchMs = performance.now() - previewFetchStartedAt;
+                                }
+                            }
+                            if (!previewPayload) {
+                                throw new Error('response-missing-depth-preview');
+                            }
+                            if (String(previewPayload.frame_id ?? request.frameId)
+                                    !== String(request.frameId)
+                                || String(previewPayload.goal_id ?? request.goalId)
+                                    !== String(request.goalId)
+                                || String(previewPayload.generation ?? request.generation)
+                                    !== String(request.generation)) {
+                                throw new Error('stale:preview-identity-mismatch');
+                            }
+                            if (typeof previewPayload.depth_image !== 'string'
+                                || previewPayload.depth_image.length === 0) {
+                                throw new Error('response-missing-depth-preview');
+                            }
+                            const polarFrame = makePolarFrame(previewPayload);
+                            depthPreviewCommitted = await this._decodeAndCommitDepthImage(
+                                previewPayload.depth_image,
+                                request,
+                                {
+                                    markStale: false,
+                                    timings: previewTimings,
+                                    commitPolarFrame: true,
+                                    polarFrame,
+                                },
+                            );
+                            if (!depthPreviewCommitted) {
+                                depthPreviewError = 'stale:image-decoded-after-session-change';
+                            }
+                        } catch (error) {
+                            depthPreviewError = shortError(error);
+                            if (!depthPreviewError.startsWith('stale:')) {
+                                reportUserError('Planning depth preview failed', error, {
+                                    key: 'planning-depth-preview', intervalMs: 3000,
+                                });
+                            }
+                        }
+                        const depthCommittedAt = performance.now();
+                        if (depthPreviewCommitted
+                            && this._isDepthPreviewSessionCurrent(request)) {
+                            this._invokeObserver(
+                                'Depth result',
+                                this.onDepthResult,
+                                [previewPayload?.latency_ms ?? payload.latency_ms],
+                            );
+                        }
+                        emitDisplayMetrics({
+                            depthPreviewCommitted,
+                            depthPreviewError,
+                            depthCommitStartedAt,
+                            depthCommittedAt,
+                            previewWasIncluded: !!previewPayload?.depth_image,
+                            previewFetchMs,
+                            previewResponseBytes,
+                            ...previewTimings,
+                        });
+                    }));
+                }
+                return !applyDeadlineExceeded;
             }
-            if (!planningControlMetricsEmitted) {
-                this.onPerceptionMetrics?.(makeMetrics({
+
+            // Preview-only mode still awaits its display result because there
+            // is no trajectory to release independently.
+            const polarFrame = makePolarFrame();
+            const depthCommitStartedAt = performance.now();
+            const previewTimings = {};
+            const depthPreviewCommitted = await this._decodeAndCommitDepthImage(
+                payload.depth_image,
+                request,
+                {
+                    timings: previewTimings,
+                    commitPolarFrame: true,
+                    polarFrame,
+                },
+            );
+            if (!depthPreviewCommitted) return false;
+            const depthCommittedAt = performance.now();
+            if (this._isRequestSessionCurrent(request)) {
+                this._setDepthState('preview', 'depth-ready', {
                     outcome,
-                    depthPreviewError,
-                    depthPreviewCommitted,
-                    depthCommittedAt,
-                    depthCommitStartedAt,
-                }));
-            } else {
-                const displayOutcome = depthPreviewCommitted
-                    ? 'applied'
-                    : depthPreviewError?.startsWith('stale:')
-                    ? 'stale'
-                    : 'error';
-                const displayMetrics = makeMetrics({
-                    outcome: displayOutcome,
-                    depthPreviewError,
-                    depthPreviewCommitted,
-                    depthCommittedAt,
-                    depthCommitStartedAt,
+                    latencyMs: Number(payload.latency_ms),
                 });
-                this.onPerceptionMetrics?.(Object.freeze({
-                    ...displayMetrics,
-                    mode: 'depth-preview',
-                    outcome: displayOutcome,
-                    planningAuthorized: null,
-                    trajectoryApplied: null,
-                    trajectoryAppliedAtMs: null,
-                    dropReason: depthPreviewError,
-                    applyMs: displayMetrics.depthCommitMs,
-                    captureToApplyMs: depthCommittedAt - frame.capturedAt,
-                    frameAgeMs: depthCommittedAt - frame.capturedAt,
-                    depthPreviewAgeMs: depthCommittedAt - frame.capturedAt,
-                }));
+                this.lastDepthTime = depthCommittedAt;
+                this._invokeObserver(
+                    'Depth result',
+                    this.onDepthResult,
+                    [payload.latency_ms],
+                );
             }
+            this._emitPerceptionMetrics(makeMetrics({
+                outcome,
+                depthPreviewCommitted,
+                depthCommittedAt,
+                depthCommitStartedAt,
+                ...previewTimings,
+            }));
+            recordCycle(depthCommittedAt, depthCommittedAt - depthCommitStartedAt);
             return true;
         } catch (error) {
+            if (request.abortReason === 'planning-deadline') {
+                request.ageBudgetRemainingMs = YOPO_MAX_FRAME_AGE_MS
+                    - (performance.now() - request.frameContext.capturedAt);
+                this._markStale(request, 'planning-frame-too-old');
+                return false;
+            }
             const sessionChanged = request.mode === 'planning'
                 ? !this._isRequestNavigationCurrent(request)
                 : !this._isRequestSessionCurrent(request);
@@ -1657,10 +2546,11 @@ export class PanoramaSensor {
                 key: 'da360-depth-request', intervalMs: 3000,
             });
             this._depthPolarFrame = null;
-            this.lastDepthTime = performance.now();
+            const failedAt = performance.now();
+            this.lastDepthTime = failedAt;
             const offline = request.abortReason === 'timeout' || error?.name === 'TypeError';
             this._setDepthState(offline ? 'offline' : 'error', shortError(error));
-            this.onPerceptionMetrics?.({
+            this._emitPerceptionMetrics(Object.freeze({
                 frameId: request.frameId,
                 goalId: request.goalId,
                 generation: request.generation,
@@ -1668,20 +2558,14 @@ export class PanoramaSensor {
                 outcome: offline ? 'offline' : 'error',
                 dropReason: shortError(error),
                 frameAgeMs: request.frameContext
-                    ? performance.now() - request.frameContext.capturedAt
+                    ? failedAt - request.frameContext.capturedAt
                     : null,
+                ...this._requestStageMetrics(request, failedAt),
                 ...this._rgbMetrics(request.frameContext),
-            });
+            }));
             return false;
         } finally {
-            if (timeout !== null) window.clearTimeout(timeout);
-            if (this._activeDepthRequest === request) {
-                this._activeDepthRequest = null;
-                this._depthAbortController = null;
-                this.depthPending = false;
-                this._depthGate = false;
-                this._queueLatestDepthRequest();
-            }
+            this._releaseDepthRequest(request);
         }
     }
 
@@ -1693,6 +2577,9 @@ export class PanoramaSensor {
         this.setCaptureProfile('flight', 'yopo-goal');
         this._abortActiveDepthRequest('goal-changed');
         this._abortActiveCapture('goal-changed');
+        this._cancelDepthCatchup();
+        this._invalidateQueuedDepthPreviews();
+        this._staleLogBuckets.clear();
         this._yopoGeneration++;
         this._planningEpoch++;
         this._goalId = `goal-${++this._goalSequence}`;
@@ -1701,6 +2588,7 @@ export class PanoramaSensor {
         this._navigationTransitionReason = 'goal-set';
         this._minimumRequestFrameId = this._rgbFrameId + 1;
         this._forceNextDepthRequest = true;
+        this._lastPlanningPreviewFetchAt = -Infinity;
         this._setDepthState('planning', 'awaiting-new-rgb-frame');
         return this._goalId;
     }
@@ -1708,6 +2596,9 @@ export class PanoramaSensor {
     resetYopoGoal(reason = 'goal-reset') {
         this._abortActiveDepthRequest(reason);
         this._abortActiveCapture(reason);
+        this._cancelDepthCatchup();
+        this._invalidateQueuedDepthPreviews();
+        this._staleLogBuckets.clear();
         this._yopoGeneration++;
         this._planningEpoch++;
         this._goalId = null;

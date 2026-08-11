@@ -35,14 +35,15 @@
 - relative `plan_full` 只更新 depth canvas，并以 blocked outcome 排除出 planning/15Hz 统计。
 - `goalId/generation/frameId/requestId` 防止旧响应画面或轨迹覆盖。
 - 新目标等待下一完整 RGB；取消/到达返回 preview 并保留最后深度图。
-- 到达阈值为 4.0m；碰撞半径为 0.6m并带旧配置迁移。
+- 终端候选沿原 Poly5 完整执行，不用目标点直线环截断绕障曲线；随后到达要求三维距离不大于 4.0m、三维速度不大于 0.75m/s、无碰撞并连续稳定0.4s。终端碰撞、overrun或超出恢复包络会退回 approach 并重规划；碰撞半径为 0.6m并带旧配置迁移。
 - swept collision 每物理步执行，不受 no-hit cache 跳过。
-- 六面 capture 默认每两面向调度器 yield，支持 AbortSignal，并输出 render/project/scheduler timings。
-- FlightLogger 记录唯一 planning frame、stale/drop reason、各阶段延迟、capture-to-apply 和 p95。
+- 六面 capture 默认每三面向调度器 yield，支持 AbortSignal，并输出 render/project/scheduler timings。
+- FlightLogger 记录唯一 planning frame、选中候选/endstate/score、Poly5峰值、控制饱和、stale/drop reason、各阶段延迟、capture-to-apply 位移和 p95。
 
 ### 原子感知和 YOPO 契约
 
 - `PerceptionFrame` 原子绑定 RGB、capture transform、实际/参考状态、yaw、capture profile 和投影配置。
+- `PerceptionFrame` 同时冻结模拟时钟；回包后按捕获时域 fast-forward 原Poly5，仅执行剩余后缀，不用应用时状态重拟合陈旧终点。安装年龄不超过 `min(0.25s, 0.25T)`，且应用实际状态与后缀参考的位置/速度误差分别不超过 1.2m/3m/s。
 - capture 起点 planning snapshot 与完成后的 RGB frame context 绑定。
 - planning wire 分别传 actual `px/py/pz` 与 reference `rpx/rpy/rpz`；YOPO goal observation 使用 reference position/acceleration，世界 endpoint 使用 actual position。
 - 9 元 axis-major endstate、有限数值、traj time、实际/参考状态、加速度和响应 identity 有校验。
@@ -52,7 +53,7 @@
 
 - standalone 与 combined 共享 API v2 `/health`、`/depth`、`/depth/raw`。
 - `/depth` 保持小 JPEG并恢复轻量 metadata；`/depth/raw` 输出 NPZ 和完整指纹。
-- `/yopo/plan_full` 回显 frame/goal/generation、depth mode、calibration ID 和 timings。
+- `/yopo/plan_full` 回显 frame/goal/generation、depth mode、calibration ID 和 timings；飞行链固定 `include_preview=0` 跳过 polar/着色/JPEG。`/yopo/preview` 按身份从最近4个规划深度中取图，不重复DA360；前端约每2s异步采样并latest-only提交。授权响应必须带 `planning_diagnostics.schema_version=1`、选中action/candidate/lattice、score和原始网络系数，否则失败关闭。原始9元数组是 lattice 解码前的无量纲 tanh 系数；顶层9元 `endstate` 才是 sim Y-up 世界系轴主序，score 为越低越优的代价，终端速度为三维模长。
 - Anchor canonical 方向、姿态旋转和 sensor/component/world 映射已统一。
 - Fitter 支持分辨率像素中心映射、seam wrap 双线性、多 captures、一次 Huber 和留出验证。
 - metric loader 绑定模型、模型/请求尺寸、projection/JPEG、resample、checkpoint SHA 与 accepted 标志；每请求携带 `X-Projection-Config`，并在 GPU 前核对 RGB 尺寸和完整运行时投影指纹。
@@ -106,7 +107,7 @@
 
 ### 15Hz 与飞行验收
 
-- 六次 Cesium scene render、跨 context face upload 和每两面一次 rAF yield 仍需 live 分段数据；目前没有真实吞吐、主线程长任务或物理更新收益数据。
+- 六次 Cesium scene render、跨 context face upload 和默认每三面一次 rAF yield 仍需 live 分段数据；规划安装已与2s低频的缓存深度预览获取/解码解耦，但目前没有这版代码的真实吞吐、主线程长任务或物理更新收益数据。
 - `config/perception-sweep.json` 及闭环/质量评估脚本已实现；它们只负责判定已有数据，不代表候选已经跑过。
 - 6×96、6×80、6×64 的质量/性能矩阵尚未运行。
 - 修复前实测仅 depth 3.1Hz、YOPO 2.9Hz；这不是当前代码的验收结果，也不能作为已达标证据。
@@ -153,7 +154,7 @@ curl --noproxy '*' -s http://127.0.0.1:5688/yopo/health | python3 -m json.tool
 
 # 4. Firefox flight-profile 手工/日志 smoke
 ./launch-firefox-gpu.sh \
-'http://127.0.0.1:8080/?panoProfile=flight&panoPreloadRequired=0&panoWidth=384&panoHeight=192&panoFace=96&panoFacesPerSlice=2&panoVfov=180&panoJpeg=0.74&da360UploadScale=0.35&panoMs=20&depthMs=20&panoramaTileSse=512'
+'http://127.0.0.1:8080/?panoProfile=flight&panoPreloadRequired=0&panoWidth=384&panoHeight=192&panoFace=96&panoFacesPerSlice=3&panoVfov=180&panoJpeg=0.74&da360UploadScale=0.35&panoMs=20&depthMs=20&panoramaTileSse=512'
 
 # 5. 有授权 metric/truth flight log 后执行正式门禁
 python3 scripts/evaluate_closed_loop.py flight-log.json \
