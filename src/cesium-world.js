@@ -31,7 +31,6 @@
 import { reportUserError } from './error-report.js';
 import { erpDirectionToComponent, sampleAnchorDirections } from './erp-geometry.js';
 
-const DEFAULT_ION_TOKEN = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJqdGkiOiJlMTg2MGFhOS02YTdhLTQ1NWMtYjkzMi05YjQ2ODRlZjI5YTgiLCJpZCI6MjUxNzM1LCJpYXQiOjE3MzAyODI0ODN9.prWAxx4RB8teelutQQbVqdxhgRZpZ4zjw8wzM-8k1Ug';
 const DEFAULT_ASSET_ID = 2275207;
 const DEFAULT_VIEW = {
     longitude: 114.1690321,
@@ -422,7 +421,8 @@ function rotateXZ(v, radians) {
 export class CesiumWorld {
     constructor(containerId, options = {}) {
         this.containerId = containerId;
-        this.token = options.token || urlString('ionToken', DEFAULT_ION_TOKEN);
+        const runtimeToken = window.MINDCLOUD_RUNTIME_CONFIG?.cesiumIonToken;
+        this.token = options.token || runtimeToken || '';
         this.assetId = Number(options.assetId || urlNumber('assetId', DEFAULT_ASSET_ID));
         this.initialView = {
             longitude: urlNumber('lon', options.longitude ?? DEFAULT_VIEW.longitude),
@@ -505,6 +505,11 @@ export class CesiumWorld {
     async init(progressCb = null) {
         const Cesium = requireCesium();
         this.Cesium = Cesium;
+        if (!this.token) {
+            throw new Error(
+                'Cesium Ion token is not configured. Set CESIUM_ION_TOKEN before starting the local server.'
+            );
+        }
         Cesium.Ion.defaultAccessToken = this.token;
 
         if (Cesium.RequestScheduler && 'maximumRequestsPerServer' in Cesium.RequestScheduler) {

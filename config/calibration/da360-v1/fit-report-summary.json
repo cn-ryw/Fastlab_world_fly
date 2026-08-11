@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "scope": "sanitized aggregate summary; raw captures and locations are not published",
+  "validation_strategy": "leave-one-location-out",
+  "locations": 4,
+  "captures": 12,
+  "anchors_total": 1536,
+  "anchors_valid": 1140,
+  "anchors_in_metric_range": 833,
+  "valid_anchor_fraction": 0.7421875,
+  "selected_model": "scale_only",
+  "scale_only": {
+    "a": 0.0011892812185910185,
+    "b": 0.0,
+    "median_abs_rel": 0.37573337310072513,
+    "p90_abs_rel": 1.5070208607309958,
+    "near_10m_p90_error_m": 4.054186582565308
+  },
+  "automatic_acceptance": {
+    "passed": false,
+    "all_lolo_folds_passed": false
+  },
+  "manual_scope": "sim-to-sim experimental baseline only"
+}

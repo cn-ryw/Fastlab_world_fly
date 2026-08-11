@@ -4,7 +4,7 @@ set -Eeuo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 DA360_ROOT="$PROJECT_ROOT/third_party/DA360"
-CHECKPOINT_DIR="$DA360_ROOT/checkpoints"
+CHECKPOINT_DIR="$PROJECT_ROOT/models/da360"
 MODEL_NAME="${1:-${DA360_MODEL:-large}}"
 
 case "$MODEL_NAME" in
@@ -36,7 +36,8 @@ die() {
 command -v git >/dev/null 2>&1 || die "git is required to clone DA360."
 
 clone_da360() {
-    git clone --depth 1 https://github.com/Insta360-Research-Team/DA360.git "$DA360_ROOT"
+    git clone https://github.com/Insta360-Research-Team/DA360.git "$DA360_ROOT"
+    git -C "$DA360_ROOT" checkout --detach 93dd3fc32e8e8751ac1e4b26ff1a575adfc55661
 }
 
 gdown_cmd=()

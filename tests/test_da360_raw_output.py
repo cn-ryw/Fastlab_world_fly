@@ -19,7 +19,18 @@ def _post_raw(image_bytes):
                          timeout=60)
 
 
-def _jpeg_bytes(width=1036, height=518):
+def _request_size():
+    health = SESSION.get(f"{DA360_URL}/health", timeout=10).json()
+    calibration = health.get("calibration") or {}
+    return (
+        int(calibration.get("request_width") or 1036),
+        int(calibration.get("request_height") or 518),
+    )
+
+
+def _jpeg_bytes(width=None, height=None):
+    if width is None or height is None:
+        width, height = _request_size()
     img = Image.new("RGB", (width, height), (100, 150, 200))
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=85)

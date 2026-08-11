@@ -150,6 +150,12 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError) as e:
             print(f"Client connection closed while handling request: {e}", file=sys.stderr)
 
+    def log_request(self, code='-', size='-'):
+        """Log the path but never query values, which may contain credentials."""
+        safe_path = urlsplit(self.path or '/').path
+        self.log_message('"%s %s %s" %s %s', self.command, safe_path,
+                         self.request_version, str(code), str(size))
+
     def end_headers(self):
         # This API is intentionally same-origin.  Do not add wildcard CORS:
         # without it an unrelated web page cannot read or mutate local paths.
@@ -163,7 +169,9 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         # Per-path caching: immutable assets get long max-age; HTML revalidates
         path_no_query = (self.path or '').split('?', 1)[0]
         # 开发服务器：所有动态资源 no-cache。长缓存只用于版本化的第三方库。
-        if path_no_query.startswith('/src/') or path_no_query.startswith('/api/'):
+        if (path_no_query == '/runtime-config.js'
+                or path_no_query.startswith('/src/')
+                or path_no_query.startswith('/api/')):
             self.send_header('Cache-Control', 'no-store')
         elif path_no_query.startswith('/ThirdParty/') or path_no_query.startswith('/asset/vendor/'):
             self.send_header('Cache-Control', 'public, max-age=86400')
@@ -299,6 +307,20 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 
     def do_GET(self):
         if self._reject_untrusted_host():
+            return
+        if urlsplit(self.path or '/').path == '/runtime-config.js':
+            import json
+            token = os.environ.get('CESIUM_ION_TOKEN', '')
+            body = (
+                'window.MINDCLOUD_RUNTIME_CONFIG = Object.freeze('
+                + json.dumps({'cesiumIonToken': token}, ensure_ascii=True)
+                + ');\n'
+            ).encode('utf-8')
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/javascript; charset=utf-8')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
             return
         if self.path.startswith('/api/path/'):
             if self._reject_cross_origin_api():

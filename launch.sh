@@ -429,7 +429,8 @@ run_docker() {
     local docker_output
     if ! docker_output="$(docker run --rm -d --init \
         --name "$NAME" \
-        -p "$PORT:8000" \
+        -p "127.0.0.1:$PORT:8000" \
+        -e "CESIUM_ION_TOKEN=${CESIUM_ION_TOKEN:-}" \
         -v "$SCRIPT_DIR/asset/gate-paths:/var/www/google-tiles-flight/asset/gate-paths" \
         "$IMAGE" 2>&1)"; then
         echo "$docker_output" >&2

@@ -56,14 +56,21 @@ app.use((req, res, next) => {
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
     // Per-path caching: immutable assets get long max-age; HTML revalidates
     const p = req.path;
-    if (p === '/' || p === '/index.html' || p.endsWith('.html')) {
-        res.setHeader('Cache-Control', 'no-cache');
-    } else if (p.startsWith('/api/')) {
+    if (p === '/runtime-config.js' || p.startsWith('/api/')) {
         res.setHeader('Cache-Control', 'no-store');
+    } else if (p === '/' || p === '/index.html' || p.endsWith('.html')) {
+        res.setHeader('Cache-Control', 'no-cache');
     } else {
         res.setHeader('Cache-Control', 'public, max-age=86400');
     }
     next();
+});
+
+app.get('/runtime-config.js', (req, res) => {
+    const config = { cesiumIonToken: process.env.CESIUM_ION_TOKEN || '' };
+    res.status(200)
+        .type('application/javascript; charset=utf-8')
+        .send(`window.MINDCLOUD_RUNTIME_CONFIG = Object.freeze(${JSON.stringify(config)});\n`);
 });
 
 app.options('/api/path/:name', (req, res) => res.status(204).end());

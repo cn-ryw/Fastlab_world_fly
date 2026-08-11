@@ -1,5 +1,15 @@
 __pycache__/
 *.pyc
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+.venv*/
+venv/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
 tools/
 third_party/DA360/
 
@@ -8,13 +18,32 @@ third_party/DA360/
 .dev-web.log
 .dev-firefox.log
 
-# Reproducible third-party web builds are fetched from versions.lock.json.
+# Reproducible third-party web builds are fetched by scripts/bootstrap.sh.
 third_party/Cesium/
 asset/vendor/playcanvas.min.js
 
-# Model weights and raw calibration captures live outside Git.  Only compact
-# manifests, fit reports, and approved calibration parameters are versioned.
+# Local assistant/editor configuration and credentials are never public files.
+CLAUDE.md
+.claude/
+.codex/
+.env
+.env.*
+*.pem
+*.key
+
+# Model weights, experiment outputs and raw calibration captures stay local.
 models/
+experiment_data/
 experiment_data/raw/
 experiment_data/**/*.npz
 experiment_data/**/*.npy
+artifacts/
+logs/
+flight-log-*.json
+closed-loop-report.json
+perception-quality-report.json
+*-manifest.json
+*-anchors.json
+*-rgb.jpg
+*-rgb.png
+drone_controller_config.json

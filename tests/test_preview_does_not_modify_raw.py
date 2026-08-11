@@ -1,5 +1,5 @@
 """Verify that calling /depth (preview) does NOT mutate the raw output of /depth/raw."""
-import io, os, sys
+import io, json, os, sys
 import numpy as np
 import pytest
 import requests
@@ -20,14 +20,28 @@ def _post_raw(image_bytes):
 
 
 def _post_depth(image_bytes):
+    health = SESSION.get(f"{DA360_URL}/health", timeout=10).json()
+    projection = (health.get("calibration") or {}).get("projection")
+    headers = {"Content-Type": "image/jpeg"}
+    if projection:
+        headers["X-Projection-Config"] = json.dumps(projection, separators=(",", ":"))
     return SESSION.post(f"{DA360_URL}/depth",
                          data=image_bytes,
-                         headers={"Content-Type": "image/jpeg"},
+                         headers=headers,
                          timeout=60)
 
 
+def _request_size():
+    health = SESSION.get(f"{DA360_URL}/health", timeout=10).json()
+    calibration = health.get("calibration") or {}
+    return (
+        int(calibration.get("request_width") or 1036),
+        int(calibration.get("request_height") or 518),
+    )
+
+
 def _jpeg_bytes():
-    img = Image.new("RGB", (1036, 518), (50, 180, 80))
+    img = Image.new("RGB", _request_size(), (50, 180, 80))
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=85)
     return buf.getvalue()

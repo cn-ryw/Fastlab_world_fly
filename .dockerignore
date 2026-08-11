@@ -1,11 +1,26 @@
 .git
 .gitignore
+.github
+.claude
+.codex
+.env
+.env.*
+CLAUDE.md
 node_modules
 __pycache__
 *.pyc
+.pytest_cache
+.venv
+.venv-test
 .DS_Store
 scene/*
+models/
+experiment_data/
+artifacts/
+logs/
+flight-log-*.json
 asset/gate-paths/*.tmp
+third_party/Cesium/
 # third_party/DA360 heavy assets excluded from web image:
 # checkpoints are bind-mounted at runtime; web container never touches them
 third_party/DA360/checkpoints/

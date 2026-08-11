@@ -1,0 +1,68 @@
+{
+  "schema_version": 1,
+  "accepted": true,
+  "a": 0.0011892812185910185,
+  "b": 0.0,
+  "depth_min_m": 0.5,
+  "depth_max_m": 20.0,
+  "model": "DA360_large",
+  "width": 476,
+  "height": 238,
+  "input_scale": 0.4594594594594595,
+  "resample": "bicubic",
+  "checkpoint_sha256": "bb5c6039a3e24d29dbcc62e451fda63bed8d59de3cf831b6a1dfa567121ee54a",
+  "requestWidth": 134,
+  "requestHeight": 67,
+  "input": {
+    "api_version": 2,
+    "model": "DA360_large",
+    "width": 476,
+    "height": 238,
+    "input_scale": 0.4594594594594595,
+    "resample": "bicubic",
+    "checkpoint_sha256": "bb5c6039a3e24d29dbcc62e451fda63bed8d59de3cf831b6a1dfa567121ee54a",
+    "request_width": 134,
+    "request_height": 67,
+    "depth_mode": "da360-relative",
+    "unit_pred_disp": "raw disparity (inverse depth), NOT per-frame normalized"
+  },
+  "projection": {
+    "width": 384,
+    "height": 192,
+    "faceSize": 96,
+    "rgbWidth": 134,
+    "rgbHeight": 67,
+    "verticalFovDeg": 180.0,
+    "faceFovDeg": 130.0,
+    "topPoleGuardDeg": 10.0,
+    "bottomPoleGuardDeg": 2.0,
+    "jpegQuality": 0.74,
+    "uploadScale": 0.3489583333333333
+  },
+  "dataset_fingerprint_sha256": "96e96f731ad7abf446029a357087066ad3d90933208904976015d81743f55bbb",
+  "selected_model": "scale_only",
+  "relation": "inverse_depth_1_per_m = a * pred_disp + b",
+  "fit_report": "fit-report-summary.json",
+  "acceptance": {
+    "passed": false,
+    "range_m": [0.5, 20.0],
+    "median_abs_rel_max": 0.15,
+    "p90_abs_rel_max": 0.3,
+    "near_10m_p90_error_m_max": 1.0,
+    "valid_anchor_fraction_min": 0.7,
+    "observed": {
+      "median_abs_rel": 0.37573337310072513,
+      "p90_abs_rel": 1.5070208607309958,
+      "near_10m_p90_error_m": 4.054186582565308,
+      "valid_anchor_fraction": 0.7421875,
+      "all_lolo_folds_passed": false
+    }
+  },
+  "manual_acceptance": {
+    "accepted": true,
+    "accepted_by": "maintainer",
+    "accepted_at": "2026-08-11",
+    "scope": "sim-to-sim",
+    "basis": "Retained as an experimental simulator baseline despite failing the automatic accuracy gates."
+  }
+}

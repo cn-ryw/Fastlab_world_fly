@@ -13,15 +13,15 @@ API_PORT="${MINDCLOUD_API_PORT:-5688}"
 API_CONTAINER="${MINDCLOUD_API_CONTAINER:-mindcloud-da360-yopo}"
 LEGACY_WEB_CONTAINER="google-tiles-flight"
 API_IMAGE="${MINDCLOUD_API_IMAGE:-mindcloud-da360-yopo:latest}"
-DA360_MODEL="${DA360_MODEL_PATH_HOST:-$SCRIPT_DIR/third_party/DA360/checkpoints/DA360_large.pth}"
-YOPO_MODEL="${YOPO_MODEL_PATH_HOST:-/home/ykx/ros1/YOPO_360_v15/YOPO/saved/YOPO_55/epoch10.pth}"
+DA360_MODEL="${DA360_MODEL_PATH_HOST:-$SCRIPT_DIR/models/da360/DA360_large.pth}"
+YOPO_MODEL="${YOPO_MODEL_PATH_HOST:-$SCRIPT_DIR/models/yopo/YOPO_55/epoch10.pth}"
 YOPO_CONFIG_NAME="${YOPO_CONFIG:-x5_cruise15_18m_a12_mask_wc3.yaml}"
 YOPO_CONFIG_PATH="$SCRIPT_DIR/third_party/YOPO/config/$YOPO_CONFIG_NAME"
 YOPO_BASE_CONFIG_PATH="$SCRIPT_DIR/third_party/YOPO/config/traj_opt.yaml"
 DEPENDENCY_LOCK="$SCRIPT_DIR/dependencies.lock.json"
 IMAGE_RECIPE="$SCRIPT_DIR/Dockerfile.da360-yopo"
 STARTUP_TIMEOUT="${MINDCLOUD_STARTUP_TIMEOUT:-180}"
-DEFAULT_CALIBRATION_FILE="$SCRIPT_DIR/../experiment_data/depth_calibration.json"
+DEFAULT_CALIBRATION_FILE="$SCRIPT_DIR/config/calibration/da360-v1/depth_calibration.json"
 DEPTH_MODE="${DA360_DEPTH_MODE:-da360-metric}"
 RESAMPLE="${DA360_RESAMPLE:-bicubic}"
 INPUT_SCALE="${DA360_INPUT_SCALE:-0.46}"
@@ -182,6 +182,8 @@ trap cleanup_failed_start EXIT
 echo "========================================="
 echo " MindCloud World Fly — 安全启动"
 echo "========================================="
+echo "WARNING: 自治链仅为 sim-to-sim 实验基线；metric 自动精度门禁未通过。"
+echo "WARNING: 未验证 15 Hz 持续运行、真实飞行安全或真实环境泛化能力。"
 
 echo ""
 echo "=== 1/4 预检 ==="
@@ -208,6 +210,8 @@ python3 -c 'import sys; value=float(sys.argv[1]); assert 0.2 <= value <= 1.0' "$
 [[ -s "$YOPO_CONFIG_PATH" ]] || die "YOPO config missing or empty: $YOPO_CONFIG_PATH"
 [[ -s "$YOPO_BASE_CONFIG_PATH" ]] || die "YOPO base config missing or empty: $YOPO_BASE_CONFIG_PATH"
 [[ -s "$DEPENDENCY_LOCK" ]] || die "dependency lock missing or empty: $DEPENDENCY_LOCK"
+[[ -n "${CESIUM_ION_TOKEN:-}" ]] \
+    || die "CESIUM_ION_TOKEN is required; export a restricted Cesium Ion token before startup"
 CALIBRATION_FILE=""
 if [[ -n "${DA360_DEPTH_CALIB_PATH_HOST:-}" ]]; then
     [[ -s "$DA360_DEPTH_CALIB_PATH_HOST" ]] \
@@ -234,8 +238,9 @@ YOPO_CONFIG_SHA256="$(sha256sum "$YOPO_CONFIG_PATH" | awk '{print $1}')"
 YOPO_BASE_CONFIG_SHA256="$(sha256sum "$YOPO_BASE_CONFIG_PATH" | awk '{print $1}')"
 DEPENDENCY_LOCK_SHA256="$(sha256sum "$DEPENDENCY_LOCK" | awk '{print $1}')"
 IMAGE_RECIPE_SHA256="$(sha256sum "$IMAGE_RECIPE" | awk '{print $1}')"
-python3 "$SCRIPT_DIR/scripts/verify_dependencies.py" --skip-checkpoints \
-    || die "browser/source dependency lock verification failed"
+python3 "$SCRIPT_DIR/scripts/verify_dependencies.py" \
+    --da360-model "$DA360_MODEL" --yopo-model "$YOPO_MODEL" \
+    || die "public dependency verification failed"
 readarray -t LOCKED_SHA256 < <(python3 - "$DEPENDENCY_LOCK" <<'PY'
 import json, sys
 with open(sys.argv[1], encoding="utf-8") as stream:
@@ -244,8 +249,7 @@ print(lock["model_checkpoints"]["da360_large"]["sha256"])
 print(lock["model_checkpoints"]["yopo_epoch10"]["sha256"])
 print(lock["runtime_dependencies"]["yopo_config"]["sha256"])
 print(lock["runtime_dependencies"]["yopo_config"]["base_sha256"])
-print(lock["container_images"]["yopo_base"]["reference"])
-print(lock["container_images"]["yopo_base"]["local_image_id"])
+print(lock["container_image"]["base"])
 PY
 )
 [[ "$DA360_SHA256" == "${LOCKED_SHA256[0]:-}" ]] \
@@ -256,30 +260,15 @@ PY
     || die "YOPO config does not match dependencies.lock.json"
 [[ "$YOPO_BASE_CONFIG_SHA256" == "${LOCKED_SHA256[3]:-}" ]] \
     || die "YOPO base config does not match dependencies.lock.json"
-IMAGE_BASE_LABEL="$(docker image inspect --format '{{ index .Config.Labels "mindcloud.yopo_base_image" }}' "$API_IMAGE" 2>/dev/null || true)"
+IMAGE_BASE_LABEL="$(docker image inspect --format '{{ index .Config.Labels "mindcloud.autonomy_base_image" }}' "$API_IMAGE" 2>/dev/null || true)"
 IMAGE_LOCK_LABEL="$(docker image inspect --format '{{ index .Config.Labels "mindcloud.dependencies_lock_sha256" }}' "$API_IMAGE" 2>/dev/null || true)"
 IMAGE_RECIPE_LABEL="$(docker image inspect --format '{{ index .Config.Labels "mindcloud.image_recipe_sha256" }}' "$API_IMAGE" 2>/dev/null || true)"
 [[ -n "$IMAGE_BASE_LABEL" && "$IMAGE_BASE_LABEL" == "${LOCKED_SHA256[4]:-}" ]] \
-    || die "Docker image base label is missing or does not match dependencies.lock.json; rebuild Dockerfile.da360-yopo"
+    || die "Docker image base label is missing or stale; run scripts/build-autonomy-image.sh"
 [[ -n "$IMAGE_LOCK_LABEL" && "$IMAGE_LOCK_LABEL" == "$DEPENDENCY_LOCK_SHA256" ]] \
     || die "Docker image dependency-lock label is missing or stale; rebuild Dockerfile.da360-yopo"
 [[ -n "$IMAGE_RECIPE_LABEL" && "$IMAGE_RECIPE_LABEL" == "$IMAGE_RECIPE_SHA256" ]] \
     || die "Docker image recipe label is missing or stale; rebuild Dockerfile.da360-yopo with the documented build args"
-docker image inspect "$API_IMAGE" "${LOCKED_SHA256[4]:-}" | python3 -c '
-import json, sys
-
-images = json.load(sys.stdin)
-if len(images) != 2:
-    raise SystemExit(1)
-candidate, base = images
-if base.get("Id") != sys.argv[1]:
-    raise SystemExit(1)
-candidate_layers = candidate.get("RootFS", {}).get("Layers", [])
-base_layers = base.get("RootFS", {}).get("Layers", [])
-if not base_layers or candidate_layers[:len(base_layers)] != base_layers:
-    raise SystemExit(1)
-' "${LOCKED_SHA256[5]:-}" \
-    || die "Docker image does not descend from the locked local YOPO base image"
 echo "  DA360: $(basename "$DA360_MODEL") sha256=${DA360_SHA256:0:16}..."
 echo "  YOPO:  $(basename "$YOPO_MODEL") sha256=${YOPO_SHA256:0:16}..."
 echo "  config: traj_opt.yaml sha256=${YOPO_BASE_CONFIG_SHA256:0:16}... + $YOPO_CONFIG_NAME sha256=${YOPO_CONFIG_SHA256:0:16}..."
@@ -332,9 +321,6 @@ run_args=(
     -p "127.0.0.1:$API_PORT:5688"
     -v "$DA360_MODEL:/models/DA360_large.pth:ro"
     -v "$YOPO_MODEL:/models/epoch10.pth:ro"
-    -v "$SCRIPT_DIR/third_party/DA360:/opt/DA360:ro"
-    -v "$SCRIPT_DIR/third_party/YOPO:/opt/YOPO_360/YOPO:ro"
-    -v "$SCRIPT_DIR/scripts:/opt/server:ro"
     -e "DA360_MODEL_SHA256=$DA360_SHA256"
     -e "YOPO_MODEL_SHA256=$YOPO_SHA256"
     -e "YOPO_CONFIG=$YOPO_CONFIG_NAME"
@@ -404,11 +390,6 @@ if (( ready == 0 )); then
     exit 1
 fi
 echo "  Web、DA360 与 YOPO 均已就绪"
-
-if [[ "${MINDCLOUD_FIX_CLASH:-0}" == "1" ]]; then
-    echo "  MINDCLOUD_FIX_CLASH=1：执行显式 Clash 修复"
-    "$SCRIPT_DIR/fix-clash-rules.sh" || echo "WARNING: Clash 修复失败" >&2
-fi
 
 START_COMPLETE=1
 trap - EXIT

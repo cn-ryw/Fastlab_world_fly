@@ -1,5 +1,5 @@
 """Verify the existing /depth endpoint is unchanged after adding /depth/raw."""
-import io, os, sys
+import io, json, os, sys
 import pytest
 import requests
 from PIL import Image
@@ -12,14 +12,31 @@ SESSION.trust_env = False
 
 
 def _post_depth(image_bytes):
+    headers = {"Content-Type": "image/jpeg", **_projection_headers()}
     return SESSION.post(f"{DA360_URL}/depth",
                          data=image_bytes,
-                         headers={"Content-Type": "image/jpeg"},
+                         headers=headers,
                          timeout=60)
 
 
+def _projection_headers():
+    health = SESSION.get(f"{DA360_URL}/health", timeout=10).json()
+    projection = (health.get("calibration") or {}).get("projection")
+    return ({"X-Projection-Config": json.dumps(projection, separators=(",", ":"))}
+            if projection else {})
+
+
+def _request_size():
+    health = SESSION.get(f"{DA360_URL}/health", timeout=10).json()
+    calibration = health.get("calibration") or {}
+    return (
+        int(calibration.get("request_width") or 1036),
+        int(calibration.get("request_height") or 518),
+    )
+
+
 def _jpeg_bytes():
-    img = Image.new("RGB", (1036, 518), (100, 150, 200))
+    img = Image.new("RGB", _request_size(), (100, 150, 200))
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=85)
     return buf.getvalue()
@@ -64,13 +81,15 @@ def test_depth_accepts_multiple_content_types():
     assert r1.status_code == 200
     # multipart
     r2 = SESSION.post(f"{DA360_URL}/depth",
-                       files={"image": ("test.jpg", jpg, "image/jpeg")}, timeout=60)
+                       files={"image": ("test.jpg", jpg, "image/jpeg")},
+                       headers=_projection_headers(), timeout=60)
     assert r2.status_code == 200
     # JSON-wrapped base64
     import base64
     b64 = base64.b64encode(jpg).decode()
     r3 = SESSION.post(f"{DA360_URL}/depth",
-                       json={"image": f"data:image/jpeg;base64,{b64}"}, timeout=60)
+                       json={"image": f"data:image/jpeg;base64,{b64}"},
+                       headers=_projection_headers(), timeout=60)
     assert r3.status_code == 200
 
 

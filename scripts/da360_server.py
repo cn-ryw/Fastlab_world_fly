@@ -979,6 +979,7 @@ def runner_health_payload(runner):
                 if calibration else None,
             "request_width": calibration.get("request_width") if calibration else None,
             "request_height": calibration.get("request_height") if calibration else None,
+            "projection": calibration.get("projection") if calibration else None,
             "dataset_fingerprint_sha256": calibration.get("dataset_fingerprint_sha256")
                 if calibration else None,
         },

@@ -1,10 +1,13 @@
 """Security regression tests for the local static and gate-path server."""
 
 import http.client
+import contextlib
+import io
 import sys
 import tempfile
 import threading
 import unittest
+from unittest import mock
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -46,6 +49,25 @@ class ServeSecurityTests(unittest.TestCase):
             with self.subTest(path=path):
                 status, _, _ = self.request("HEAD", path)
                 self.assertEqual(status, 200)
+
+    def test_runtime_config_is_uncached_and_uses_environment(self):
+        fake_token = "temporary-test-token-not-a-real-credential"
+        with mock.patch.dict("os.environ", {"CESIUM_ION_TOKEN": fake_token}):
+            status, headers, body = self.request("GET", "/runtime-config.js")
+        self.assertEqual(status, 200)
+        self.assertEqual(headers["Cache-Control"], "no-store")
+        self.assertIn(fake_token.encode(), body)
+        self.assertNotIn(fake_token, "/runtime-config.js")
+
+    def test_request_log_redacts_query_values(self):
+        fake_value = "temporary-query-credential"
+        captured = io.StringIO()
+        with contextlib.redirect_stderr(captured):
+            status, _, _ = self.request(
+                "GET", f"/runtime-config.js?credential={fake_value}"
+            )
+        self.assertEqual(status, 200)
+        self.assertNotIn(fake_value, captured.getvalue())
 
     def test_sensitive_and_traversal_paths_are_denied(self):
         paths = [
