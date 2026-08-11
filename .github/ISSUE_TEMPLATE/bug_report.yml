@@ -1,0 +1,28 @@
+name: Bug report
+description: Report a reproducible simulator problem
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: Do not include access tokens, private flight logs, raw calibration captures, or personal paths.
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Describe the observed and expected behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Reproduction steps
+    validations:
+      required: true
+  - type: input
+    id: revision
+    attributes:
+      label: Revision and environment
+      description: Commit, OS, browser and GPU/driver versions. Do not paste credentials.
+    validations:
+      required: true
