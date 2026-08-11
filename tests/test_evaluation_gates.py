@@ -50,7 +50,11 @@ def synthetic_log(
             "serverMs": server_ms,
             "depthMode": depth_mode,
             "calibrationId": calibration_id,
+            "calibrationAccuracyAccepted": True,
             "serviceFingerprint": service_fingerprint,
+            "rgbTilesReady": True,
+            "rgbReadyFaces": 6,
+            "rgbTotalFaces": 6,
         }
         for index in range(count)
     ]
@@ -97,6 +101,29 @@ def test_closed_loop_passes_strict_schema_after_unified_warmup():
     assert report["metrics"]["unique_planning_frames"] == 1000
     assert report["metrics"]["capture_to_apply_p95_ms"] == 100.0
     assert report["metrics"]["warm_server_p95_ms"] == 40.0
+    assert report["metrics"]["rgb_tiles_ready_planning_fraction"] == 1.0
+
+
+def test_closed_loop_reports_partial_rgb_tiles_without_blocking_user_test():
+    log = synthetic_log()
+    for event in log["perception"]:
+        event["rgbTilesReady"] = False
+        event["rgbReadyFaces"] = 3
+        event["rgbTileError"] = True
+        event["rgbReadinessReason"] = "tile-error"
+
+    report = closed_loop.evaluate_log(log)
+
+    assert report["passed"]
+    assert report["metrics"]["rgb_tiles_ready_planning_frames"] == 0
+    assert report["metrics"]["rgb_tiles_partial_planning_frames"] == len(
+        log["perception"]
+    )
+    assert report["metrics"]["rgb_tiles_unknown_planning_frames"] == 0
+    assert report["metrics"]["rgb_tile_error_planning_frames"] == len(
+        log["perception"]
+    )
+    assert report["metrics"]["rgb_tiles_ready_planning_fraction"] == 0.0
 
 
 def test_closed_loop_resolved_url_allowlist_matches_flight_logger_source():
@@ -359,6 +386,18 @@ def test_closed_loop_requires_complete_identity_and_stable_fingerprints():
     assert not report["checks"]["required_identity_fields"]
     assert not report["checks"]["calibration_id_stable"]
     assert not report["checks"]["service_fingerprint_stable"]
+
+
+def test_closed_loop_rejects_experimental_unaccepted_metric_calibration():
+    log = synthetic_log()
+    for event in log["perception"]:
+        event["calibrationAccuracyAccepted"] = False
+    report = closed_loop.evaluate_log(log)
+    assert not report["passed"]
+    assert not report["checks"]["calibration_accuracy_accepted"]
+    assert report["metrics"]["invalid_field_counts"][
+        "calibrationAccuracyAccepted"
+    ] == len(log["perception"])
 
 
 def test_closed_loop_requires_one_declared_navigation_session():

@@ -75,7 +75,7 @@ function testCardinal(u, v, W, H, expectedDir) {
     assert(d.dz > 0.98, `top dz ~ +1, got ${d.dz}`);
 }
 
-// Right side → +y (ERP left edge is right/down from center pixel)
+// Both ERP edges meet behind the vehicle.
 {
     const dR = erpPixelToDirection(383.5, 95.5, 384, 192, Math.PI);
     assert(Math.abs(dR.dy) < 0.02, 'right edge dy ~ 0 (backward, not left)');
@@ -122,8 +122,12 @@ assertClose(componentTop.x, 0, 'ERP top component x');
 assertClose(componentTop.y, 1, 'ERP top component y');
 assertClose(componentTop.z, 0, 'ERP top component z');
 
-// Explicit numerical parity with PanoramaEquirectProjector's GLSL
-// directionFromPitchYaw() across seams, poles and a cropped vertical FOV.
+// Explicit numerical parity with PanoramaEquirectProjector's GLSL and the
+// authoritative YOPO_360 CUDA training ray:
+//   d_body = (cos(pitch)cos(yaw), cos(pitch)sin(yaw), sin(pitch)).
+// The broken 2026-08-09 mapping used component x=-sin(yaw), which is not an
+// algebraic rename: at yaw=+90 deg it changes body-left/component +X into
+// body-right/component -X.  These samples cover both non-zero signs.
 for (const [u, v, vfov] of [
     [0, 0, Math.PI],
     [383, 191, Math.PI],
@@ -134,7 +138,7 @@ for (const [u, v, vfov] of [
     const pitch = vfov / 2 - (v + 0.5) / 192 * vfov;
     const cosPitch = Math.cos(pitch);
     const expected = {
-        x: -cosPitch * Math.sin(yaw),
+        x: cosPitch * Math.sin(yaw),
         y: Math.sin(pitch),
         z: -cosPitch * Math.cos(yaw),
     };

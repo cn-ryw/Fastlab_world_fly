@@ -92,15 +92,15 @@ const T = 1.125;
 {
     const d = new Drone();
     d.x = 0; d.y = 100; d.z = 0;
-    // 目标高度 130m，Y 多项式末尾应给出平滑过渡到 130m 的中间值
-    d.setIdealGoal({ x: 200, y: 130, z: 0 });
+    // 单段安全高度步进到 104m；更大的目标高差由 bridge 连续重规划逼近。
+    d.setIdealGoal({ x: 200, y: 104, z: 0 });
     // endstate 轴主序：[px,vx,ax, py,vy,ay, pz,vz,az]
-    d.setYopoTrajectory([16.9, 15.0, 2.0, 130.0, -10.0, 5.0, 1.2, 0.8, 0.3], 1.125);
+    d.setYopoTrajectory([16.9, 15.0, 2.0, 104.0, 4.0, 0.0, 1.2, 0.8, 0.3], 1.125);
 
-    // 中点：Y 多项式应给出介于 100→130 之间的中间值
+    // 中点：Y 多项式应给出介于 100→104 之间的中间值
     const ref = d._getYopoReference(0.5625);
-    assert(ref.y > 105 && ref.y < 125,
-        `中点高度 ${ref.y.toFixed(1)}m 应在 105~125 之间（Y 多项式平滑插值），不得被固定值覆盖`);
+    assert(ref.y > 100.5 && ref.y < 103.5,
+        `中点高度 ${ref.y.toFixed(1)}m 应在 100.5~103.5 之间（Y 多项式平滑插值），不得被固定值覆盖`);
     assert(Math.abs(ref.vy) > 1e-6,
         `中点垂直速度 ${ref.vy.toFixed(4)} m/s 不得为 0（Y 多项式非恒值）`);
     // 验证 X/Z 通道仍来自对应多项式

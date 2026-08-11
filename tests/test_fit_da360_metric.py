@@ -159,7 +159,7 @@ def _write_bundle(
         "erp": {
             "verticalFovDeg": 180.0,
             "sensorFrame": "NWU(+x forward,+y left,+z up)",
-            "componentFrame": "(+x right,+y up,+z back)",
+            "componentFrame": "(+x body-left,+y up,+z back)",
         },
         "sampling": {
             "gridCols": 2,

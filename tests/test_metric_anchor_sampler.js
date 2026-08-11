@@ -98,7 +98,7 @@ const position = { x: 2, y: 3, z: 4 };
     assert(result.metadata.identity.frameId === 'frame-9', 'sampler records perception frame ID');
     assert(result.metadata.image.width === 384 && result.metadata.image.height === 192,
         'sampler records the exact RGB image dimensions');
-    assert(result.metadata.erp.componentFrame === '(+x right,+y up,+z back)',
+    assert(result.metadata.erp.componentFrame === '(+x body-left,+y up,+z back)',
         'sampler records the projector component convention');
     assert(result.metadata.raycastSource === 'panorama-capture-viewer',
         'sampler records the dedicated RGB capture viewer as ray source');

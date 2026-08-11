@@ -30,10 +30,30 @@
  *   - Forward = local -Z at identity orientation
  *
  * FPV:   sticks → body-frame angular rates,  throttle → thrust,  no self-leveling
- * Drone: sticks → velocity command → position setpoint,  cascaded PI position/velocity/tilt hold
+ * Drone: sticks → jerk-limited velocity setpoint → position/velocity hold
  */
 
 import { reportUserError } from './error-report.js';
+import {
+    YopoTrajectoryTracker,
+    validateYopoTrajectory,
+} from './yopo-trajectory.js';
+import {
+    ControlCommandType,
+    allocateEasyForce,
+    capDirectForce,
+    desiredAttitudeFromForce,
+    firstOrderRateServo,
+    integrateBodyRates,
+    limitVector,
+    piecewiseHoverThrottle,
+    reducedQuaternionBodyRateSetpoint,
+    rotateVectorByQuaternion,
+    shapeAssistedAxis,
+    vectorNorm,
+} from './flight-control.js';
+
+export { validateYopoTrajectory } from './yopo-trajectory.js';
 
 const DEG2RAD = Math.PI / 180;
 const RAD2DEG = 180 / Math.PI;
@@ -43,45 +63,24 @@ const DRONE_BOOST_MULTIPLIER = 2.0;
 const FPV_BOOST_MULTIPLIER = 1.7;
 const DRONE_MAX_SUPPORTED_SPEED = 300 / 3.6; // 300 km/h in m/s
 const DRONE_MAX_SUPPORTED_VSPEED = 25;
+const FAILSAFE_HOLD_REASONS = new Set([
+    'unknown-flight-mode',
+    'non-finite-command',
+    'control-overrun',
+    'trajectory-rejected',
+    'trajectory-expired',
+    'collision',
+]);
 // Navigation completion is a product-level tolerance, not the YOPO lattice
 // radio_range. The external YOPO reference uses 4 m; using radio_range (9 m)
 // here caused a vehicle travelling at 5 m/s to be declared arrived at 8.94 m.
 export const ARRIVAL_DISTANCE_M = 4.0;
-const YOPO_DEFAULT_TRAJ_TIME_S = 1.125;
-const YOPO_MIN_TRAJ_TIME_S = 0.05;
-const YOPO_MAX_TRAJ_TIME_S = 5.0;
-const YOPO_MAX_ENDPOINT_DISTANCE_M = 120.0;
-const YOPO_MAX_ENDPOINT_SPEED_MPS = 50.0;
-const YOPO_MAX_ENDPOINT_ACCEL_MPS2 = 80.0;
 
 // Reusable PlayCanvas math objects (avoid per-frame allocation)
 const _quat  = new pc.Quat();
 const _quat2 = new pc.Quat();
 const _mat4  = new pc.Mat4();
 const _v3    = new pc.Vec3();
-
-// ── Poly5Solver — YOPO 5th-order polynomial trajectory ──────────────────
-// Ported from YOPO_360_v15/YOPO/policy/poly_solver.py
-class Poly5Solver {
-    constructor(pos0, vel0, acc0, pos1, vel1, acc1, Tf) {
-        const t = Tf;
-        const Coef_inv = [
-            [1, 0, 0, 0, 0, 0],
-            [0, 1, 0, 0, 0, 0],
-            [0, 0, 0.5, 0, 0, 0],
-            [-10/t**3, -6/t**2, -1.5/t, 10/t**3, -4/t**2, 0.5/t],
-            [15/t**4, 8/t**3, 1.5/t**2, -15/t**4, 7/t**3, -1/t**2],
-            [-6/t**5, -3/t**4, -0.5/t**3, 6/t**5, -3/t**4, 0.5/t**3],
-        ];
-        const s = [pos0, vel0, acc0, pos1, vel1, acc1];
-        this.A = Array.from({length: 6}, (_, i) =>
-            Coef_inv[i].reduce((sum, c, j) => sum + c * s[j], 0)
-        );
-    }
-    position(t) { return this.A[0]+this.A[1]*t+this.A[2]*t*t+this.A[3]*t**3+this.A[4]*t**4+this.A[5]*t**5; }
-    velocity(t) { return this.A[1]+2*this.A[2]*t+3*this.A[3]*t*t+4*this.A[4]*t**3+5*this.A[5]*t**4; }
-    acceleration(t) { return 2*this.A[2]+6*this.A[3]*t+12*this.A[4]*t*t+20*this.A[5]*t**3; }
-}
 
 /**
  * 推力矢量倾角限幅 —— 移植自 NetworkControl.cpp: get_Q_from_ACC()
@@ -141,44 +140,6 @@ export function leveledYawFromBackward(bx, bz) {
     };
 }
 
-/** Validate the public axis-major YOPO trajectory contract before mutation. */
-export function validateYopoTrajectory(endpoint, trajTime, currentPosition = { x: 0, y: 0, z: 0 }) {
-    if (!Array.isArray(endpoint) && !ArrayBuffer.isView(endpoint)) {
-        return { valid: false, reason: 'endstate must be an array' };
-    }
-    if (endpoint.length !== 9) {
-        return { valid: false, reason: `endstate must contain 9 values, got ${endpoint.length}` };
-    }
-    const values = Array.from(endpoint, Number);
-    if (!values.every(Number.isFinite)) {
-        return { valid: false, reason: 'endstate contains a non-finite value' };
-    }
-
-    const duration = trajTime == null ? YOPO_DEFAULT_TRAJ_TIME_S : Number(trajTime);
-    if (!Number.isFinite(duration) || duration < YOPO_MIN_TRAJ_TIME_S || duration > YOPO_MAX_TRAJ_TIME_S) {
-        return { valid: false, reason: `trajTime ${trajTime} is outside ${YOPO_MIN_TRAJ_TIME_S}-${YOPO_MAX_TRAJ_TIME_S}s` };
-    }
-
-    const positions = [values[0], values[3], values[6]];
-    const velocities = [values[1], values[4], values[7]];
-    const accelerations = [values[2], values[5], values[8]];
-    const displacement = Math.hypot(
-        positions[0] - Number(currentPosition.x || 0),
-        positions[1] - Number(currentPosition.y || 0),
-        positions[2] - Number(currentPosition.z || 0),
-    );
-    if (displacement > YOPO_MAX_ENDPOINT_DISTANCE_M) {
-        return { valid: false, reason: `endpoint displacement ${displacement.toFixed(2)}m exceeds ${YOPO_MAX_ENDPOINT_DISTANCE_M}m` };
-    }
-    if (Math.hypot(...velocities) > YOPO_MAX_ENDPOINT_SPEED_MPS) {
-        return { valid: false, reason: `endpoint speed exceeds ${YOPO_MAX_ENDPOINT_SPEED_MPS}m/s` };
-    }
-    if (Math.hypot(...accelerations) > YOPO_MAX_ENDPOINT_ACCEL_MPS2) {
-        return { valid: false, reason: `endpoint acceleration exceeds ${YOPO_MAX_ENDPOINT_ACCEL_MPS2}m/s²` };
-    }
-    return { valid: true, values, trajTime: duration };
-}
-
 export class Drone {
     constructor() {
         // ---- Geometry ----
@@ -217,43 +178,27 @@ export class Drone {
         this.maxYawRate   = 120;
         this.droneMaxYawRate = 80;  // Drone mode yaw rate limit (deg/s)
 
-        this.droneMaxAngle   = 45;   // max tilt angle
-        this.droneAngleRate  = 280;
         this.droneMaxVSpeed  = 8.0;
         this.droneMaxSpeed   = DRONE_MAX_SUPPORTED_SPEED;
 
-        // Cascaded PID gains
-        this.dronePosKp  = 2.0;
-        this.dronePosKi  = 0.3;
-        this.dronePosKd  = 0.1;
-        this.droneVelKp  = 3.0;
-        this.droneVelKi  = 1.0;
-        this.droneVelKd  = 0.05;
+        // PX4-v1.17-style position/velocity defaults. Position is P-only;
+        // velocity uses measurement-side D and actuator-aware anti-windup.
+        this.dronePosKp  = 0.95;
+        this.dronePosKi  = 0;
+        this.dronePosKd  = 0;
+        this.droneVelKp  = 1.8;
+        this.droneVelKi  = 0.4;
+        this.droneVelKd  = 0.2;
         this.droneAltKp  = 4.0;
         this.droneAltKi  = 2.0;
-        this.droneAltKd  = 0.1;
+        this.droneAltKd  = 0;
 
         // Position-hold setpoints (horizontal XY + altitude Y). Drone mode
         // yaw is pure rate control and does not use a target heading.
         this._targetX = 0; this._targetY = 2; this._targetZ = 0;
 
-        // Smoothed attitude targets (prevent limit-cycle at angle clamp)
-        this._smoothTargetPitch = 0;
-        this._smoothTargetRoll  = 0;
-
-        // Integral accumulators (position loop)
-        this._posIntX = 0; this._posIntY = 0; this._posIntZ = 0;
         // Integral accumulators (velocity loop)
         this._velIntX = 0; this._velIntY = 0; this._velIntZ = 0;
-        // Previous errors for derivative term
-        this._prevPosErrX = 0; this._prevPosErrY = 0; this._prevPosErrZ = 0;
-        this._prevVelErrX = 0; this._prevVelErrY = 0; this._prevVelErrZ = 0;
-        // Filtered derivative values (low-pass to suppress jitter)
-        this._filtPosDerrX = 0; this._filtPosDerrY = 0; this._filtPosDerrZ = 0;
-        this._filtVelDerrX = 0; this._filtVelDerrY = 0; this._filtVelDerrZ = 0;
-        // Anti-windup limits
-        this._posIntMax = 5.0;
-        this._velIntMax = 15.0;
 
         this.angularDrag = 8.0;
 
@@ -287,93 +232,208 @@ export class Drone {
 
         // ---- Ideal controller state ----
         this._idealGoal = null;      // {x,y,z,yaw} or null
-        this._idealCruiseMps = 15;   // cruise speed (m/s)
-        this._idealYawRate = 60;     // max yaw rate (deg/s)
         this._arrivalDistanceM = ARRIVAL_DISTANCE_M;
 
         // ---- YOPO trajectory tracking ----
-        this._yopoPolyX = null;      // Poly5Solver | null
-        this._yopoPolyY = null;
-        this._yopoPolyZ = null;
-        this._yopoTrajTime = 0;      // trajectory duration (s)
-        this._yopoTrackerTime = 0;   // current time along trajectory
-        this._yopoGoalYaw = 0;       // locked yaw for this trajectory
-
+        this._trajectory = new YopoTrajectoryTracker();
+        // Compatibility read-only aliases retained for logging and existing
+        // integration tests while lifecycle ownership lives in the tracker.
+        Object.defineProperties(this, {
+            _yopoPolyX: { get: () => this._trajectory.polynomials?.x ?? null },
+            _yopoPolyY: { get: () => this._trajectory.polynomials?.y ?? null },
+            _yopoPolyZ: { get: () => this._trajectory.polynomials?.z ?? null },
+            _yopoTrajTime: { get: () => this._trajectory.duration },
+            _yopoTrackerTime: { get: () => this._trajectory.time },
+        });
         // ---- Yaw lock (SO3 mode: fix initial yaw like YOPO lock_yaw=True) ----
         this._so3FixedYaw = null;    // null = unlocked, number = fixed yaw degrees
-        this._yopoDecayRef = null;   // smooth decel after YOPO trajectory ends
-        this._yopoDecayTimer = 0;
-        this._so3StickYaw = null;    // accumulated yaw from A/D keys in SO3 stick mode
-        this._so3AltitudeRef = null; // fixed altitude reference for goal mode
+        this._yopoDecayRef = null;   // compatibility: decay was removed in v4 controller
         this._yopoPlanTriggered = false; // YOPO 轨迹已下发后才允许到达判定
         this._navigationState = 'idle';
         this._navigationTransitionReason = null;
+        this._replanRequested = false;
 
-        // ---- SO3 geometric controller gains (verified in YOPO_360_v15) ----
-        // YOPO uses: kx=(5.7,5.7,6.2), kv=(3.4,3.4,4.0), kR=(1.5,1.5,1.0), kOm=(0.13,0.13,0.1)
-        // Our rate-control scheme: omega_des = (KR/KOmega)*eR, match ratio kR/kOm≈11.5
-        this.so3Kx = 6.0;            // position error gain (YOPO: 5.7~6.2)
-        this.so3Kv = 3.5;            // velocity error gain (YOPO: 3.4~4.0)
-        this.so3KR = 70.0;           // attitude error gain (KR/KOmega ≈ 11.5 matches YOPO kR/kOm)
-        this.so3KOmega = 6.0;        // angular velocity damping
-        this.so3MaxBodyRate = 220;   // max body rate (deg/s)
-        this.so3YawRate = 120;       // max yaw rate (deg/s, YOPO allows faster yaw)
+        // ---- Shared ideal-controller state ----
+        this._simTimeS = 0;
+        this._easyYawSetpointDeg = 0;
+        this._levelYawSetpointDeg = 0;
+        this._so3YawSetpointDeg = 0;
+        this._so3YawRateSetpointDeg = 0;
+        this._so3Hold = { x: this.x, y: this.y, z: this.z, yawDeg: this.yaw };
+        this._so3HoldCommandType = ControlCommandType.POSITION_VELOCITY_HOLD;
+        this._controlOverrunHoldRemaining = 0;
+        this._easyHorizontalState = 'hold';
+        this._easyVerticalState = 'hold';
+        this._easyHorizontalBrakeRamp = false;
+        this._easyVelocitySetpoint = { x: 0, y: 0, z: 0 };
+        this._easyAccelerationSetpoint = { x: 0, y: 0, z: 0 };
+        this._easyLimitedAcceleration = { x: 0, y: 0, z: 0 };
+        this._measuredAcceleration = { x: 0, y: 0, z: 0 };
+        this._controlDiagnostics = this._makeControlDiagnostics('initializing');
+        this._lastControlCommand = Object.freeze({
+            type: ControlCommandType.FAILSAFE_HOLD,
+            source: 'controller',
+            frame: 'sim-world-y-up',
+            generation: null,
+            createdSimTime: 0,
+            expirySimTime: null,
+        });
+
+        // ---- YOPO hold/direct-acceleration envelope ----
+        this.so3Kx = 5.7;            // compatibility scalar: horizontal hold gain
+        this.so3Kv = 3.4;            // compatibility scalar: horizontal hold gain
+        this.so3KxVertical = 6.2;
+        this.so3KvVertical = 4.0;
         this.so3CruiseMps = 15;      // cruise speed (YOPO cruise_target_mps = 15)
-        // 推力矢量相对世界竖直方向的最大倾角。对应 NetworkControl.cpp 的
-        // max_tilt_deg_（默认 60°，且该文件拒绝 > 60 的取值）。
-        // 限倾角而非限力的模，才能保证重力补偿不被削弱。
-        this.so3MaxTiltDeg = 60;
     }
 
     // ---- Public API ----
 
+    _makeControlDiagnostics(reason = null) {
+        return {
+            simTimeS: Number(this._simTimeS || 0),
+            commandType: ControlCommandType.FAILSAFE_HOLD,
+            source: 'controller',
+            frame: 'sim-world-y-up',
+            generation: null,
+            createdSimTime: Number(this._simTimeS || 0),
+            expirySimTime: null,
+            referenceState: null,
+            actualState: {
+                position: { x: Number(this.x || 0), y: Number(this.y || 0), z: Number(this.z || 0) },
+                velocity: { x: Number(this.vx || 0), y: Number(this.vy || 0), z: Number(this.vz || 0) },
+            },
+            rawAcceleration: { x: 0, y: 0, z: 0 },
+            limitedAcceleration: { x: 0, y: 0, z: 0 },
+            requestedForce: { x: 0, y: 0, z: 0 },
+            allocatedForce: { x: 0, y: 0, z: 0 },
+            tiltDeg: 0,
+            thrustGf: Number(this.thrustOutput || 0),
+            saturation: { horizontal: false, vertical: false, direct: false },
+            antiWindup: { horizontal: false, vertical: false },
+            trajectoryAgeS: null,
+            fallbackReason: reason,
+            overrunCount: Number(this._controlDiagnostics?.overrunCount || 0),
+            overrunDroppedSeconds: Number(this._controlDiagnostics?.overrunDroppedSeconds || 0),
+        };
+    }
+
+    getControlDiagnostics() {
+        const diagnostics = this._controlDiagnostics || this._makeControlDiagnostics('unavailable');
+        return Object.freeze({
+            ...diagnostics,
+            rawAcceleration: Object.freeze({ ...diagnostics.rawAcceleration }),
+            limitedAcceleration: Object.freeze({ ...diagnostics.limitedAcceleration }),
+            requestedForce: Object.freeze({ ...diagnostics.requestedForce }),
+            allocatedForce: Object.freeze({ ...diagnostics.allocatedForce }),
+            saturation: Object.freeze({ ...diagnostics.saturation }),
+            antiWindup: Object.freeze({ ...diagnostics.antiWindup }),
+            actualState: diagnostics.actualState ? Object.freeze({
+                ...diagnostics.actualState,
+                position: Object.freeze({ ...diagnostics.actualState.position }),
+                velocity: Object.freeze({ ...diagnostics.actualState.velocity }),
+            }) : null,
+            referenceState: diagnostics.referenceState ? Object.freeze({ ...diagnostics.referenceState }) : null,
+            ...(diagnostics.attitudeRateSetpoint ? {
+                attitudeRateSetpoint: Object.freeze({ ...diagnostics.attitudeRateSetpoint }),
+            } : {}),
+        });
+    }
+
+    handleControlOverrun({ droppedSeconds = 0, acceptedSeconds = 0.1 } = {}) {
+        const previous = this._controlDiagnostics || this._makeControlDiagnostics();
+        this._controlDiagnostics = {
+            ...previous,
+            overrunCount: previous.overrunCount + 1,
+            overrunDroppedSeconds: previous.overrunDroppedSeconds + Math.max(0, Number(droppedSeconds) || 0),
+            fallbackReason: 'control-overrun',
+        };
+        this._controlOverrunHoldRemaining = Math.max(
+            this._controlOverrunHoldRemaining,
+            Math.max(0.1, Number(acceptedSeconds) || 0),
+        );
+        this._latchSo3Hold('control-overrun', ControlCommandType.FAILSAFE_HOLD);
+        if (this.flightMode === 'so3' && this._trajectory.active) {
+            this._trajectory.clear('control-overrun');
+            this._navigationTransitionReason = 'control-overrun';
+            this._replanRequested = true;
+        }
+    }
+
+    _latchSo3Hold(reason = 'hold', commandType = null) {
+        this._so3Hold = { x: this.x, y: this.y, z: this.z, yawDeg: this.yaw };
+        this._so3YawSetpointDeg = this.yaw;
+        this._so3HoldCommandType = commandType || (FAILSAFE_HOLD_REASONS.has(reason)
+            ? ControlCommandType.FAILSAFE_HOLD
+            : ControlCommandType.POSITION_VELOCITY_HOLD);
+        if (this._controlDiagnostics) this._controlDiagnostics.fallbackReason = reason;
+    }
+
     /** Set ideal goal (point-to-point, no YOPO trajectory). */
     setIdealGoal(goal) {
         // A goal change starts a new navigation generation.  Never keep
-        // tracking a polynomial or decay reference generated for the prior
+        // tracking a polynomial generated for the prior
         // goal while the next perception response is still in flight.
         this._clearYopoMotionState();
         this._idealGoal = goal ? { x: goal.x, y: goal.y, z: goal.z, yaw: goal.yaw } : null;
-        this._so3AltitudeRef = goal ? goal.y : null;  // lock altitude
+        this._so3FixedYaw = goal ? this.yaw : null;
+        this._so3YawSetpointDeg = this.yaw;
+        this._latchSo3Hold(goal ? 'awaiting-trajectory' : 'goal-cleared');
         this._navigationState = goal ? 'active' : 'idle';
         this._navigationTransitionReason = goal ? 'goal-set' : 'goal-cleared';
     }
 
-    clearIdealGoal() { this._idealGoal = null; }
+    clearIdealGoal() {
+        // Public compatibility API: clearing a goal has the same safety
+        // boundary as setIdealGoal(null). An active polynomial must never
+        // outlive the navigation target that authorized it.
+        this.setIdealGoal(null);
+    }
 
     _clearYopoMotionState() {
         this._yopoPlanTriggered = false;
-        this._yopoPolyX = this._yopoPolyY = this._yopoPolyZ = null;
-        this._yopoTrajTime = 0;
-        this._yopoTrackerTime = 0;
-        this._yopoDecayRef = null;
-        this._yopoDecayTimer = 0;
+        this._trajectory.clear('motion-cleared');
+        this._replanRequested = false;
     }
 
-    /** Cancel current waypoint — clear goal + YOPO trajectory + decay + stop */
+    /** Cancel current waypoint without teleporting physical velocity. */
     cancelWaypoint() {
         this._idealGoal = null;
-        this._so3AltitudeRef = null;
         this._clearYopoMotionState();
+        this._replanRequested = false;
+        this._latchSo3Hold('cancelled');
         this._navigationState = 'cancelled';
         this._navigationTransitionReason = 'cancelled';
-        // Set current position as hold reference so drone stops immediately
-        this.vx = 0; this.vy = 0; this.vz = 0;
     }
 
     /** 载入 YOPO 轨迹末端状态 → 拟合五次多项式。 */
-    setYopoTrajectory(endpoint, trajTime) {
+    setYopoTrajectory(endpoint, trajTime, context = null) {
         // endpoint 采用**轴主序** [px,vx,ax, py,vy,ay, pz,vz,az]（sim 世界系）。
         // 这与 yopo_bridge.py 的输出、以及参考实现 test_yopo_ros.py 的
         // endstate_w[id, axis, order] 一致 —— 每个轴连续排布 位置/速度/加速度。
         // 切勿改成量主序 [px,py,pz, vx,vy,vz, ...]：那会把高度值填进 X 轴的
         // 终端速度、把加速度填进 Z 轴的终点位置，产生发散的参考轨迹。
         // 契约由 tests/test_yopo_endstate_layout.js 锁定。
-        const checked = validateYopoTrajectory(endpoint, trajTime, {
-            x: this.x,
-            y: this.y,
-            z: this.z,
+        const previousReference = this._trajectory.active
+            ? this._trajectory.referenceAt(this._trajectory.time)
+            : this._trajectory.lastReference;
+        const duration = trajTime == null ? 1.125 : Number(trajTime);
+        const providedContext = context && typeof context === 'object' ? context : {};
+        const commandContext = Object.freeze({
+            ...providedContext,
+            source: typeof providedContext.source === 'string' ? providedContext.source : 'yopo',
+            frame: 'sim-world-y-up',
+            generation: providedContext.generation ?? null,
+            createdSimTime: this._simTimeS,
+            expirySimTime: this._simTimeS + (Number.isFinite(duration) ? duration : 0),
         });
+        const checked = this._trajectory.install(endpoint, trajTime, {
+            x: this.x, y: this.y, z: this.z,
+            vx: this.vx, vy: this.vy, vz: this.vz,
+            ax: previousReference?.ax ?? 0,
+            ay: previousReference?.ay ?? 0,
+            az: previousReference?.az ?? 0,
+        }, commandContext);
         if (!checked.valid) {
             const now = globalThis.performance?.now?.() ?? Date.now();
             if (this._lastYopoRejectReason !== checked.reason || now - (this._lastYopoRejectAt || 0) > 1000) {
@@ -381,27 +441,19 @@ export class Drone {
                 this._lastYopoRejectReason = checked.reason;
                 this._lastYopoRejectAt = now;
             }
+            this._trajectory.clear('trajectory-rejected');
+            this._latchSo3Hold('trajectory-rejected');
+            this._replanRequested = true;
             return false;
         }
-        endpoint = checked.values;
-        const trajT = checked.trajTime;
-        // 轨迹交接：若旧轨迹仍活跃，取当前加速度做新轨迹初值，避免
-        // refAcc 跳变导致 _controlSO3 的姿态咯噔（"断断续续"的直接来源）。
-        const ax0 = this._yopoPolyX ? this._yopoPolyX.acceleration(Math.min(this._yopoTrackerTime, this._yopoTrajTime)) : 0;
-        const ay0 = this._yopoPolyY ? this._yopoPolyY.acceleration(Math.min(this._yopoTrackerTime, this._yopoTrajTime)) : 0;
-        const az0 = this._yopoPolyZ ? this._yopoPolyZ.acceleration(Math.min(this._yopoTrackerTime, this._yopoTrajTime)) : 0;
-
-        this._yopoPolyX = new Poly5Solver(this.x, this.vx, ax0, endpoint[0], endpoint[1], endpoint[2], trajT);
-        this._yopoPolyY = new Poly5Solver(this.y, this.vy, ay0, endpoint[3], endpoint[4], endpoint[5], trajT);
-        this._yopoPolyZ = new Poly5Solver(this.z, this.vz, az0, endpoint[6], endpoint[7], endpoint[8], trajT);
-        this._yopoTrajTime = trajT;
-        this._yopoTrackerTime = 0;
-        this._yopoGoalYaw = this.yaw;
-        this._yopoDecayRef = null;  // clear decay from previous trajectory
+        // 轨迹交接使用旧轨迹当前期望加速度作为新 Poly5 的初值，
+        // 避免重规划边界上的加速度跳变。
         this._yopoPlanTriggered = true;  // 标记已有轨迹到达，允许到达判定
+        this._replanRequested = false;
+        this._so3HoldCommandType = ControlCommandType.POSITION_VELOCITY_HOLD;
         this._navigationState = 'active';
         // 不清除 _idealGoal —— 目标是持久导航参考，轨迹是对它的连续逼近。
-        // 到达判断在 decay 结束时根据实际距离决定，不是在轨迹开始时就丢弃目标。
+        // 到达判断依据实际位置，不在轨迹开始时丢弃目标。
         return true;
     }
 
@@ -414,16 +466,12 @@ export class Drone {
         // 清除所有导航/轨迹状态 —— reset 可能发生在重选出生点后，
         // 旧坐标系下的多项式、目标、高度参考在新坐标系里毫无意义。
         this._idealGoal = null;
-        this._so3AltitudeRef = null;
-        this._yopoPolyX = this._yopoPolyY = this._yopoPolyZ = null;
-        this._yopoTrackerTime = 0;
-        this._yopoDecayRef = null;
-        this._yopoDecayTimer = 0;
+        this._trajectory.clear('reset');
         this._yopoPlanTriggered = false;
         this._navigationState = 'idle';
         this._navigationTransitionReason = 'reset';
+        this._replanRequested = false;
         this._so3FixedYaw = null;
-        this._so3StickYaw = null;
 
         this.x = this._spawnX; this.y = this._spawnY; this.z = this._spawnZ;
         this.vx = 0; this.vy = 0; this.vz = 0;
@@ -445,19 +493,41 @@ export class Drone {
         this.boostActive = false;
         this.boostMultiplier = 1.0;
         this._targetX = this._spawnX; this._targetY = this._spawnY; this._targetZ = this._spawnZ;
-        this._posIntX = 0; this._posIntY = 0; this._posIntZ = 0;
         this._velIntX = 0; this._velIntY = 0; this._velIntZ = 0;
-        this._prevPosErrX = 0; this._prevPosErrY = 0; this._prevPosErrZ = 0;
-        this._prevVelErrX = 0; this._prevVelErrY = 0; this._prevVelErrZ = 0;
-        this._filtPosDerrX = 0; this._filtPosDerrY = 0; this._filtPosDerrZ = 0;
-        this._filtVelDerrX = 0; this._filtVelDerrY = 0; this._filtVelDerrZ = 0;
-        this._smoothTargetPitch = 0;
-        this._smoothTargetRoll  = 0;
+        this._simTimeS = 0;
+        this._easyYawSetpointDeg = 0;
+        this._levelYawSetpointDeg = 0;
+        this._so3YawSetpointDeg = 0;
+        this._so3YawRateSetpointDeg = 0;
+        this._so3Hold = { x: this.x, y: this.y, z: this.z, yawDeg: this.yaw };
+        this._so3HoldCommandType = ControlCommandType.POSITION_VELOCITY_HOLD;
+        this._controlOverrunHoldRemaining = 0;
+        this._easyHorizontalState = 'hold';
+        this._easyVerticalState = 'hold';
+        this._easyHorizontalBrakeRamp = false;
+        this._easyVelocitySetpoint = { x: 0, y: 0, z: 0 };
+        this._easyAccelerationSetpoint = { x: 0, y: 0, z: 0 };
+        this._easyLimitedAcceleration = { x: 0, y: 0, z: 0 };
+        this._measuredAcceleration = { x: 0, y: 0, z: 0 };
+        this._controlDiagnostics = this._makeControlDiagnostics('reset');
+        this._lastControlCommand = Object.freeze({
+            type: ControlCommandType.FAILSAFE_HOLD,
+            source: 'controller',
+            frame: 'sim-world-y-up',
+            generation: null,
+            createdSimTime: 0,
+            expirySimTime: null,
+        });
     }
 
     readSettings() {
         const el = (id) => document.getElementById(id);
-        const v  = (id) => { const e = el(id); return e ? parseFloat(e.value) : null; };
+        const v = (id) => {
+            const element = el(id);
+            if (!element) return null;
+            const value = Number(element.value);
+            return Number.isFinite(value) ? value : null;
+        };
         const massVal   = v('phys-mass');
         const thrustVal = v('phys-thrust');
         const cdVal     = v('phys-drag-cd');
@@ -501,33 +571,42 @@ export class Drone {
         if (altKi !== null) this.droneAltKi = altKi;
         if (altKd !== null) this.droneAltKd = altKd;
 
-        // SO3 geometric controller gains
-        const so3KxVal = v('so3-kx');
-        const so3KvVal = v('so3-kv');
-        const so3KRVal  = v('so3-kr');
-        const so3KOmegaVal = v('so3-komega');
-        const so3MaxBodyRateVal = v('so3-max-body-rate');
-        const so3YawRateVal = v('so3-yaw-rate');
-        if (so3KxVal !== null) this.so3Kx = so3KxVal;
-        if (so3KvVal !== null) this.so3Kv = so3KvVal;
-        if (so3KRVal !== null) this.so3KR = so3KRVal;
-        if (so3KOmegaVal !== null) this.so3KOmega = so3KOmegaVal;
-        if (so3MaxBodyRateVal !== null) this.so3MaxBodyRate = so3MaxBodyRateVal;
-        if (so3YawRateVal !== null) this.so3YawRate = so3YawRateVal;
     }
 
     /** 到达目标后刹车：对齐参考 test_yopo_ros.py 的 TRAJECTORY_STATUS_EMPTY + 位置保持 */
     _onArrival() {
-        this._yopoPolyX = this._yopoPolyY = this._yopoPolyZ = null;  // 停轨迹跟踪
-        this._yopoDecayRef = null; this._yopoDecayTimer = 0;
+        this._trajectory.clear('arrival');
+        this._latchSo3Hold('arrival');
+        this._replanRequested = false;
         this._idealGoal = null;
-        this._so3AltitudeRef = null;
         this._navigationState = 'arrived';
         this._navigationTransitionReason = 'arrival-distance';
     }
 
     update(dt, input, collisionProvider) {
-        dt = Math.min(dt, 0.05);
+        dt = Math.min(Math.max(Number(dt) || 0, 0), 0.05);
+        if (dt <= 0) return;
+        const suppliedInput = input || { armed: false };
+        const suppliedRates = suppliedInput.rates || {};
+        const invalidControlInput = ['pitch', 'roll', 'yaw', 'throttle'].some(
+            axis => suppliedInput[axis] != null && !Number.isFinite(Number(suppliedInput[axis])),
+        ) || ['pitch', 'roll', 'yaw'].some(
+            axis => suppliedRates[axis] != null && !Number.isFinite(Number(suppliedRates[axis])),
+        );
+        input = {
+            ...suppliedInput,
+            pitch: Number.isFinite(Number(suppliedInput.pitch)) ? Number(suppliedInput.pitch) : 0,
+            roll: Number.isFinite(Number(suppliedInput.roll)) ? Number(suppliedInput.roll) : 0,
+            yaw: Number.isFinite(Number(suppliedInput.yaw)) ? Number(suppliedInput.yaw) : 0,
+            throttle: Number.isFinite(Number(suppliedInput.throttle)) ? Number(suppliedInput.throttle) : 0,
+            rates: {
+                pitch: Number.isFinite(Number(suppliedRates.pitch)) ? Number(suppliedRates.pitch) : 1,
+                roll: Number.isFinite(Number(suppliedRates.roll)) ? Number(suppliedRates.roll) : 1,
+                yaw: Number.isFinite(Number(suppliedRates.yaw)) ? Number(suppliedRates.yaw) : 1,
+            },
+        };
+        this._simTimeS += dt;
+        const velocityBeforeStep = { x: this.vx, y: this.vy, z: this.vz };
 
         // 0a. 到达判定。radio_range=9m 是网络格点范围，不是到达容差。
         // 到达半径与外部 YOPO 参考实现统一为 4m。
@@ -556,14 +635,21 @@ export class Drone {
         // 1. Control law → updates orientation quaternion and thrustOutput
         if (!input.armed) {
             this._updateDisarmed(dt);
+        } else if (invalidControlInput) {
+            this._controlFailsafeHold(dt, 'non-finite-command');
+        } else if (this._controlOverrunHoldRemaining > 0) {
+            this._controlOverrunHoldRemaining = Math.max(0, this._controlOverrunHoldRemaining - dt);
+            this._controlFailsafeHold(dt, 'control-overrun');
         } else if (this.flightMode === 'stabilized') {
             this._controlStabilized(dt, input, collisionProvider);
         } else if (this.flightMode === 'so3') {
             this._controlSO3(dt, input, collisionProvider);
         } else if (this.flightMode === 'drone') {
             this._controlDrone(dt, input);
-        } else {
+        } else if (this.flightMode === 'fpv') {
             this._controlFPV(dt, input);
+        } else {
+            this._controlFailsafeHold(dt, 'unknown-flight-mode');
         }
 
         // 2. Extract rotation matrix from orientation
@@ -617,12 +703,28 @@ export class Drone {
         // 5. Collisions
         this._handleCollisions(collisionProvider, previousPosition, dt);
 
+        this._measuredAcceleration = {
+            x: (this.vx - velocityBeforeStep.x) / dt,
+            y: (this.vy - velocityBeforeStep.y) / dt,
+            z: (this.vz - velocityBeforeStep.z) / dt,
+        };
+
         // 6. Derive euler angles for HUD
         this._updateEulerFromQuat();
         this.groundSpeed = Math.sqrt(this.vx * this.vx + this.vz * this.vz);
         this.airSpeed = Math.sqrt(this.vx * this.vx + this.vy * this.vy + this.vz * this.vz);
         this.speed = this.groundSpeed;
         this.verticalSpeed = this.vy;
+        if (this._controlDiagnostics) {
+            this._controlDiagnostics.simTimeS = this._simTimeS;
+            this._controlDiagnostics.thrustGf = this.thrustOutput;
+            // Publish the state after the common rigid-body/collision step so
+            // diagnostics never mix a post-step timestamp with pre-step state.
+            this._controlDiagnostics.actualState = {
+                position: { x: this.x, y: this.y, z: this.z },
+                velocity: { x: this.vx, y: this.vy, z: this.vz },
+            };
+        }
     }
 
     getCameraTransform() {
@@ -703,7 +805,7 @@ export class Drone {
 
     /** Return fixed yaw if SO3 yaw-lock is active, else current yaw. */
     getFixedYaw() {
-        const yawLockEl = document.getElementById('yaw-lock-toggle');
+        const yawLockEl = globalThis.document?.getElementById?.('yaw-lock-toggle');
         const lockEnabled = yawLockEl ? yawLockEl.checked : true;
         return (lockEnabled && this._so3FixedYaw != null) ? this._so3FixedYaw : this.yaw;
     }
@@ -841,7 +943,7 @@ export class Drone {
     /**
      * Called once on the frame a flight-mode transition is detected.
      * Re-anchors position-hold + altitude-hold setpoints to the drone's
-     * current state and clears PID integrator / derivative memory so the
+     * current state and clears controller integrator / filter memory so the
      * new mode does not fly toward stale targets or apply leftover control
      * effort accumulated during the previous mode.
      *
@@ -855,21 +957,15 @@ export class Drone {
         this._targetX = this.x;
         this._targetY = this.y;
         this._targetZ = this.z;
-        this._posIntX = 0; this._posIntY = 0; this._posIntZ = 0;
         this._velIntX = 0; this._velIntY = 0; this._velIntZ = 0;
-        this._prevPosErrX = 0; this._prevPosErrY = 0; this._prevPosErrZ = 0;
-        this._prevVelErrX = 0; this._prevVelErrY = 0; this._prevVelErrZ = 0;
-        this._filtPosDerrX = 0; this._filtPosDerrY = 0; this._filtPosDerrZ = 0;
-        this._filtVelDerrX = 0; this._filtVelDerrY = 0; this._filtVelDerrZ = 0;
-        this._smoothTargetPitch = 0;
-        this._smoothTargetRoll  = 0;
-
-        // Clear angular rates when entering so3 or stabilized (prevent FPV rate carryover)
-        if (newMode === 'so3' || newMode === 'stabilized') {
-            this.pitchRate = 0;
-            this.rollRate = 0;
-            this.yawRate = 0;
-        }
+        this._easyVelocitySetpoint = { x: this.vx, y: this.vy, z: this.vz };
+        this._easyAccelerationSetpoint = { x: 0, y: 0, z: 0 };
+        this._easyLimitedAcceleration = { x: 0, y: 0, z: 0 };
+        this._easyHorizontalState = Math.hypot(this.vx, this.vz) < 0.5 ? 'hold' : 'brake';
+        this._easyVerticalState = Math.abs(this.vy) < 0.2 ? 'hold' : 'brake';
+        this._easyHorizontalBrakeRamp = false;
+        this._easyYawSetpointDeg = this.yaw;
+        this._levelYawSetpointDeg = this.yaw;
         // 离开 SO3 模式即结束本次导航会话。旧目标、轨迹与高度覆盖不能
         // 在之后切回 SO3 时悄悄恢复；main.js 会消费 mode-exit 并同步清 UI。
         if (oldMode === 'so3' && newMode !== 'so3') {
@@ -879,6 +975,9 @@ export class Drone {
         // Lock yaw on entering SO3 mode (like YOPO lock_yaw=True)
         if (newMode === 'so3') {
             this._so3FixedYaw = this.yaw;
+            this._so3YawSetpointDeg = this.yaw;
+            this._so3YawRateSetpointDeg = 0;
+            this._latchSo3Hold('mode-enter');
         } else {
             this._so3FixedYaw = null;
         }
@@ -913,6 +1012,135 @@ export class Drone {
         }
     }
 
+    _assistedAxis(input, axis) {
+        const raw = Number(input?.rawAxes?.[axis]);
+        if (!Number.isFinite(raw)) return Number(input?.[axis]) || 0;
+        const config = input?.axisConfig?.[axis] || {};
+        return shapeAssistedAxis(raw, Number(config.deadzone) || 0, Number(config.expo) || 0);
+    }
+
+    _bodyBasis() {
+        const quaternion = {
+            x: this.orientation.x,
+            y: this.orientation.y,
+            z: this.orientation.z,
+            w: this.orientation.w,
+        };
+        const right = rotateVectorByQuaternion(quaternion, { x: 1, y: 0, z: 0 });
+        const up = rotateVectorByQuaternion(quaternion, { x: 0, y: 1, z: 0 });
+        const backward = rotateVectorByQuaternion(quaternion, { x: 0, y: 0, z: 1 });
+        let forward = { x: -backward.x, y: 0, z: -backward.z };
+        const forwardNorm = Math.hypot(forward.x, forward.z);
+        forward = forwardNorm > 1e-6
+            ? { x: forward.x / forwardNorm, y: 0, z: forward.z / forwardNorm }
+            : { x: 0, y: 0, z: -1 };
+        // Use one yaw-only heading to construct both horizontal axes. Projecting
+        // and normalizing tilted body X/Z independently makes them non-orthogonal
+        // and can amplify a diagonal Easy command beyond its speed limit.
+        // The simulator's geographic frame is x=east, y=up, z=north.  Its
+        // identity heading points south (-Z), so body-right is west (-X).
+        // Keep this yaw-only vector consistent with the keyboard contract
+        // (negative roll = left, positive roll = right) and with the depth
+        // projection's body-left convention.
+        const horizontalRight = { x: forward.z, y: 0, z: -forward.x };
+        return { right, up, backward, forward, horizontalRight };
+    }
+
+    _trackDesiredAttitude(dt, desiredQuaternion, rateLimitsDeg = null) {
+        const currentQuaternion = {
+            x: this.orientation.x,
+            y: this.orientation.y,
+            z: this.orientation.z,
+            w: this.orientation.w,
+        };
+        const targetRate = reducedQuaternionBodyRateSetpoint(
+            currentQuaternion,
+            desiredQuaternion,
+            rateLimitsDeg ? { rateLimitsDeg } : {},
+        );
+        const currentRate = {
+            x: this.pitchRate * DEG2RAD,
+            y: this.yawRate * DEG2RAD,
+            z: this.rollRate * DEG2RAD,
+        };
+        const actualRate = firstOrderRateServo(currentRate, targetRate, dt, 15);
+        const nextQuaternion = integrateBodyRates(currentQuaternion, actualRate, dt);
+        this.orientation.set(
+            nextQuaternion.x,
+            nextQuaternion.y,
+            nextQuaternion.z,
+            nextQuaternion.w,
+        );
+        this.pitchRate = actualRate.x * RAD2DEG;
+        this.yawRate = actualRate.y * RAD2DEG;
+        this.rollRate = actualRate.z * RAD2DEG;
+        return { targetRate, actualRate };
+    }
+
+    _applyForceAttitude(dt, force, yawRad, maxThrustN, rateLimitsDeg = null) {
+        const desiredQuaternion = desiredAttitudeFromForce(force, yawRad);
+        const rates = this._trackDesiredAttitude(dt, desiredQuaternion, rateLimitsDeg);
+        // Projection uses the exact same post-servo attitude that the common
+        // translational plant uses below; no cached pre-update body axis.
+        const bodyUp = this._bodyBasis().up;
+        const thrustN = Math.max(0, Math.min(
+            maxThrustN,
+            force.x * bodyUp.x + force.y * bodyUp.y + force.z * bodyUp.z,
+        ));
+        this.thrustOutput = thrustN / G * 1000;
+        this.throttlePercent = maxThrustN > 0 ? thrustN / maxThrustN : 0;
+        return { desiredQuaternion, bodyUp, thrustN, ...rates };
+    }
+
+    _setControlDiagnostics(values) {
+        const previous = this._controlDiagnostics || this._makeControlDiagnostics();
+        this._controlDiagnostics = {
+            ...this._makeControlDiagnostics(null),
+            overrunCount: previous.overrunCount,
+            overrunDroppedSeconds: previous.overrunDroppedSeconds,
+            ...values,
+            simTimeS: this._simTimeS,
+            thrustGf: this.thrustOutput,
+            actualState: {
+                position: { x: this.x, y: this.y, z: this.z },
+                velocity: { x: this.vx, y: this.vy, z: this.vz },
+            },
+        };
+        this._lastControlCommand = Object.freeze({
+            type: this._controlDiagnostics.commandType,
+            source: this._controlDiagnostics.source,
+            frame: this._controlDiagnostics.frame,
+            generation: this._controlDiagnostics.generation,
+            createdSimTime: this._controlDiagnostics.createdSimTime,
+            expirySimTime: this._controlDiagnostics.expirySimTime,
+        });
+    }
+
+    _controlFailsafeHold(dt, reason) {
+        this._so3HoldCommandType = ControlCommandType.FAILSAFE_HOLD;
+        const invalidatesActiveAutoTrajectory = this.flightMode === 'so3' && this._trajectory.active;
+        if (!this._so3Hold || this._controlDiagnostics?.fallbackReason !== reason) {
+            if (this._trajectory.active) this._trajectory.clear(reason);
+            this._latchSo3Hold(reason, ControlCommandType.FAILSAFE_HOLD);
+        }
+        if (invalidatesActiveAutoTrajectory) {
+            this._navigationTransitionReason = reason;
+            this._replanRequested = true;
+        }
+        this._controlPositionHold(dt, ControlCommandType.FAILSAFE_HOLD, reason);
+    }
+
+    _isYawLockEnabled() {
+        const element = globalThis.document?.getElementById?.('yaw-lock-toggle');
+        return element ? !!element.checked : true;
+    }
+
+    _wrapDegrees(value) {
+        let wrapped = (value + 180) % 360;
+        if (wrapped < 0) wrapped += 360;
+        return wrapped - 180;
+    }
+
     _controlFPV(dt, input) {
         const boost = input.boost ? FPV_BOOST_MULTIPLIER : 1.0;
         const rates = input.rates || { roll: 1, pitch: 1, yaw: 1 };
@@ -940,657 +1168,693 @@ export class Drone {
         if (Math.abs(input.roll)  < 0.05) this.rollRate  *= ad;
         if (Math.abs(input.yaw)   < 0.05) this.yawRate   *= ad;
 
-        // Apply body-frame rotations
-        this._applyBodyRotation(1, 0, 0, this.pitchRate * dt); // pitch around body X
-        this._applyBodyRotation(0, 0, 1, this.rollRate * dt);  // roll around body Z
-        this._applyBodyRotation(0, 1, 0, this.yawRate * dt);      // yaw around body Y
+        // Preserve the legacy 60 Hz right-endpoint attitude trajectory while
+        // the common plant now runs at 200 Hz. Stored rates keep the original
+        // exact 15/s response; only the integration sample gets the small
+        // deterministic phase lead that the coarser legacy step introduced.
+        const legacyStep = 1 / 60;
+        const legacyLag = legacyStep / Math.expm1(15 * legacyStep);
+        const currentLag = dt / Math.expm1(15 * dt);
+        const integrationLead = dt < legacyStep
+            ? Math.max(0, Math.min(1, 1 - legacyLag / currentLag))
+            : 0;
+        const integratedPitchRate = this.pitchRate + (tPR - this.pitchRate) * integrationLead;
+        const integratedRollRate = this.rollRate + (tRR - this.rollRate) * integrationLead;
+        const integratedYawRate = this.yawRate + (tYR - this.yawRate) * integrationLead;
+
+        if (dt < legacyStep) {
+            // Fractional power of the legacy one-frame Rx·Rz·Ry delta. This
+            // retains its non-commutative rotation order at 200 Hz instead of
+            // accumulating a different path from three smaller Euler steps.
+            const hp = integratedPitchRate * legacyStep * DEG2RAD * 0.5;
+            const hr = integratedRollRate * legacyStep * DEG2RAD * 0.5;
+            const hy = integratedYawRate * legacyStep * DEG2RAD * 0.5;
+            const sp = Math.sin(hp), cp = Math.cos(hp);
+            const sr = Math.sin(hr), cr = Math.cos(hr);
+            const sy = Math.sin(hy), cy = Math.cos(hy);
+            const fullX = sp * cr * cy - cp * sr * sy;
+            const fullY = cp * cr * sy - sp * sr * cy;
+            const fullZ = sp * cr * sy + cp * sr * cy;
+            const fullW = cp * cr * cy + sp * sr * sy;
+            const vectorLength = Math.hypot(fullX, fullY, fullZ);
+            if (vectorLength > 1e-12) {
+                const halfAngle = Math.atan2(vectorLength, fullW);
+                const fraction = dt / legacyStep;
+                const scale = Math.sin(halfAngle * fraction) / vectorLength;
+                _quat.set(
+                    fullX * scale,
+                    fullY * scale,
+                    fullZ * scale,
+                    Math.cos(halfAngle * fraction),
+                );
+                _quat2.copy(this.orientation).mul(_quat);
+                this.orientation.copy(_quat2).normalize();
+            }
+        } else {
+            this._applyBodyRotation(1, 0, 0, integratedPitchRate * dt); // pitch around body X
+            this._applyBodyRotation(0, 0, 1, integratedRollRate * dt);  // roll around body Z
+            this._applyBodyRotation(0, 1, 0, integratedYawRate * dt);   // yaw around body Y
+        }
 
         // Throttle → thrust (in grams-force)
         this.thrustOutput = ((input.throttle + 1) * 0.5) * this.maxThrust * boost;
         this.throttlePercent = this.maxThrust > 0
             ? Math.max(0, Math.min(1, this.thrustOutput / (this.maxThrust * boost)))
             : 0;
+        this._setControlDiagnostics({
+            commandType: ControlCommandType.BODY_RATE_THRUST,
+            source: 'fpv-stick',
+            createdSimTime: this._simTimeS,
+            expirySimTime: this._simTimeS + dt,
+            fallbackReason: null,
+        });
+    }
+
+    // ---- Unified ideal-controller implementation ----
+
+    _updateEasyMotionSetpoint(targetVelocity, dt, horizontalAcceleration, verticalUp, verticalDown) {
+        const currentVelocity = this._easyVelocitySetpoint;
+        const currentAcceleration = this._easyAccelerationSetpoint;
+        const responseTime = 0.35;
+        const desiredHorizontal = limitVector({
+            x: (targetVelocity.x - currentVelocity.x) / responseTime,
+            y: 0,
+            z: (targetVelocity.z - currentVelocity.z) / responseTime,
+        }, horizontalAcceleration);
+        const desiredVertical = Math.max(-verticalDown, Math.min(
+            verticalUp,
+            (targetVelocity.y - currentVelocity.y) / responseTime,
+        ));
+
+        const horizontalJerk = Math.max(0, horizontalAcceleration * 3);
+        const accelerationDelta = limitVector({
+            x: desiredHorizontal.x - currentAcceleration.x,
+            y: 0,
+            z: desiredHorizontal.z - currentAcceleration.z,
+        }, horizontalJerk * dt);
+        const verticalJerk = 3 * Math.max(verticalUp, verticalDown);
+        const nextAcceleration = {
+            x: currentAcceleration.x + accelerationDelta.x,
+            y: currentAcceleration.y + Math.max(-verticalJerk * dt, Math.min(
+                verticalJerk * dt,
+                desiredVertical - currentAcceleration.y,
+            )),
+            z: currentAcceleration.z + accelerationDelta.z,
+        };
+        const nextVelocity = {
+            x: currentVelocity.x + nextAcceleration.x * dt,
+            y: currentVelocity.y + nextAcceleration.y * dt,
+            z: currentVelocity.z + nextAcceleration.z * dt,
+        };
+
+        for (const axis of ['x', 'y', 'z']) {
+            const before = targetVelocity[axis] - currentVelocity[axis];
+            const after = targetVelocity[axis] - nextVelocity[axis];
+            if (before === 0 || before * after <= 0) {
+                nextVelocity[axis] = targetVelocity[axis];
+                nextAcceleration[axis] = 0;
+            }
+        }
+        this._easyVelocitySetpoint = nextVelocity;
+        this._easyAccelerationSetpoint = nextAcceleration;
     }
 
     _controlDrone(dt, input) {
-        const boost = input.boost ? DRONE_BOOST_MULTIPLIER : 1.0;
-        const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
-        this.boostActive = !!input.boost;
-        this.boostMultiplier = boost;
+        const clamp = (value, minimum, maximum) => Math.max(minimum, Math.min(maximum, value));
+        const finiteScale = (value) => Number.isFinite(Number(value)) ? Math.max(0, Number(value)) : 1;
+        const rates = input.rates || {};
+        const pitch = this._assistedAxis(input, 'pitch') * finiteScale(rates.pitch);
+        const roll = this._assistedAxis(input, 'roll') * finiteScale(rates.roll);
+        const throttle = this._assistedAxis(input, 'throttle');
+        const yaw = this._assistedAxis(input, 'yaw') * finiteScale(rates.yaw);
+        const horizontalStick = limitVector({ x: roll, y: 0, z: -pitch }, 1);
+        const horizontalActive = Math.hypot(horizontalStick.x, horizontalStick.z) > 1e-4;
+        const verticalActive = Math.abs(throttle) > 1e-4;
+        const basis = this._bodyBasis();
+        const boostScale = input.boost ? DRONE_BOOST_MULTIPLIER : 1;
+        const maxSpeed = Math.min(
+            DRONE_MAX_SUPPORTED_SPEED,
+            Math.max(1, this.droneMaxSpeed) * boostScale,
+        );
+        const maxVerticalSpeed = Math.min(
+            DRONE_MAX_SUPPORTED_VSPEED,
+            Math.max(1, this.droneMaxVSpeed) * boostScale,
+        );
+        const horizontalPilotVelocity = limitVector({
+            x: (basis.forward.x * horizontalStick.z + basis.horizontalRight.x * horizontalStick.x) * maxSpeed,
+            y: 0,
+            z: (basis.forward.z * horizontalStick.z + basis.horizontalRight.z * horizontalStick.x) * maxSpeed,
+        }, maxSpeed);
+        const pilotVelocity = {
+            x: horizontalPilotVelocity.x,
+            y: throttle * maxVerticalSpeed,
+            z: horizontalPilotVelocity.z,
+        };
 
-        // ---- 1. Determine stick state and compute desired velocity ----
-        // Get body-frame forward (-Z) and right (+X) in world XZ plane
-        _mat4.setTRS(pc.Vec3.ZERO, this.orientation, pc.Vec3.ONE);
-        _mat4.getZ(_v3);
-        let fwdX = -_v3.x, fwdZ = -_v3.z;
-        _mat4.getX(_v3);
-        let rightX = _v3.x, rightZ = _v3.z;
-
-        const fwdLen = Math.sqrt(fwdX * fwdX + fwdZ * fwdZ);
-        if (fwdLen > 1e-4) {
-            fwdX /= fwdLen; fwdZ /= fwdLen;
-        }
-        const rightLen = Math.sqrt(rightX * rightX + rightZ * rightZ);
-        if (rightLen > 1e-4) {
-            rightX /= rightLen; rightZ /= rightLen;
-        }
-
-        const rates = input.rates || { roll: 1, pitch: 1, yaw: 1 };
-        const maxSpd = Math.min(DRONE_MAX_SUPPORTED_SPEED, this.droneMaxSpeed * boost);
-        this.effectiveMaxSpeed = maxSpd;
-
-        const horizActive = Math.abs(input.pitch) > 0.05 || Math.abs(input.roll) > 0.05;
-        const vertActive  = Math.abs(input.throttle) > 0.05;
-
-        const yawActive = Math.abs(input.yaw) > 0.05;
-
-        let vDesX, vDesY, vDesZ;
-        let pilotCmdX = 0;
-        let pilotCmdZ = 0;
-
-        // ---- Horizontal: stick = target velocity, centered = position hold ----
-        if (horizActive) {
-            // Stick directly commands target velocity (body-frame → world-frame)
-            const cmdFwd   = -input.pitch * maxSpd * rates.pitch;
-            const cmdRight = -input.roll  * maxSpd * rates.roll;
-            pilotCmdX = cmdFwd * fwdX + cmdRight * rightX;
-            pilotCmdZ = cmdFwd * fwdZ + cmdRight * rightZ;
-            const pilotCmdH = Math.sqrt(pilotCmdX * pilotCmdX + pilotCmdZ * pilotCmdZ);
-            if (pilotCmdH > maxSpd) {
-                const s = maxSpd / pilotCmdH;
-                pilotCmdX *= s; pilotCmdZ *= s;
-            }
-            vDesX = pilotCmdX;
-            vDesZ = pilotCmdZ;
-
-            // Latch current position as hold target for when stick is released
+        let targetVelocityX = 0;
+        let targetVelocityZ = 0;
+        if (horizontalActive) {
+            this._easyHorizontalState = 'velocity';
+            this._easyHorizontalBrakeRamp = false;
+            targetVelocityX = pilotVelocity.x;
+            targetVelocityZ = pilotVelocity.z;
             this._targetX = this.x;
             this._targetZ = this.z;
-            // Clear position-loop state (not needed while stick is active)
-            this._posIntX = 0; this._posIntZ = 0;
-            this._filtPosDerrX = 0; this._filtPosDerrZ = 0;
-            this._prevPosErrX = 0; this._prevPosErrZ = 0;
         } else {
-            // Sticks centered → position hold via PID
-            const posErrX = this._targetX - this.x;
-            const posErrZ = this._targetZ - this.z;
-
-            const piMax = this._posIntMax;
-            this._posIntX = clamp(this._posIntX + posErrX * dt, -piMax, piMax);
-            this._posIntZ = clamp(this._posIntZ + posErrZ * dt, -piMax, piMax);
-
-            const dAlpha = 1 - Math.exp(-20 * dt);
-            const rawPosDerrX = dt > 0 ? (posErrX - this._prevPosErrX) / dt : 0;
-            const rawPosDerrZ = dt > 0 ? (posErrZ - this._prevPosErrZ) / dt : 0;
-            this._filtPosDerrX += (rawPosDerrX - this._filtPosDerrX) * dAlpha;
-            this._filtPosDerrZ += (rawPosDerrZ - this._filtPosDerrZ) * dAlpha;
-            this._prevPosErrX = posErrX;
-            this._prevPosErrZ = posErrZ;
-
-            vDesX = this.dronePosKp * posErrX + this.dronePosKi * this._posIntX + this.dronePosKd * this._filtPosDerrX;
-            vDesZ = this.dronePosKp * posErrZ + this.dronePosKi * this._posIntZ + this.dronePosKd * this._filtPosDerrZ;
+            if (this._easyHorizontalState === 'velocity') this._easyHorizontalState = 'brake';
+            if (this._easyHorizontalState === 'brake'
+                && Math.hypot(this.vx, this.vz) < 0.5
+                && Math.hypot(this._easyVelocitySetpoint.x, this._easyVelocitySetpoint.z) < 0.05
+                && Math.hypot(this._easyLimitedAcceleration.x, this._easyLimitedAcceleration.z) < 0.1) {
+                this._easyHorizontalState = 'hold';
+                this._easyHorizontalBrakeRamp = false;
+                this._targetX = this.x;
+                this._targetZ = this.z;
+            }
+            if (this._easyHorizontalState === 'hold') {
+                const holdVelocity = limitVector({
+                    x: this.dronePosKp * (this._targetX - this.x),
+                    y: 0,
+                    z: this.dronePosKp * (this._targetZ - this.z),
+                }, maxSpeed);
+                targetVelocityX = holdVelocity.x;
+                targetVelocityZ = holdVelocity.z;
+            }
         }
 
-        // ---- Vertical: stick = target vertical speed, centered = altitude hold ----
-        if (vertActive) {
-            vDesY = input.throttle * this.droneMaxVSpeed * boost;
-
-            // Latch current altitude as hold target
+        let targetVelocityY = 0;
+        if (verticalActive) {
+            this._easyVerticalState = 'velocity';
+            targetVelocityY = pilotVelocity.y;
             this._targetY = this.y;
-            this._posIntY = 0;
-            this._filtPosDerrY = 0;
-            this._prevPosErrY = 0;
         } else {
-            const posErrY = this._targetY - this.y;
-
-            const piMax = this._posIntMax;
-            this._posIntY = clamp(this._posIntY + posErrY * dt, -piMax, piMax);
-
-            const dAlpha = 1 - Math.exp(-20 * dt);
-            const rawPosDerrY = dt > 0 ? (posErrY - this._prevPosErrY) / dt : 0;
-            this._filtPosDerrY += (rawPosDerrY - this._filtPosDerrY) * dAlpha;
-            this._prevPosErrY = posErrY;
-
-            vDesY = this.droneAltKp * posErrY + this.droneAltKi * this._posIntY + this.droneAltKd * this._filtPosDerrY;
+            if (this._easyVerticalState === 'velocity') this._easyVerticalState = 'brake';
+            if (this._easyVerticalState === 'brake'
+                && Math.abs(this.vy) < 0.2
+                && Math.abs(this._easyVelocitySetpoint.y) < 0.2) {
+                this._easyVerticalState = 'hold';
+                this._targetY = this.y;
+            }
+            if (this._easyVerticalState === 'hold') {
+                targetVelocityY = clamp(this._targetY - this.y, -maxVerticalSpeed, maxVerticalSpeed);
+            }
         }
 
-        // Clamp desired velocity
-        const vDesH = Math.sqrt(vDesX * vDesX + vDesZ * vDesZ);
-        if (vDesH > maxSpd) {
-            const s = maxSpd / vDesH;
-            vDesX *= s; vDesZ *= s;
+        const massKg = Math.max(0.001, this.mass / 1000);
+        const maxThrustN = Math.max(0, this.maxThrust * G / 1000);
+        const maximumTotalAcceleration = maxThrustN / massKg;
+        const thrustHorizontalAcceleration = Math.sqrt(Math.max(
+            0,
+            maximumTotalAcceleration ** 2 - G ** 2,
+        ));
+        const horizontalAcceleration = Math.max(0.5, Math.min(
+            8,
+            0.8 * G * Math.tan(45 * DEG2RAD),
+            0.8 * thrustHorizontalAcceleration,
+        ));
+        const targetVelocity = { x: targetVelocityX, y: targetVelocityY, z: targetVelocityZ };
+        this._updateEasyMotionSetpoint(targetVelocity, dt, horizontalAcceleration, 4, 3);
+
+        const velocityError = {
+            x: this._easyVelocitySetpoint.x - this.vx,
+            y: this._easyVelocitySetpoint.y - this.vy,
+            z: this._easyVelocitySetpoint.z - this.vz,
+        };
+        const requestedAcceleration = {
+            x: this._easyAccelerationSetpoint.x
+                + this.droneVelKp * velocityError.x
+                + this.droneVelKi * this._velIntX
+                - this.droneVelKd * this._measuredAcceleration.x,
+            y: this._easyAccelerationSetpoint.y
+                + this.droneAltKp * velocityError.y
+                + this.droneAltKi * this._velIntY
+                - this.droneAltKd * this._measuredAcceleration.y,
+            z: this._easyAccelerationSetpoint.z
+                + this.droneVelKp * velocityError.z
+                + this.droneVelKi * this._velIntZ
+                - this.droneVelKd * this._measuredAcceleration.z,
+        };
+        let targetHorizontalAcceleration = limitVector({
+            x: requestedAcceleration.x,
+            y: 0,
+            z: requestedAcceleration.z,
+        }, horizontalAcceleration);
+        const priorLimitedAcceleration = this._easyLimitedAcceleration;
+        const horizontalJerkLimit = horizontalAcceleration * 3;
+        if (this._easyHorizontalState === 'brake') {
+            const actualSpeed = Math.hypot(this.vx, this.vz);
+            const priorAccelerationNorm = Math.hypot(
+                priorLimitedAcceleration.x,
+                priorLimitedAcceleration.z,
+            );
+            const accelerationOpposesVelocity = this.vx * priorLimitedAcceleration.x
+                + this.vz * priorLimitedAcceleration.z < 0;
+            const rampDownVelocity = priorAccelerationNorm ** 2
+                / Math.max(1e-9, 2 * horizontalJerkLimit);
+            if (accelerationOpposesVelocity
+                // The ideal plant still needs finite attitude-servo time to
+                // rotate the thrust axis back to level. Begin the jerk ramp
+                // before the pure translational stopping boundary so that
+                // residual tilt cannot create a second speed hump.
+                && actualSpeed <= rampDownVelocity + 1.0) {
+                if (!this._easyHorizontalBrakeRamp) {
+                    // Tracking ARW handles actuator saturation, while this is
+                    // an intentional jerk-ramp state transition. Discard the
+                    // velocity-loop memory that would otherwise re-accelerate
+                    // the craft as soon as HOLD is latched.
+                    this._velIntX = 0;
+                    this._velIntZ = 0;
+                }
+                this._easyHorizontalBrakeRamp = true;
+            }
+            if (this._easyHorizontalBrakeRamp) {
+                targetHorizontalAcceleration = { x: 0, y: 0, z: 0 };
+            }
         }
-        vDesY = clamp(vDesY, -this.droneMaxVSpeed * boost, this.droneMaxVSpeed * boost);
-        this.targetGroundSpeed = Math.sqrt(vDesX * vDesX + vDesZ * vDesZ);
-        this.pilotGroundSpeedCommand = Math.sqrt(pilotCmdX * pilotCmdX + pilotCmdZ * pilotCmdZ);
-        this.commandedGroundSpeed = this.targetGroundSpeed;
+        const horizontalCommandStep = limitVector({
+            x: targetHorizontalAcceleration.x - priorLimitedAcceleration.x,
+            y: 0,
+            z: targetHorizontalAcceleration.z - priorLimitedAcceleration.z,
+        }, horizontalJerkLimit * dt);
+        const targetVerticalAcceleration = clamp(requestedAcceleration.y, -3, 4);
+        const verticalCommandStep = clamp(
+            targetVerticalAcceleration - priorLimitedAcceleration.y,
+            -12 * dt,
+            12 * dt,
+        );
+        const limitedAcceleration = {
+            x: priorLimitedAcceleration.x + horizontalCommandStep.x,
+            y: priorLimitedAcceleration.y + verticalCommandStep,
+            z: priorLimitedAcceleration.z + horizontalCommandStep.z,
+        };
+        this._easyLimitedAcceleration = limitedAcceleration;
+        const requestedForce = {
+            x: massKg * limitedAcceleration.x,
+            y: massKg * (G + limitedAcceleration.y),
+            z: massKg * limitedAcceleration.z,
+        };
+        const tiltLimited = limitTiltPreservingGravity(
+            requestedForce.x,
+            requestedForce.y,
+            requestedForce.z,
+            massKg * G,
+            45,
+        );
+        const allocation = allocateEasyForce(tiltLimited, maxThrustN, {
+            horizontalMarginFraction: 0.3,
+            fallbackForce: { x: 0, y: Math.min(massKg * G, maxThrustN), z: 0 },
+        });
 
-        // ---- 2. Inner loop: Velocity PID → desired tilt angles ----
-        const maxAngle = this.droneMaxAngle;
-        let velErrX = vDesX - this.vx;
-        const velErrY = vDesY - this.vy;
-        let velErrZ = vDesZ - this.vz;
-
-        // Clamp velocity error so acceleration demand stays within angle limit
-        const aMaxHoriz = G * Math.tan(maxAngle * DEG2RAD);
-        const velErrClamp = aMaxHoriz / this.droneVelKp;
-        velErrX = clamp(velErrX, -velErrClamp, velErrClamp);
-        velErrZ = clamp(velErrZ, -velErrClamp, velErrClamp);
-
-        // Accumulate velocity integral (with anti-windup)
-        const viMax = this._velIntMax;
-        this._velIntX = clamp(this._velIntX + velErrX * dt, -viMax, viMax);
-        this._velIntY = clamp(this._velIntY + velErrY * dt, -viMax, viMax);
-        this._velIntZ = clamp(this._velIntZ + velErrZ * dt, -viMax, viMax);
-
-        // Derivative of velocity error (low-pass filtered to suppress jitter)
-        const vdAlpha = 1 - Math.exp(-15 * dt);
-        const rawVelDerrX = dt > 0 ? (velErrX - this._prevVelErrX) / dt : 0;
-        const rawVelDerrY = dt > 0 ? (velErrY - this._prevVelErrY) / dt : 0;
-        const rawVelDerrZ = dt > 0 ? (velErrZ - this._prevVelErrZ) / dt : 0;
-        this._filtVelDerrX += (rawVelDerrX - this._filtVelDerrX) * vdAlpha;
-        this._filtVelDerrY += (rawVelDerrY - this._filtVelDerrY) * vdAlpha;
-        this._filtVelDerrZ += (rawVelDerrZ - this._filtVelDerrZ) * vdAlpha;
-        this._prevVelErrX = velErrX;
-        this._prevVelErrY = velErrY;
-        this._prevVelErrZ = velErrZ;
-
-        // Desired world-frame horizontal acceleration
-        const aDesX = this.droneVelKp * velErrX + this.droneVelKi * this._velIntX + this.droneVelKd * this._filtVelDerrX;
-        const aDesZ = this.droneVelKp * velErrZ + this.droneVelKi * this._velIntZ + this.droneVelKd * this._filtVelDerrZ;
-
-        // Project desired acceleration onto body forward/right to get tilt angles
-        const aFwd   = aDesX * fwdX + aDesZ * fwdZ;
-        const aRight = aDesX * rightX + aDesZ * rightZ;
-
-        // Forward accel → negative pitch (nose down), right accel → positive roll
-        const targetPitch = clamp(-aFwd / G * RAD2DEG, -maxAngle, maxAngle);
-        const targetRoll  = clamp(-aRight / G * RAD2DEG, -maxAngle, maxAngle);
-
-        // Smooth target angles to prevent residual oscillation at saturation boundary
-        const smoothFactor = 1 - Math.exp(-10 * dt);
-        this._smoothTargetPitch += (targetPitch - this._smoothTargetPitch) * smoothFactor;
-        this._smoothTargetRoll  += (targetRoll  - this._smoothTargetRoll)  * smoothFactor;
-
-        // ---- 3. Attitude P-controller: tilt error → body rotation ----
-        const dec = this._decomposeOrientation();
-        const pitchErr = this._smoothTargetPitch - dec.bodyPitchDeg;
-        const rollErr  = this._smoothTargetRoll  - dec.bodyRollDeg;
-
-        const maxStep = this.droneAngleRate * dt;
-        const dpitch = clamp(pitchErr, -maxStep, maxStep);
-        const droll  = clamp(rollErr,  -maxStep, maxStep);
-
-        this._applyBodyRotation(1, 0, 0, dpitch);
-        this._applyBodyRotation(0, 0, 1, droll);
-
-        this.pitchRate = pitchErr * 5;
-        this.rollRate  = rollErr  * 5;
-
-        // ---- 4. Yaw: pure rate control, no target heading ----
-        // Stick commands yaw rate directly; a centered stick damps the rate
-        // toward zero (same pattern as FPV). This preserves whatever heading
-        // the drone has at that moment — in particular, a FPV→drone switch
-        // keeps the current heading instead of snapping to a stale setpoint.
-        const droneYawMax = this.droneMaxYawRate * rates.yaw * boost;
-        const tYR = input.yaw * droneYawMax;
-        const ys = 1 - Math.exp(-15 * dt);
-        this.yawRate += (tYR - this.yawRate) * ys;
-        if (!yawActive) {
-            // Stick centered → angular drag damps residual yaw rate to zero.
-            this.yawRate *= Math.exp(-this.angularDrag * dt);
+        const producedAcceleration = {
+            x: allocation.force.x / massKg,
+            y: allocation.force.y / massKg - G,
+            z: allocation.force.z / massKg,
+        };
+        const horizontalAntiWindup = allocation.saturatedHorizontal
+            || Math.hypot(
+                producedAcceleration.x - limitedAcceleration.x,
+                producedAcceleration.z - limitedAcceleration.z,
+            ) > 1e-4;
+        const arwGain = 2 / Math.max(0.1, this.droneVelKp);
+        const integralErrorX = horizontalAntiWindup
+            ? velocityError.x - arwGain * (limitedAcceleration.x - producedAcceleration.x)
+            : velocityError.x;
+        const integralErrorZ = horizontalAntiWindup
+            ? velocityError.z - arwGain * (limitedAcceleration.z - producedAcceleration.z)
+            : velocityError.z;
+        this._velIntX = clamp(this._velIntX + integralErrorX * dt, -20, 20);
+        this._velIntZ = clamp(this._velIntZ + integralErrorZ * dt, -20, 20);
+        const verticalCommandSaturated = Math.abs(
+            requestedAcceleration.y - limitedAcceleration.y,
+        ) > 1e-4;
+        const verticalActuatorSaturated = Math.abs(
+            limitedAcceleration.y - producedAcceleration.y,
+        ) > 1e-4;
+        const verticalSaturated = verticalCommandSaturated || verticalActuatorSaturated;
+        const verticalSameDirection = (verticalCommandSaturated
+            && ((requestedAcceleration.y > limitedAcceleration.y && velocityError.y > 0)
+                || (requestedAcceleration.y < limitedAcceleration.y && velocityError.y < 0)))
+            || (verticalActuatorSaturated
+                && ((limitedAcceleration.y > producedAcceleration.y && velocityError.y > 0)
+                    || (limitedAcceleration.y < producedAcceleration.y && velocityError.y < 0)));
+        if (!verticalSameDirection) {
+            this._velIntY = clamp(this._velIntY + velocityError.y * dt, -10, 10);
         }
-        this._applyBodyRotation(0, 1, 0, this.yawRate * dt);
 
-        // ---- 5. Altitude PID → thrust (in grams-force) ----
-        const aDesY = this.droneVelKp * velErrY + this.droneVelKi * this._velIntY + this.droneVelKd * this._filtVelDerrY;
-        let cmdGf = this.mass * (G + aDesY) / G;
+        this._easyYawSetpointDeg += clamp(yaw, -1, 1) * this.droneMaxYawRate * dt;
+        const attitude = this._applyForceAttitude(
+            dt,
+            allocation.force,
+            this._easyYawSetpointDeg * DEG2RAD,
+            maxThrustN,
+            { roll: 220, pitch: 220, yaw: 120 },
+        );
+        const tiltDeg = Math.atan2(
+            Math.hypot(allocation.force.x, allocation.force.z),
+            Math.max(1e-9, allocation.force.y),
+        ) * RAD2DEG;
 
-        // Tilt compensation
-        _mat4.setTRS(pc.Vec3.ZERO, this.orientation, pc.Vec3.ONE);
-        _mat4.getY(_v3);
-        const cosT = Math.max(0.1, _v3.y);
-        cmdGf /= cosT;
-
-        this.thrustOutput = clamp(cmdGf, 0, this.maxThrust * boost);
-        this.throttlePercent = this.maxThrust > 0
-            ? Math.max(0, Math.min(1, this.thrustOutput / (this.maxThrust * boost)))
-            : 0;
+        this.boostActive = !!input.boost;
+        this.boostMultiplier = 1;
+        this.effectiveMaxSpeed = maxSpeed;
+        this.commandedGroundSpeed = Math.hypot(
+            this._easyVelocitySetpoint.x,
+            this._easyVelocitySetpoint.z,
+        );
+        this.targetGroundSpeed = Math.hypot(targetVelocityX, targetVelocityZ);
+        this.pilotGroundSpeedCommand = Math.hypot(pilotVelocity.x, pilotVelocity.z);
+        this._setControlDiagnostics({
+            commandType: ControlCommandType.POSITION_VELOCITY_HOLD,
+            source: 'easy-stick-hold',
+            createdSimTime: this._simTimeS,
+            expirySimTime: this._simTimeS + dt,
+            referenceState: {
+                x: this._targetX, y: this._targetY, z: this._targetZ,
+                vx: this._easyVelocitySetpoint.x,
+                vy: this._easyVelocitySetpoint.y,
+                vz: this._easyVelocitySetpoint.z,
+            },
+            rawAcceleration: requestedAcceleration,
+            limitedAcceleration,
+            requestedForce,
+            allocatedForce: allocation.force,
+            tiltDeg,
+            saturation: {
+                horizontal: horizontalAntiWindup,
+                vertical: verticalSaturated,
+                direct: false,
+            },
+            antiWindup: { horizontal: horizontalAntiWindup, vertical: verticalSameDirection },
+            fallbackReason: null,
+            attitudeRateSetpoint: attitude.targetRate,
+        });
     }
 
-    // ---- Stabilized controller (PX4 self-level: stick → angle, auto-level) ----
-    // Angle-command mode: roll/pitch sticks set target tilt angle, yaw = rate,
-    // throttle = thrust.  Goes through normal physics path (no early return).
-    // YOPO trajectory and goal clicking use SO3 mode instead.
-
     _controlStabilized(dt, input, _collisionProvider) {
-        const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
-        const boost = input.boost ? DRONE_BOOST_MULTIPLIER : 1.0;
+        const finiteScale = (value) => Number.isFinite(Number(value)) ? Math.max(0, Number(value)) : 1;
+        const rates = input.rates || {};
+        const pitch = this._assistedAxis(input, 'pitch') * finiteScale(rates.pitch);
+        const roll = this._assistedAxis(input, 'roll') * finiteScale(rates.roll);
+        const yaw = this._assistedAxis(input, 'yaw') * finiteScale(rates.yaw);
+        const tiltStick = limitVector({ x: roll, y: 0, z: -pitch }, 1);
+        const tiltMagnitude = Math.min(1, Math.hypot(tiltStick.x, tiltStick.z));
+        const tiltRad = tiltMagnitude * 45 * DEG2RAD;
+        const yawRad = this._levelYawSetpointDeg * DEG2RAD;
+        const forward = { x: -Math.sin(yawRad), z: -Math.cos(yawRad) };
+        // Identity yaw faces south (-Z), hence body-right is west (-X).
+        // The previous vector was body-left and inverted every Level roll
+        // command relative to the FPV/keyboard convention.
+        const right = { x: -Math.cos(yawRad), z: Math.sin(yawRad) };
+        let horizontalX = 0;
+        let horizontalZ = 0;
+        if (tiltMagnitude > 1e-9) {
+            horizontalX = (right.x * tiltStick.x + forward.x * tiltStick.z) / tiltMagnitude;
+            horizontalZ = (right.z * tiltStick.x + forward.z * tiltStick.z) / tiltMagnitude;
+        }
+        const desiredThrustAxis = {
+            x: horizontalX * Math.sin(tiltRad),
+            y: Math.cos(tiltRad),
+            z: horizontalZ * Math.sin(tiltRad),
+        };
+        this._levelYawSetpointDeg += Math.max(-1, Math.min(1, yaw)) * 60 * dt;
+        const desiredQuaternion = desiredAttitudeFromForce(
+            desiredThrustAxis,
+            this._levelYawSetpointDeg * DEG2RAD,
+        );
+        const attitude = this._trackDesiredAttitude(
+            dt,
+            desiredQuaternion,
+            { roll: 220, pitch: 220, yaw: 120 },
+        );
+
         this.boostActive = !!input.boost;
-        this.boostMultiplier = boost;
-
-        const rates = input.rates || { roll: 1, pitch: 1, yaw: 1 };
-        const maxTilt = 45; // max tilt angle in degrees (stick at edge)
-
-        // Decompose orientation to get current body tilt
-        const dec = this._decomposeOrientation();
-        const currentPitch = dec.bodyPitchDeg;
-        const currentRoll  = dec.bodyRollDeg;
-
-        // Stick → target tilt angle (centered → 0° = auto-level)
-        const targetPitch =  input.pitch * maxTilt * rates.pitch;  // ArrowUp=-1 → neg pitch = nose-down = forward
-        const targetRoll  =  input.roll  * maxTilt * rates.roll;   // ArrowLeft=-1 → neg roll = left tilt
-
-        // Angle error P-control → target body rate
-        const angleP = 8.0;  // P gain: deg/s per degree of angle error
-        const pitchErr = targetPitch - currentPitch;
-        const rollErr  = targetRoll  - currentRoll;
-
-        const maxRate = 220; // deg/s
-        const pitchRateDes = clamp(pitchErr * angleP, -maxRate, maxRate) * boost;
-        const rollRateDes  = clamp(rollErr  * angleP, -maxRate, maxRate) * boost;
-
-        // Yaw: rate control (stick = rate, centered = stop)
-        const yawActive = Math.abs(input.yaw) > 0.05;
-        const yawRateDes = input.yaw * this._idealYawRate * rates.yaw * boost;
-
-        // Smooth rate tracking
-        const rateSmooth = 1 - Math.exp(-15 * dt);
-        this.pitchRate += (pitchRateDes - this.pitchRate) * rateSmooth;
-        this.rollRate  += (rollRateDes  - this.rollRate)  * rateSmooth;
-        this.yawRate   += (yawRateDes   - this.yawRate)   * rateSmooth;
-
-        // Damp when sticks centered and error small
-        if (Math.abs(input.pitch) < 0.05 && Math.abs(pitchErr) < 1.0) this.pitchRate *= Math.exp(-this.angularDrag * dt);
-        if (Math.abs(input.roll)  < 0.05 && Math.abs(rollErr)  < 1.0) this.rollRate  *= Math.exp(-this.angularDrag * dt);
-        if (!yawActive) this.yawRate *= Math.exp(-this.angularDrag * dt);
-
-        // Apply body-frame rotations
-        this._applyBodyRotation(1, 0, 0, this.pitchRate * dt);  // pitch around body X
-        this._applyBodyRotation(0, 0, 1, this.rollRate * dt);   // roll  around body Z
-        this._applyBodyRotation(0, 1, 0, this.yawRate * dt);    // yaw   around body Y
-
-        // 油门映射：摇杆中位=悬停推力，上推=爬升，下拉=下降。
-        // 旧公式 ((throttle+1)*0.5)*maxThrust 在 throttle=0 时给出 50% 最大推力
-        // (1300gf)，远超 980g 自重 → 无输入时自动上升，被用户误判为"油门自动增大"。
-        const hoverGf = this.mass;   // 悬停推力 = 自重（理想推重比 1:1）
-        const thrustRange = Math.max(this.maxThrust * boost - hoverGf, 0);
-        this.thrustOutput = Math.max(0, hoverGf + input.throttle * thrustRange);
-        this.throttlePercent = this.maxThrust > 0
-            ? Math.max(0, Math.min(1, this.thrustOutput / (this.maxThrust * boost)))
-            : 0;
-
+        this.boostMultiplier = 1;
+        this.thrustOutput = piecewiseHoverThrottle(
+            this._assistedAxis(input, 'throttle'),
+            this.mass,
+            this.maxThrust,
+        );
+        this.throttlePercent = this.maxThrust > 0 ? this.thrustOutput / this.maxThrust : 0;
         this.commandedGroundSpeed = 0;
         this.targetGroundSpeed = 0;
         this.pilotGroundSpeedCommand = 0;
         this.effectiveMaxSpeed = null;
+        this._setControlDiagnostics({
+            commandType: ControlCommandType.ATTITUDE_THRUST,
+            source: 'level-stick',
+            createdSimTime: this._simTimeS,
+            expirySimTime: this._simTimeS + dt,
+            tiltDeg: tiltRad * RAD2DEG,
+            fallbackReason: null,
+            attitudeRateSetpoint: attitude.targetRate,
+        });
     }
 
-    // ---- SO3 geometric controller ----
-    // Based on Lee et al. (2010) "Geometric Tracking Control of a Quadrotor UAV on SE(3)"
-    // Outputs thrust + body angular rates; physics integrator handles the rest.
-
-    /**
-     * Get YOPO reference state at time t along the current trajectory.
-     * Returns null if no YOPO trajectory is active.
-     */
-    /** 从 YOPO 多项式返回当前时刻的参考状态（位置/速度/加速度，sim 世界系）。 */
     _getYopoReference(t) {
-        if (!this._yopoPolyX) return null;
-        // Y 通道直接取多项式值，不做硬覆盖。参考实现 test_yopo_ros.py
-        // 跟踪的是完整三轴多项式，没有对任一轴做硬覆盖。
-        // 此前的实现把 y/vy/ay 钉在 _so3AltitudeRef/0/0，会导致异面目标
-        // 的高度过渡靠位置误差（限幅 ±3m）驱动，爬升缓慢（~0.07 m/s）
-        // 且到达后因缺速度参考而过冲。
-        // _so3AltitudeRef 的语义现为"多项式不可用时的 fallback 高度"，
-        // 仅在 _controlSO3 的 _idealGoal/stickInput 分支中用于 refY。
-        return {
-            x:  this._yopoPolyX.position(t),
-            y:  this._yopoPolyY.position(t),
-            z:  this._yopoPolyZ.position(t),
-            vx: this._yopoPolyX.velocity(t),
-            vy: this._yopoPolyY.velocity(t),
-            vz: this._yopoPolyZ.velocity(t),
-            ax: this._yopoPolyX.acceleration(t),
-            ay: this._yopoPolyY.acceleration(t),
-            az: this._yopoPolyZ.acceleration(t),
-        };
+        return this._trajectory.referenceAt(t);
     }
 
-    /**
-     * Build a desired-attitude quaternion from a world-frame force direction and desired yaw.
-     *
-     * Body-frame convention (matching the existing physics in update()):
-     *   body X = right,  body Y = up / thrust axis,  body Z = backward (-forward)
-     *   At identity: b1=(1,0,0)=east, b2=(0,1,0)=up, b3=(0,0,1)=north
-     *   Forward = -body Z = south at identity (yaw=0 faces -Z)
-     *
-     * R_d columns: b1d=right, b2d=thrust=forceDir, b3d=backward
-     * Forward direction in world: c1 = (-sin yaw, 0, -cos yaw)
-     */
-    _so3DesiredAttitude(forceX, forceY, forceZ, yawDesRad) {
-        const lenF = Math.sqrt(forceX * forceX + forceY * forceY + forceZ * forceZ);
-        if (lenF < 1e-6) {
-            // force too small — return level attitude at current yaw
-            const hy = yawDesRad * 0.5;
-            _quat.set(0, Math.sin(hy), 0, Math.cos(hy));
-            return _quat.clone();
+    _updateSo3Yaw(dt, reference) {
+        if (this._isYawLockEnabled()) {
+            this._so3YawSetpointDeg = this._so3FixedYaw ?? this._so3Hold?.yawDeg ?? this.yaw;
+            this._so3YawRateSetpointDeg = 0;
+            return this._so3YawSetpointDeg;
         }
+        const horizontalSpeed = Math.hypot(reference?.vx || 0, reference?.vz || 0);
+        if (horizontalSpeed <= 0.2) return this._so3YawSetpointDeg;
 
-        // b2d = F_d / ||F_d||  (thrust axis = body Y)
-        // Tilt already clamped in _controlSO3 before calling this function
-        const b2x = forceX / lenF;
-        const b2y = forceY / lenF;
-        const b2z = forceZ / lenF;
-
-        // Forward direction in world (sim convention: yaw=0 → forward = (0,0,-1) = south)
-        const c1x = -Math.sin(yawDesRad);
-        const c1y = 0;   // forward stays in XZ plane
-        const c1z = -Math.cos(yawDesRad);
-
-        // b3d = body Z = backward = -forward_projected_to_b2d_orthogonal_plane
-        // Project c1 onto b2d: c1_parallel = (c1·b2d) * b2d
-        // c1_perp = c1 - c1_parallel → backward = -normalize(c1_perp)
-        const dotC = c1x * b2x + c1y * b2y + c1z * b2z;
-        let b3x = -(c1x - dotC * b2x);
-        let b3y = -(c1y - dotC * b2y);
-        let b3z = -(c1z - dotC * b2z);
-        const lenB3 = Math.sqrt(b3x * b3x + b3y * b3y + b3z * b3z);
-        if (lenB3 < 1e-6) {
-            // c1 is parallel to b2d (pure vertical thrust) — fall back to a perpendicular
-            const absY = Math.abs(b2y);
-            if (absY < 0.99) {
-                // cross(b2d, [0,1,0]) gives horizontal perpendicular, use as body Z
-                b3x = b2z; b3y = 0; b3z = -b2x;
-            } else {
-                // b2d is mostly vertical — cross with world forward gives body X, then body Z
-                b3x = 0; b3y = b2x; b3z = 0;
-            }
-            const altLen = Math.sqrt(b3x * b3x + b3y * b3y + b3z * b3z);
-            if (altLen < 1e-6) { b3x = 0; b3y = 0; b3z = 1; }
-            else { b3x /= altLen; b3y /= altLen; b3z /= altLen; }
+        const desiredYaw = Math.atan2(-reference.vx, -reference.vz) * RAD2DEG;
+        const yawError = this._wrapDegrees(desiredYaw - this._so3YawSetpointDeg);
+        const desiredRate = Math.max(-60, Math.min(60, yawError * 3));
+        const rateStep = 20 * dt;
+        this._so3YawRateSetpointDeg += Math.max(-rateStep, Math.min(
+            rateStep,
+            desiredRate - this._so3YawRateSetpointDeg,
+        ));
+        const yawStep = this._so3YawRateSetpointDeg * dt;
+        if (Math.abs(yawStep) >= Math.abs(yawError)) {
+            this._so3YawSetpointDeg = desiredYaw;
+            this._so3YawRateSetpointDeg = 0;
         } else {
-            b3x /= lenB3; b3y /= lenB3; b3z /= lenB3;
+            this._so3YawSetpointDeg = this._wrapDegrees(this._so3YawSetpointDeg + yawStep);
         }
-
-        // b1d = b2d × b3d (right-hand rule: right = up × backward)
-        const b1x = b2y * b3z - b2z * b3y;
-        const b1y = b2z * b3x - b2x * b3z;
-        const b1z = b2x * b3y - b2y * b3x;
-
-        // Rotation matrix R_d = [b1d | b2d | b3d] → quaternion
-        // PlayCanvas Mat4 is COLUMN-MAJOR: data[0..3]=col0, data[4..7]=col1, data[8..11]=col2
-        // Columns: col 0 = b1d (right), col 1 = b2d (up), col 2 = b3d (backward)
-        _mat4.data.set([
-            b1x, b1y, b1z, 0,    // column 0: body X (right)
-            b2x, b2y, b2z, 0,    // column 1: body Y (up / thrust)
-            b3x, b3y, b3z, 0,    // column 2: body Z (backward)
-            0,   0,   0,   1,    // column 3: translation
-        ]);
-        _quat.setFromMat4(_mat4);
-        return _quat.clone();
+        return this._so3YawSetpointDeg;
     }
 
-    /**
-     * Compute SO(3) attitude error: e_R = vee(R_d^T R - R^T R_d) / 2
-     * In quaternion form: e_R = 2 * sgn(q_d·q) * (q_d.w * q.xyz - q.w * q_d.xyz - q_d.xyz × q.xyz)
-     * Returns {x, y, z} in the body frame.
-     */
-    _so3AttitudeError(qDesired) {
-        const qd = qDesired;
-        const q = this.orientation;
-        // Dot product for shortest-path sign
-        const dot = qd.x * q.x + qd.y * q.y + qd.z * q.z + qd.w * q.w;
-        const sign = dot >= 0 ? 1 : -1;
-
-        const ex = sign * (qd.w * q.x - q.w * qd.x - (qd.y * q.z - qd.z * q.y));
-        const ey = sign * (qd.w * q.y - q.w * qd.y - (qd.z * q.x - qd.x * q.z));
-        const ez = sign * (qd.w * q.z - q.w * qd.z - (qd.x * q.y - qd.y * q.x));
-
-        return { x: ex, y: ey, z: ez };
-    }
-
-    /**
-     * SO3 geometric control law.
-     * Tracks YOPO trajectory with feedback, or holds position / follows stick input.
-     */
-    _controlSO3(dt, input, _collisionProvider) {
-        const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
-        const maxSpd = this.so3CruiseMps * (input.boost ? 2.0 : 1.0);
-        this.boostActive = !!input.boost;
-        this.boostMultiplier = input.boost ? 2.0 : 1.0;
-        this.effectiveMaxSpeed = maxSpd;
-
-        // ---- Body-frame basis for stick-to-world conversion and thrust projection ----
-        _mat4.setTRS(pc.Vec3.ZERO, this.orientation, pc.Vec3.ONE);
-        _mat4.getY(_v3);
-        const bodyUpX = _v3.x, bodyUpY = _v3.y, bodyUpZ = _v3.z;
-        _mat4.getZ(_v3);
-        let fwdX = -_v3.x, fwdZ = -_v3.z;
-        _mat4.getX(_v3);
-        let rightX = _v3.x, rightZ = _v3.z;
-        const fwdLen = Math.sqrt(fwdX * fwdX + fwdZ * fwdZ);
-        if (fwdLen > 1e-4) { fwdX /= fwdLen; fwdZ /= fwdLen; }
-        const rightLen = Math.sqrt(rightX * rightX + rightZ * rightZ);
-        if (rightLen > 1e-4) { rightX /= rightLen; rightZ /= rightLen; }
-
-        // ---- Determine reference trajectory ----
-        let refX, refY, refZ, refVX, refVY, refVZ, refAX, refAY, refAZ;
-        // Yaw lock: use fixed initial yaw if enabled (like YOPO lock_yaw=True)
-        const fixedYaw = this.getFixedYaw();
-        let yawDes = fixedYaw * DEG2RAD;       // default: fixed or current yaw
-        let refActive = false;
-
-        if (this._yopoPolyX) {
-            // YOPO trajectory mode
-            this._yopoTrackerTime += dt;
-            const t = Math.min(this._yopoTrackerTime, this._yopoTrajTime);
-            if (t >= this._yopoTrajTime - 0.001) {
-                // End of trajectory — save final state for smooth deceleration
-                const ref = this._getYopoReference(this._yopoTrajTime);
-                this._yopoDecayRef = { x: ref.x, z: ref.z, vx: ref.vx, vz: ref.vz };
-                this._yopoDecayTimer = 0;
-                this._yopoPolyX = this._yopoPolyY = this._yopoPolyZ = null;
-            } else {
-                const ref = this._getYopoReference(t);
-                refX = ref.x; refY = ref.y; refZ = ref.z;
-                refVX = ref.vx; refVY = ref.vy; refVZ = ref.vz;
-                refAX = ref.ax; refAY = ref.ay; refAZ = ref.az;
-                refActive = true;
-                // Yaw toward velocity direction (only when not locked)
-                if (this._so3FixedYaw == null && (Math.abs(refVX) > 0.2 || Math.abs(refVZ) > 0.2)) {
-                    yawDes = Math.atan2(-refVX, -refVZ);  // sim convention: 0=south
-                }
-            }
-        }
-
-        // Smooth deceleration after YOPO trajectory ends (P3 fix)
-        if (!refActive && this._yopoDecayRef) {
-            this._yopoDecayTimer += dt;
-            const decayDuration = 0.5;  // seconds — 缩短以缩小轨迹段间减速间隙
-            const t = Math.min(this._yopoDecayTimer / decayDuration, 1.0);
-            const r = this._yopoDecayRef;
-            refX = r.x; refZ = r.z;
-            refY = (this._so3AltitudeRef != null ? this._so3AltitudeRef : this.y);
-            refVX = r.vx * (1 - t);
-            refVZ = r.vz * (1 - t);
-            refVY = 0;
-            refAX = 0; refAY = 0; refAZ = 0;
-            refActive = true;
-            if (t >= 1.0) {
-                this._yopoDecayRef = null;
-                this._yopoDecayTimer = 0;
-                // YOPO 轨迹+衰减完成，判断是否真正到达目标
-                if (this._idealGoal) {
-                    const g = this._idealGoal;
-                    const d = Math.sqrt(
-                        (g.x - this.x) ** 2 +
-                        ((g.y != null ? g.y : this.y) - this.y) ** 2 +
-                        (g.z - this.z) ** 2
-                    );
-                    if (d < this._arrivalDistanceM) {
-                        this._onArrival();
-                    }
-                }
-            }
-        }
-
-        if (!refActive && this._idealGoal) {
-            // 有目标但无 YOPO 轨迹 → 原地悬停，等待首条轨迹到达。
-            // 参考实现 NetworkControl.cpp 无轨迹时走 hover 保持。
-            // 目标只在 YOPO 轨迹+衰减完成后由 decay 分支的到达检查清除；
-            // 本分支不主动清除目标，也不盲追目标位置。
-            const goal = this._idealGoal;
-
-            // 悬停：参考位置 = 当前位置。有任何手动输入时绕过高度锁定
-            const manualInput = Math.abs(input.throttle) > 0.05 ||
-                                Math.abs(input.pitch) > 0.05 ||
-                                Math.abs(input.roll) > 0.05;
-            refX = this.x;
-            refY = (manualInput ? this.y :
-                    (this._so3AltitudeRef != null ? this._so3AltitudeRef : this.y));
-            refZ = this.z;
-            refVX = 0; refVY = 0; refVZ = 0;
-            refAX = 0; refAY = 0; refAZ = 0;
-            refActive = true;
-            if (this._so3FixedYaw == null) {
-                const dx = goal.x - this.x;
-                const dz = goal.z - this.z;
-                if (Math.hypot(dx, dz) > 0.1) {
-                    yawDes = Math.atan2(-dx, -dz);
-                }
-            }
-        }
-
-        if (!refActive) {
-            // Stick input mode — body-frame velocity command
-            const rates = input.rates || { roll: 1, pitch: 1, yaw: 1 };
-            const cmdFwd   = -input.pitch * maxSpd * rates.pitch;
-            const cmdRight = -input.roll  * maxSpd * rates.roll;
-            const horizActive = Math.abs(input.pitch) > 0.05 || Math.abs(input.roll) > 0.05;
-            const vertActive  = Math.abs(input.throttle) > 0.05;
-
-            if (horizActive) {
-                refVX = cmdFwd * fwdX + cmdRight * rightX;
-                refVZ = cmdFwd * fwdZ + cmdRight * rightZ;
-            } else {
-                refVX = 0; refVZ = 0;
-            }
-            refVY = vertActive ? input.throttle * this.droneMaxVSpeed : 0;
-            // Position hold at current location, locked altitude
-            refX = this.x; refY = (this._so3AltitudeRef != null ? this._so3AltitudeRef : this.y); refZ = this.z;
-            refAX = 0; refAY = 0; refAZ = 0;
-            refActive = true;
-            // Yaw rate from A/D keys (P6 fix)
-            const yawActive = Math.abs(input.yaw) > 0.05;
-            if (yawActive && this._so3FixedYaw == null) {
-                if (this._so3StickYaw == null) this._so3StickYaw = this.yaw;
-                this._so3StickYaw += input.yaw * this.so3YawRate * rates.yaw * dt;
-                yawDes = this._so3StickYaw * DEG2RAD;
-            } else {
-                this._so3StickYaw = null;
-            }
-        }
-
-        // ---- Compute desired force F_d (world frame, Newtons) ----
-        const massKg = Math.max(this.mass, 1) / 1000;
-        // Cap position error: avoid massive F_d from far-away goals destroying control
-        const posErrMax = 3.0;  // meters — above 3m the drone tilts too much to hover
-        const ePosX = clamp(this.x - refX, -posErrMax, posErrMax);
-        const ePosY = clamp(this.y - refY, -posErrMax, posErrMax);
-        const ePosZ = clamp(this.z - refZ, -posErrMax, posErrMax);
-        const eVelX = this.vx - refVX;
-        const eVelY = this.vy - refVY;
-        const eVelZ = this.vz - refVZ;
-
-        // F_d = -K_x e_x - K_v e_v + m*g*e_3 + m*a_d
-        // Our coordinate: Y = up, so gravity compensation is +y
-        let FdX = -this.so3Kx * ePosX - this.so3Kv * eVelX + refAX * massKg;
-        let FdY = -this.so3Kx * ePosY - this.so3Kv * eVelY + (G + refAY) * massKg;
-        let FdZ = -this.so3Kx * ePosZ - this.so3Kv * eVelZ + refAZ * massKg;
-
-        // --- 倾角限幅，取代此前的力模等比缩放 ---
-        // 可行倾角上限：满推力下垂直分量仍须撑得住自重，否则倾到该角度就是掉高。
-        // 参考实现固定 60°（NetworkControl）/45°（SO3Control）；这里额外用推重比兜底，
-        // 因为设置面板允许用户任意修改 mass / maxThrust。
+    _controlPositionHold(dt, commandType = ControlCommandType.POSITION_VELOCITY_HOLD, reason = null) {
+        if (!this._so3Hold) this._latchSo3Hold(reason || 'hold');
+        const massKg = Math.max(0.001, this.mass / 1000);
         const weightN = massKg * G;
-        const Fmax = this.maxThrust * this.boostMultiplier * G / 1000 * 0.95;  // N
-        let tiltDeg = this.so3MaxTiltDeg;
-        if (Fmax > weightN) {
-            const feasibleDeg = Math.acos(weightN / Fmax) * RAD2DEG * 0.9;  // 留 10% 裕度
-            tiltDeg = Math.min(tiltDeg, feasibleDeg);
+        const maxThrustN = Math.max(0, this.maxThrust * G / 1000);
+        const hold = this._so3Hold;
+        const requestedForce = {
+            x: -this.so3Kx * (this.x - hold.x) - this.so3Kv * this.vx,
+            y: weightN
+                - this.so3KxVertical * (this.y - hold.y)
+                - this.so3KvVertical * this.vy,
+            z: -this.so3Kx * (this.z - hold.z) - this.so3Kv * this.vz,
+        };
+        const tiltLimited = limitTiltPreservingGravity(
+            requestedForce.x,
+            requestedForce.y,
+            requestedForce.z,
+            weightN,
+            45,
+        );
+        const allocation = allocateEasyForce(tiltLimited, maxThrustN, {
+            horizontalMarginFraction: 0.3,
+            fallbackForce: { x: 0, y: Math.min(weightN, maxThrustN), z: 0 },
+        });
+        const acceleration = {
+            x: requestedForce.x / massKg,
+            y: requestedForce.y / massKg - G,
+            z: requestedForce.z / massKg,
+        };
+        const limitedAcceleration = {
+            x: allocation.force.x / massKg,
+            y: allocation.force.y / massKg - G,
+            z: allocation.force.z / massKg,
+        };
+        const horizontalSaturated = Math.hypot(
+            limitedAcceleration.x - acceleration.x,
+            limitedAcceleration.z - acceleration.z,
+        ) > 1e-4;
+        const verticalSaturated = Math.abs(limitedAcceleration.y - acceleration.y) > 1e-4;
+        const yawDeg = this._isYawLockEnabled()
+            ? (this._so3FixedYaw ?? hold.yawDeg)
+            : this._so3YawSetpointDeg;
+        this._applyForceAttitude(
+            dt,
+            allocation.force,
+            yawDeg * DEG2RAD,
+            maxThrustN,
+            { roll: 220, pitch: 220, yaw: 120 },
+        );
+        const tiltDeg = Math.atan2(
+            Math.hypot(allocation.force.x, allocation.force.z),
+            Math.max(1e-9, allocation.force.y),
+        ) * RAD2DEG;
+        this.boostActive = false;
+        this.boostMultiplier = 1;
+        this.effectiveMaxSpeed = this.so3CruiseMps;
+        this.commandedGroundSpeed = 0;
+        this.targetGroundSpeed = 0;
+        this.pilotGroundSpeedCommand = 0;
+        this._setControlDiagnostics({
+            commandType,
+            source: commandType === ControlCommandType.FAILSAFE_HOLD ? 'failsafe' : 'yopo-hold',
+            createdSimTime: this._simTimeS,
+            expirySimTime: null,
+            referenceState: { x: hold.x, y: hold.y, z: hold.z, vx: 0, vy: 0, vz: 0 },
+            rawAcceleration: acceleration,
+            limitedAcceleration,
+            requestedForce,
+            allocatedForce: allocation.force,
+            tiltDeg,
+            saturation: {
+                horizontal: horizontalSaturated,
+                vertical: verticalSaturated,
+                direct: false,
+            },
+            antiWindup: { horizontal: false, vertical: false },
+            trajectoryAgeS: null,
+            fallbackReason: reason,
+        });
+    }
+
+    _controlSO3(dt, _input, _collisionProvider) {
+        this.boostActive = false;
+        this.boostMultiplier = 1;
+        const context = this._trajectory.context;
+        // Tracker time normally advances one-for-one with simulation time.
+        // The absolute envelope also prevents an old command from resuming if
+        // tracking was paused while disarmed.
+        if (this._trajectory.active
+            && Number.isFinite(context?.expirySimTime)
+            && this._simTimeS >= context.expirySimTime - 1e-12) {
+            this._trajectory.clear('trajectory-expired');
+            this._latchSo3Hold('trajectory-expired');
+            this._navigationTransitionReason = 'trajectory-expired';
+            this._replanRequested = true;
+            this._controlPositionHold(
+                dt,
+                ControlCommandType.FAILSAFE_HOLD,
+                'trajectory-expired',
+            );
+            return;
         }
-        const Flim = limitTiltPreservingGravity(FdX, FdY, FdZ, weightN, tiltDeg);
-        FdX = Flim.x; FdY = Flim.y; FdZ = Flim.z;
-
-        // ---- Attitude control ----
-        // b2d = F_d/|F_d| naturally. Let the attitude controller handle tilt;
-        // the Fmax cap and position error cap already bound the control authority.
-        const qDesired = this._so3DesiredAttitude(FdX, FdY, FdZ, yawDes);
-        const eR = this._so3AttitudeError(qDesired);
-
-        // Control torque in body frame: M = -K_R e_R - K_Ω Ω
-        // Body angular velocity: Ω = (pitchRate, yawRate, rollRate) in deg/s
-        // e_R x→body X→pitch, e_R y→body Y→yaw, e_R z→body Z→roll
-        const omegaX = this.pitchRate * DEG2RAD;  // rad/s around body X
-        const omegaY = this.yawRate * DEG2RAD;    // rad/s around body Y
-        const omegaZ = this.rollRate * DEG2RAD;   // rad/s around body Z
-        const torqueX = -this.so3KR * eR.x - this.so3KOmega * omegaX;
-        const torqueY = -this.so3KR * eR.y - this.so3KOmega * omegaY;
-        const torqueZ = -this.so3KR * eR.z - this.so3KOmega * omegaZ;
-
-        // Simplified rate-control: torque → desired angular rate
-        // body X torque → pitchRate, body Y torque → yawRate, body Z torque → rollRate
-        const kOmegaInv = 1.0 / Math.max(this.so3KOmega, 0.01);
-        const pitchDes  = clamp(torqueX * kOmegaInv * RAD2DEG, -this.so3MaxBodyRate, this.so3MaxBodyRate);
-        const yawRateDes = clamp(torqueY * kOmegaInv * RAD2DEG, -this.so3YawRate, this.so3YawRate);
-        const rollDes   = clamp(torqueZ * kOmegaInv * RAD2DEG, -this.so3MaxBodyRate, this.so3MaxBodyRate);
-
-        // Smooth rate tracking (same pattern as _controlFPV)
-        const rateSmooth = 1 - Math.exp(-15 * dt);
-        this.rollRate  += (rollDes   - this.rollRate)  * rateSmooth;
-        this.pitchRate += (pitchDes  - this.pitchRate) * rateSmooth;
-        this.yawRate   += (yawRateDes - this.yawRate)  * rateSmooth;
-
-        // Apply body-frame rotations
-        this._applyBodyRotation(1, 0, 0, this.pitchRate * dt);  // pitch around body X
-        this._applyBodyRotation(0, 0, 1, this.rollRate * dt);   // roll  around body Z
-        this._applyBodyRotation(0, 1, 0, this.yawRate * dt);    // yaw   around body Y
-
-        // Damp angular rates when errors are small
-        const eRmag = Math.sqrt(eR.x * eR.x + eR.y * eR.y + eR.z * eR.z);
-        if (eRmag < 0.02) {
-            const ad = Math.exp(-this.angularDrag * dt * 0.5);
-            this.rollRate *= ad;
-            this.pitchRate *= ad;
-            this.yawRate *= ad;
+        const elapsedEnvelopeTime = Number.isFinite(context?.createdSimTime)
+            ? Math.max(0, this._simTimeS - context.createdSimTime)
+            : this._trajectory.time + dt;
+        // Catch up tracker sampling to the authoritative simulation clock if
+        // control execution was briefly paused (for example while disarmed).
+        const trackerAdvance = Math.max(dt, elapsedEnvelopeTime - this._trajectory.time);
+        const step = this._trajectory.advance(trackerAdvance);
+        if (!step.active) {
+            if (step.expired) {
+                this._latchSo3Hold('trajectory-expired');
+                this._navigationTransitionReason = 'trajectory-expired';
+                this._replanRequested = true;
+            }
+            this._controlPositionHold(
+                dt,
+                step.expired ? ControlCommandType.FAILSAFE_HOLD : this._so3HoldCommandType,
+                step.expired ? 'trajectory-expired' : (this._controlDiagnostics?.fallbackReason || 'awaiting-trajectory'),
+            );
+            return;
         }
 
-        // ---- Thrust: 将 F_d 投影到实际 body Y 方向（非取模） ----
-        // 取模法 `thrust = |F_d|` 在稳态时正确（body Y ≈ F_d 方向），
-        // 但在瞬态（按下/松开方向键，姿态未跟踪到位）时：
-        // body Y 比 F_d 更垂直 → |F_d| 通过不够倾斜的 body Y 产生
-        // 过量垂直分量 → 无人机在倾斜/回正瞬间升高。
-        // 投影法：推力 = F_d · bodyY，自动补偿姿态瞬态，输出恒等于
-        // F_d 通过当前 body Y 产生的净力。
-        const thrustN = FdX * bodyUpX + FdY * bodyUpY + FdZ * bodyUpZ;
-        const cmdGf = Math.max(0, thrustN / G * 1000);
-        this.thrustOutput = clamp(cmdGf, 0, this.maxThrust * this.boostMultiplier);
-        this.throttlePercent = this.maxThrust > 0
-            ? Math.max(0, Math.min(1, this.thrustOutput / (this.maxThrust * this.boostMultiplier)))
-            : 0;
+        const reference = step.reference;
+        const rawAcceleration = { x: reference.ax, y: reference.ay, z: reference.az };
+        if (![rawAcceleration.x, rawAcceleration.y, rawAcceleration.z].every(Number.isFinite)) {
+            this._trajectory.clear('non-finite-acceleration');
+            this._latchSo3Hold('non-finite-command');
+            this._replanRequested = true;
+            this._controlPositionHold(dt, ControlCommandType.FAILSAFE_HOLD, 'non-finite-command');
+            return;
+        }
 
-        // ---- Display outputs ----
-        this.commandedGroundSpeed = Math.sqrt(refVX * refVX + refVZ * refVZ);
-        this.targetGroundSpeed = maxSpd;
-        this.pilotGroundSpeedCommand = Math.sqrt(
-            (input.pitch || 0) * (input.pitch || 0) + (input.roll || 0) * (input.roll || 0)
-        ) * maxSpd;
+        const limitedAcceleration = limitVector(rawAcceleration, 25);
+        const massKg = Math.max(0.001, this.mass / 1000);
+        const weightN = massKg * G;
+        const maxThrustN = Math.max(0, this.maxThrust * G / 1000);
+        const requestedForce = {
+            x: massKg * limitedAcceleration.x,
+            y: massKg * (G + limitedAcceleration.y),
+            z: massKg * limitedAcceleration.z,
+        };
+        const tiltLimited = limitTiltPreservingGravity(
+            requestedForce.x,
+            requestedForce.y,
+            requestedForce.z,
+            weightN,
+            60,
+        );
+        const allocation = capDirectForce(tiltLimited, maxThrustN);
+        const producedAcceleration = {
+            x: allocation.force.x / massKg,
+            y: allocation.force.y / massKg - G,
+            z: allocation.force.z / massKg,
+        };
+        const horizontalSaturated = Math.hypot(
+            rawAcceleration.x - limitedAcceleration.x,
+            rawAcceleration.z - limitedAcceleration.z,
+        ) > 1e-4 || Math.hypot(
+            producedAcceleration.x - limitedAcceleration.x,
+            producedAcceleration.z - limitedAcceleration.z,
+        ) > 1e-4;
+        const verticalSaturated = Math.abs(rawAcceleration.y - limitedAcceleration.y) > 1e-4
+            || Math.abs(producedAcceleration.y - limitedAcceleration.y) > 1e-4;
+        const yawDeg = this._updateSo3Yaw(dt, reference);
+        this._applyForceAttitude(
+            dt,
+            allocation.force,
+            yawDeg * DEG2RAD,
+            maxThrustN,
+            { roll: 220, pitch: 220, yaw: 120 },
+        );
+        const tiltDeg = Math.atan2(
+            Math.hypot(allocation.force.x, allocation.force.z),
+            Math.max(1e-9, allocation.force.y),
+        ) * RAD2DEG;
+        this.effectiveMaxSpeed = this.so3CruiseMps;
+        this.commandedGroundSpeed = Math.hypot(reference.vx, reference.vz);
+        this.targetGroundSpeed = this.so3CruiseMps;
+        this.pilotGroundSpeedCommand = 0;
+        this._setControlDiagnostics({
+            commandType: ControlCommandType.DIRECT_ACCELERATION,
+            source: context?.source || 'yopo',
+            frame: context?.frame || 'sim-world-y-up',
+            generation: context?.generation ?? null,
+            createdSimTime: context?.createdSimTime ?? this._simTimeS - this._trajectory.time,
+            expirySimTime: context?.expirySimTime ?? this._simTimeS + (this._trajectory.duration - this._trajectory.time),
+            referenceState: reference,
+            rawAcceleration,
+            limitedAcceleration,
+            requestedForce,
+            allocatedForce: allocation.force,
+            tiltDeg,
+            saturation: {
+                horizontal: horizontalSaturated,
+                vertical: verticalSaturated,
+                direct: allocation.saturated || horizontalSaturated || verticalSaturated,
+            },
+            antiWindup: { horizontal: false, vertical: false },
+            trajectoryAgeS: this._trajectory.time,
+            fallbackReason: null,
+        });
+    }
+
+    consumeReplanRequest() {
+        const requested = !!this._replanRequested;
+        this._replanRequested = false;
+        return requested;
     }
 
     // ---- Collision ----
 
     _handleCollisions(collisionProvider, previousPosition = null, dt = 0.016) {
+        const wasColliding = this.isColliding;
         this.isColliding = false;
         this.collisionIntensity = 0;
 
@@ -1644,6 +1908,14 @@ export class Drone {
                     this._targetX = this.x;
                     this._targetY = this.y;
                     this._targetZ = this.z;
+                    this._easyHorizontalState = 'brake';
+                    this._easyVerticalState = 'brake';
+                } else if (this.flightMode === 'so3'
+                    && (!wasColliding || this._trajectory.active)) {
+                    this._trajectory.clear('collision');
+                    this._latchSo3Hold('collision');
+                    this._navigationTransitionReason = 'collision';
+                    this._replanRequested = true;
                 }
             }
         }

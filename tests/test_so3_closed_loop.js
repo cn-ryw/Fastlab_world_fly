@@ -39,7 +39,8 @@ const TRAJ_T = 1.125;      // 2*radio_range/vel_max_train = 2*9/16
 const CRUISE = 15.0;       // YOPO cruise_target_mps
 
 /**
- * 模拟 yopo_bridge.py 的输出：朝目标前进一段，高度落在目标所在的高度平面。
+ * 模拟 yopo_bridge.py 的输出：朝目标前进一段；高度端点按单段安全包络
+ * 逐步逼近目标平面，避免把 30m 高差硬塞进 1.125s quintic。
  * 返回**轴主序** [px,vx,ax, py,vy,ay, pz,vz,az]。
  */
 function mockYopoEndstate(drone, goal) {
@@ -49,9 +50,11 @@ function mockYopoEndstate(drone, goal) {
     const uz = d > 1e-6 ? dz / d : 0;
     const step = Math.min(CRUISE * TRAJ_T, d);
     const spd = d > CRUISE * TRAJ_T ? CRUISE : 0;   // 临近目标减速
+    const heightStep = Math.max(-4, Math.min(4, goal.y - drone.y));
+    const verticalSpeed = Math.abs(goal.y - drone.y) > 4 ? Math.sign(goal.y - drone.y) * 4 : 0;
     return [
         drone.x + ux * step, ux * spd, 0,
-        goal.y,              0,        0,
+        drone.y + heightStep, verticalSpeed, 0,
         drone.z + uz * step, uz * spd, 0,
     ];
 }

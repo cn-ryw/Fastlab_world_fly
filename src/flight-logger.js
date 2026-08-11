@@ -274,6 +274,28 @@ export class FlightLogger {
             && item.planningAuthorized === true
             && item.trajectoryApplied === true
         ));
+        const uniqueAuthorizedPlanningByIdentity = new Map();
+        for (const item of authorizedPlanningMetrics) {
+            const identity = `${item.goalId ?? ''}:${item.generation ?? ''}:${item.frameId ?? ''}`;
+            if (!uniqueAuthorizedPlanningByIdentity.has(identity)) {
+                uniqueAuthorizedPlanningByIdentity.set(identity, item);
+            }
+        }
+        const uniqueAuthorizedPlanningMetrics = [
+            ...uniqueAuthorizedPlanningByIdentity.values(),
+        ];
+        const rgbTilesReadyPlanningFrames = uniqueAuthorizedPlanningMetrics.filter(
+            item => item.rgbTilesReady === true
+        ).length;
+        const rgbTilesPartialPlanningFrames = uniqueAuthorizedPlanningMetrics.filter(
+            item => item.rgbTilesReady === false
+        ).length;
+        const rgbTilesUnknownPlanningFrames = uniqueAuthorizedPlanningMetrics.length
+            - rgbTilesReadyPlanningFrames
+            - rgbTilesPartialPlanningFrames;
+        const rgbTileErrorPlanningFrames = uniqueAuthorizedPlanningMetrics.filter(
+            item => item.rgbTileError === true || item.rgbReadinessReason === 'tile-error'
+        ).length;
         const metricValues = key => authorizedPlanningMetrics
             .map(item => Number(item[key]))
             .filter(Number.isFinite);
@@ -311,6 +333,13 @@ export class FlightLogger {
                     ? Math.round(this._yopoTrackerCount / this._frames.length * 100) : 0,
                 uniquePlanningHz: Math.round(this._appliedPlanningFrames.size / duration * 10) / 10,
                 uniquePlanningFrames: this._appliedPlanningFrames.size,
+                rgbTilesReadyPlanningFrames,
+                rgbTilesPartialPlanningFrames,
+                rgbTilesUnknownPlanningFrames,
+                rgbTileErrorPlanningFrames,
+                rgbTilesReadyPlanningPercent: uniqueAuthorizedPlanningMetrics.length > 0
+                    ? Math.round(rgbTilesReadyPlanningFrames / uniqueAuthorizedPlanningMetrics.length * 1000) / 10
+                    : null,
                 planningIntervalP95Ms: percentile(planningIntervals, 0.95),
                 captureToApplyP95Ms: percentile(metricValues('captureToApplyMs'), 0.95),
                 frameAgeP95Ms: percentile(metricValues('frameAgeMs'), 0.95),

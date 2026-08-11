@@ -342,6 +342,127 @@ def depth_to_color(depth, sample_limit=65536):
     return color.astype(np.uint8), scale
 
 
+def depth_to_polar_scan(
+    depth,
+    depth_mode="da360-relative",
+    angular_bins=96,
+    pitch_band_deg=12.0,
+    distance_percentile=20.0,
+    vertical_fov_deg=180.0,
+):
+    """Reduce one ERP depth frame to a compact horizontal clearance scan.
+
+    The scan is derived from the numerical DA360 output, never from the
+    coloured preview JPEG.  Each angular bin reports a robust near surface in
+    a narrow band around the horizon.  Slant ranges are projected onto the
+    horizontal plane before aggregation.
+
+    Relative DA360 output is normalized by this frame's second-percentile
+    depth and is therefore explicitly labelled ``x-near-reference``.  Only
+    validated metric/truth modes are labelled in metres.
+    """
+    values = np.asarray(depth, dtype=np.float32)
+    if values.ndim != 2 or values.shape[0] <= 0 or values.shape[1] <= 0:
+        raise ValueError("polar scan requires a non-empty 2-D depth array")
+    if not isinstance(angular_bins, int) or angular_bins <= 0:
+        raise ValueError("polar scan angular_bins must be a positive integer")
+    if not np.isfinite(pitch_band_deg) or not 0 < pitch_band_deg < 90:
+        raise ValueError("polar scan pitch band must be between 0 and 90 degrees")
+    if not np.isfinite(distance_percentile) or not 0 <= distance_percentile <= 100:
+        raise ValueError("polar scan percentile must be in [0, 100]")
+    if not np.isfinite(vertical_fov_deg) or not 0 < vertical_fov_deg <= 180:
+        raise ValueError("polar scan vertical FOV must be in (0, 180]")
+
+    height, width = values.shape
+    bin_count = min(angular_bins, width)
+    row_pitch_deg = (
+        float(vertical_fov_deg) / 2.0
+        - (np.arange(height, dtype=np.float32) + 0.5)
+        * (float(vertical_fov_deg) / height)
+    )
+    row_indices = np.flatnonzero(np.abs(row_pitch_deg) <= pitch_band_deg)
+    if row_indices.size == 0:
+        # Very small contract-test tensors may have no centre inside the
+        # configured band.  Select the closest row(s), symmetrically on even H.
+        nearest_count = min(height, 2 if height % 2 == 0 else 1)
+        row_indices = np.argsort(np.abs(row_pitch_deg))[:nearest_count]
+
+    horizontal_factor = np.cos(np.deg2rad(row_pitch_deg[row_indices])).reshape(-1, 1)
+    horizontal_depth = values[row_indices, :] * horizontal_factor
+    horizontal_valid = np.isfinite(horizontal_depth) & (horizontal_depth > 0)
+
+    metric = depth_mode in {"da360-metric", "cesium-truth"}
+    reference = 1.0
+    if not metric:
+        # Normalize the same horizontal quantity that the scan publishes, so
+        # ``1x`` remains a truthful nearest-reference distance.
+        if np.any(horizontal_valid):
+            reference = float(np.percentile(horizontal_depth[horizontal_valid], 2.0))
+        if not np.isfinite(reference) or reference <= 0:
+            reference = 1.0
+
+    # Vectorized sampling keeps the visualization off the 15 Hz critical path.
+    # At production resolution, three adjacent ERP columns contribute to each
+    # 3.75-degree bin; tiny test tensors use one column and avoid overlap.
+    centre_columns = np.floor(
+        (np.arange(bin_count, dtype=np.float32) + 0.5) * width / bin_count
+    ).astype(np.int64)
+    half_width = max(0, int(np.floor((width / bin_count) * 0.25)))
+    column_offsets = np.arange(-half_width, half_width + 1, dtype=np.int64)
+    sample_columns = (centre_columns[:, None] + column_offsets[None, :]) % width
+    samples = horizontal_depth[:, sample_columns].transpose(0, 2, 1).reshape(-1, bin_count)
+    sample_valid = np.isfinite(samples) & (samples > 0)
+    valid_counts = sample_valid.sum(axis=0)
+    # Ignore invalid values without np.nanpercentile's per-column Python loop.
+    # Linear rank interpolation matches NumPy's default percentile semantics.
+    ordered = np.sort(np.where(sample_valid, samples, np.inf), axis=0)
+    ranks = (np.maximum(valid_counts, 1) - 1) * (distance_percentile / 100.0)
+    lower = np.floor(ranks).astype(np.int64)
+    upper = np.ceil(ranks).astype(np.int64)
+    fraction = ranks - lower
+    bin_indices = np.arange(bin_count)
+    distances = np.full(bin_count, np.nan, dtype=np.float64)
+    valid_bin_indices = bin_indices[valid_counts > 0]
+    distances[valid_bin_indices] = (
+        ordered[lower[valid_bin_indices], valid_bin_indices]
+        * (1.0 - fraction[valid_bin_indices])
+        + ordered[upper[valid_bin_indices], valid_bin_indices]
+        * fraction[valid_bin_indices]
+    )
+    if not metric:
+        distances = distances / reference
+    # YOPO ERP columns run from yaw +pi toward -pi as u increases:
+    #   u=0 -> back/+pi, W/4 -> body-left/+pi/2,
+    #   W/2 -> front/0, 3W/4 -> body-right/-pi/2.
+    # The compact polar schema deliberately uses increasing body-left angles
+    # (-pi -> +pi), so reverse only this visualization array.  The full depth
+    # tensor passed to YOPO remains in its native training layout.
+    scan_values = [
+        round(float(distance), 3)
+        if valid_counts[index] > 0 and np.isfinite(distance) and distance > 0
+        else None
+        for index, distance in reversed(list(enumerate(distances)))
+    ]
+    valid_bins = sum(item is not None for item in scan_values)
+
+    angle_step_deg = 360.0 / bin_count
+    return {
+        "schema_version": 1,
+        "depth_mode": depth_mode,
+        "unit": "metres" if metric else "x-near-reference",
+        "radius": 20.0,
+        "angle_start_deg": -180.0 + angle_step_deg * 0.5,
+        "angle_step_deg": angle_step_deg,
+        "angle_positive": "body-left",
+        "pitch_band_deg": [-float(pitch_band_deg), float(pitch_band_deg)],
+        "vertical_fov_deg": float(vertical_fov_deg),
+        "distance_percentile": float(distance_percentile),
+        "normalization": None if metric else "per-frame-depth-p02",
+        "valid_fraction": round(valid_bins / bin_count, 4),
+        "values": scan_values,
+    }
+
+
 def encode_image(image, output_format="jpeg", jpeg_quality=72):
     out = io.BytesIO()
     fmt = (output_format or "jpeg").lower()
@@ -630,10 +751,48 @@ class DA360Runner:
                 calib = json.load(f)
             if calib.get("schema_version") != 1:
                 raise ValueError("unsupported or missing calibration schema_version")
-            if calib.get("accepted") is not True:
-                raise ValueError("calibration has not passed acceptance gates")
-            if calib.get("acceptance", {}).get("passed") is not True:
-                raise ValueError("calibration acceptance report is not passed")
+            accuracy_accepted = calib.get("accepted")
+            acceptance_report = calib.get("acceptance")
+            if not isinstance(accuracy_accepted, bool):
+                raise ValueError("calibration accepted status must be boolean")
+            if not isinstance(acceptance_report, dict) or not isinstance(
+                    acceptance_report.get("passed"), bool):
+                raise ValueError("calibration acceptance report status must be boolean")
+            automatic_gate_passed = acceptance_report["passed"]
+            manual_acceptance = calib.get("manual_acceptance")
+            manual_accepted = False
+            acceptance_method = "automatic" if automatic_gate_passed else None
+            acceptance_scope = "accuracy-gates" if automatic_gate_passed else None
+            if manual_acceptance is not None:
+                if not isinstance(manual_acceptance, dict):
+                    raise ValueError("calibration manual_acceptance must be an object")
+                manual_accepted = manual_acceptance.get("accepted") is True
+                if manual_acceptance.get("accepted") is not True:
+                    raise ValueError("calibration manual acceptance must be explicitly true")
+                required_manual_fields = {
+                    "accepted_by": manual_acceptance.get("accepted_by"),
+                    "accepted_at": manual_acceptance.get("accepted_at"),
+                    "scope": manual_acceptance.get("scope"),
+                    "basis": manual_acceptance.get("basis"),
+                }
+                invalid_manual_fields = [
+                    field for field, value in required_manual_fields.items()
+                    if not isinstance(value, str) or not value.strip()
+                ]
+                if invalid_manual_fields:
+                    raise ValueError(
+                        "calibration manual acceptance is missing non-empty fields: "
+                        + ", ".join(invalid_manual_fields)
+                    )
+                if manual_acceptance["scope"] != "sim-to-sim":
+                    raise ValueError(
+                        "calibration manual acceptance scope must be sim-to-sim"
+                    )
+                acceptance_method = "manual-user"
+                acceptance_scope = manual_acceptance["scope"]
+            provenance_accepted = automatic_gate_passed or manual_accepted
+            if accuracy_accepted is not provenance_accepted:
+                raise ValueError("calibration acceptance statuses disagree")
             expected_relation = "inverse_depth_1_per_m = a * pred_disp + b"
             if calib.get("relation") != expected_relation:
                 raise ValueError("calibration inverse-depth relation is missing or incompatible")
@@ -715,6 +874,13 @@ class DA360Runner:
                 "request_height": request_height,
                 "projection": projection,
                 "dataset_fingerprint_sha256": dataset_fingerprint.lower(),
+                # Accuracy acceptance is provenance, not a runtime gate.  This
+                # allows an explicitly selected metric candidate to be tested
+                # without ever treating raw relative depth as metric input.
+                "accuracy_accepted": accuracy_accepted,
+                "automatic_accuracy_gate_passed": automatic_gate_passed,
+                "acceptance_method": acceptance_method,
+                "acceptance_scope": acceptance_scope,
             }
         except Exception as exc:
             raise RuntimeError(f"invalid DA360 calibration {path}: {exc}") from exc
@@ -802,6 +968,15 @@ def runner_health_payload(runner):
         "calibration": {
             "loaded": calibration is not None,
             "id": _runner_calibration_id(runner),
+            "accuracy_accepted": calibration.get("accuracy_accepted")
+                if calibration else None,
+            "automatic_accuracy_gate_passed": calibration.get(
+                "automatic_accuracy_gate_passed"
+            ) if calibration else None,
+            "acceptance_method": calibration.get("acceptance_method")
+                if calibration else None,
+            "acceptance_scope": calibration.get("acceptance_scope")
+                if calibration else None,
             "request_width": calibration.get("request_width") if calibration else None,
             "request_height": calibration.get("request_height") if calibration else None,
             "dataset_fingerprint_sha256": calibration.get("dataset_fingerprint_sha256")
@@ -954,6 +1129,15 @@ def register_depth_routes(app, runner_provider, on_depth=None, endpoint_prefix="
             if on_depth is not None:
                 on_depth(pred_depth, request_metadata)
             mark = time.perf_counter()
+            polar_scan = depth_to_polar_scan(
+                pred_depth,
+                getattr(runner, "depth_mode", "da360-relative"),
+                vertical_fov_deg=(
+                    request_metadata.get("projection_config") or {}
+                ).get("verticalFovDeg", 180.0),
+            )
+            timings["polar_ms"] = (time.perf_counter() - mark) * 1000.0
+            mark = time.perf_counter()
             colored, depth_scale = depth_to_color(pred_depth)
             if getattr(runner, "depth_mode", "da360-relative") == "da360-metric":
                 depth_scale["unit"] = "metres"
@@ -969,6 +1153,7 @@ def register_depth_routes(app, runner_provider, on_depth=None, endpoint_prefix="
                 "api_version": API_VERSION,
                 "depth_image": depth_image,
                 "depth_scale": depth_scale,
+                "polar_scan": polar_scan,
                 "depth_mode": getattr(runner, "depth_mode", "da360-relative"),
                 "calibration_id": _runner_calibration_id(runner),
                 "latency_ms": (time.perf_counter() - started) * 1000.0,

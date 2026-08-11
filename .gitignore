@@ -6,6 +6,7 @@ third_party/DA360/
 # Runtime state must never enter commits.
 .dev-web.pid
 .dev-web.log
+.dev-firefox.log
 
 # Reproducible third-party web builds are fetched from versions.lock.json.
 third_party/Cesium/

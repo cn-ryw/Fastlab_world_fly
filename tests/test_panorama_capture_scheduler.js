@@ -106,6 +106,83 @@ for (const [facesPerSlice, expectedYields] of [[2, 2], [3, 1], [6, 0]]) {
     if (!result.allFacesTileReady || !world._lastCompletedPanoramaCapture?.allFacesTileReady) {
         throw new Error('per-face tile readiness was not retained with the completed RGB capture');
     }
+    if (!result.complete || !result.ready || result.readyFaces !== 6
+        || result.faceTileReadiness?.length !== 6) {
+        throw new Error('ready capture did not expose complete 6/6 readiness provenance');
+    }
+}
+
+// A zero-wait flight capture still returns its projected canvas for live use,
+// while `ready` truthfully remains false until all six tile views are settled.
+{
+    const { world, viewer, transform } = harness();
+    world._panoramaTileset.tilesLoaded = false;
+    world._panoramaTileLoadState.pending = 2;
+    const result = await world._capturePanoramaHybridWithViewerAsync(
+        viewer, transform, 384, 192, 96, 180,
+        { captureAnyway: true, facesPerSlice: 6 },
+    );
+    if (!result.canvas || !result.complete) {
+        throw new Error('partial flight capture must retain the completed ERP canvas');
+    }
+    if (result.ready || result.allFacesTileReady || result.readyFaces !== 0
+        || result.faceTileReadiness?.length !== 6
+        || result.readinessReason !== 'tiles-partial') {
+        throw new Error('partial flight capture was mislabeled as tiles-ready');
+    }
+}
+
+// The one-shot flight preload must visit all six directions even when an
+// individual tile wait times out. Otherwise a slow first face prevents the
+// other five directions from ever issuing requests and warm-up is ineffective.
+{
+    const { world, viewer, transform, faces } = harness();
+    world.waitForTilesIdle = async () => false;
+    const result = await world._capturePanoramaHybridWithViewerAsync(
+        viewer, transform, 384, 192, 96, 180,
+        {
+            captureAnyway: false,
+            continueOnTileTimeout: true,
+            tileTimeoutMs: 1,
+            facesPerSlice: 6,
+        },
+    );
+    if (faces.length !== 6 || !result.canvas || !result.complete) {
+        throw new Error('preload timeout must continue through and project all six faces');
+    }
+    if (result.ready || result.allFacesTileReady || result.readyFaces !== 0) {
+        throw new Error('timed-out preload was incorrectly marked tiles-ready');
+    }
+}
+
+// Calibration keeps its strict semantics: a face timeout returns immediately
+// and must never export a partial capture as a calibration sample.
+{
+    const { world, viewer, transform, faces } = harness();
+    world.waitForTilesIdle = async () => false;
+    const result = await world._capturePanoramaHybridWithViewerAsync(
+        viewer, transform, 384, 192, 96, 180,
+        { captureAnyway: false, tileTimeoutMs: 1, facesPerSlice: 6 },
+    );
+    if (faces.length !== 0 || result.canvas || result.complete || result.faceIndex !== 0) {
+        throw new Error('strict calibration timeout must reject the first incomplete face');
+    }
+}
+
+// Recent tile request failures remain visible even if Cesium's aggregate
+// `tilesLoaded` flag has already bounced back to true.
+{
+    const { world, viewer, transform } = harness();
+    world._panoramaTileLoadState.errorCount = 1;
+    world._panoramaTileLoadState.lastErrorAt = performance.now();
+    const result = await world._capturePanoramaHybridWithViewerAsync(
+        viewer, transform, 384, 192, 96, 180,
+        { captureAnyway: true, facesPerSlice: 6 },
+    );
+    if (!result.complete || result.ready || !result.tileError
+        || result.readinessReason !== 'tile-error') {
+        throw new Error('recent panorama tile failure was hidden by tilesLoaded=true');
+    }
 }
 
 // A dedicated viewer has no default render loop. Tile-idle polling must execute
@@ -202,6 +279,15 @@ for (const [facesPerSlice, expectedYields] of [[2, 2], [3, 1], [6, 0]]) {
         || flightOptions.tileQuietMs !== 0) {
         throw new Error('flight profile must force a zero-wait capture');
     }
+    const flightPreloadOptions = flightSensor.getCaptureOptions({ preload: true });
+    if (flightPreloadOptions.captureAnyway
+        || !flightPreloadOptions.continueOnTileTimeout
+        || flightPreloadOptions.frameDelayMs !== 96
+        || flightPreloadOptions.tileTimeoutMs !== 6000
+        || flightPreloadOptions.tileQuietMs !== 650
+        || flightPreloadOptions.timeoutMs !== 60000) {
+        throw new Error('flight preload must settle hidden-viewer tiles before zero-wait live capture');
+    }
 
     globalThis.window.location.search = '?panoProfile=calibration&panoCaptureAnyway=1'
         + '&panoFrameDelayMs=12&panoFaceTileTimeoutMs=1234&panoFaceTileQuietMs=321';
@@ -224,6 +310,7 @@ for (const [facesPerSlice, expectedYields] of [[2, 2], [3, 1], [6, 0]]) {
     }
     const calibrationOptions = sensor.getCaptureOptions();
     if (calibrationOptions.captureAnyway
+        || calibrationOptions.continueOnTileTimeout
         || calibrationOptions.tileTimeoutMs !== 6000
         || calibrationOptions.tileQuietMs !== 650) {
         throw new Error('calibration profile did not retain strict 6000/650 defaults');

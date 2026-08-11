@@ -1,6 +1,6 @@
 # MindCloud World Fly
 
-浏览器内的 Google Photorealistic 3D Tiles 无人机仿真器。目标导航链路为：Cesium 六面渲染生成 384×192 ERP RGB，DA360 估计米制深度，YOPO 输出 Poly5 轨迹，浏览器内 SO3 控制器跟踪轨迹。当前默认 `da360-relative` 只用于预览和标定采集，不授权 YOPO 轨迹。
+浏览器内的 Google Photorealistic 3D Tiles 无人机仿真器。目标导航链路为：Cesium 六面渲染生成 384×192 ERP RGB，DA360 估计米制深度，YOPO 输出 Poly5 轨迹，浏览器内 SO3 控制器跟踪轨迹。`start-all.sh` 默认使用项目负责人批准的 sim-to-sim metric 标定；显式 `da360-relative` 只用于预览和标定采集，不授权 YOPO 轨迹。
 
 本项目正在做 YOPO_360 的 sim-to-sim 迁移。权威参考是 `/home/ykx/ros1/YOPO_360_v15`；除深度来源和控制下发方式外，其余行为应与参考实现一致。
 
@@ -118,7 +118,7 @@ combined 服务与 standalone DA360 服务共享 API v2 深度契约：
 | `DA360_INPUT_SCALE` | 0.46（约 476×238） |
 | `DA360_RESAMPLE` | bicubic |
 | `DA360_CHANNELS_LAST` | 0 |
-| `DA360_DEPTH_MODE` | da360-relative |
+| `DA360_DEPTH_MODE` | da360-metric（`start-all.sh` 默认） |
 | 到达距离 | 4.0m |
 | 碰撞半径 | 0.6m |
 
@@ -132,7 +132,7 @@ http://127.0.0.1:8080/?panoTopPoleGuard=0&panoBottomPoleGuard=0
 
 ## 米制标定状态
 
-**DA360 metric 尚未验收；默认 `da360-relative` 是 preview/采集模式，正式闭环当前 fail closed。** 当前已实现：
+**2026-08-10 LOLO scale-only 标定已由项目负责人于 2026-08-11 人工批准用于 sim-to-sim，`start-all.sh` 默认加载正式路径 `../experiment_data/depth_calibration.json`。** 当前已实现：
 
 - combined 与 standalone 的 `/depth/raw`
 - canonical ERP anchor 方向与 capture transform 旋转
@@ -144,7 +144,7 @@ http://127.0.0.1:8080/?panoTopPoleGuard=0&panoBottomPoleGuard=0
 
 2026-08-10 已完成 4 地点×3 静止姿态、共 12 captures 的原子采集和 leave-one-location-out 拟合。证据在 `../experiment_data/metric_fit-lolo-20260810-12capture/fit_report.json`；样本为 site-a `try-03/04/05`、site-b `try-01/02/03`、site-c `try-02/03/04`、site-d `try-02/04/05`。四件套、地点覆盖、指纹和 LOLO 完整性均通过：1536 个 anchors 中 1140 个有效（74.22%），其中 833 个在 0.5–20m 范围。
 
-不过，**拟合结果未通过精度门禁**。报告中的 `success=true` 只表示 fitter 正常完成，不等于 calibration accepted；最终 acceptance 为 false：
+自动评估事实保持不变：**拟合结果未通过预设精度门禁**。报告中的 `success=true` 只表示 fitter 正常完成，自动 `acceptance.passed` 为 false：
 
 | 留出地点 | median AbsRel | p90 AbsRel | 10m 内 p90 绝对误差 |
 |---|---:|---:|---:|
@@ -153,7 +153,7 @@ http://127.0.0.1:8080/?panoTopPoleGuard=0&panoBottomPoleGuard=0
 | site-c | 0.383 | 0.443 | 3.545m |
 | site-d | 0.313 | 0.982 | 4.051m |
 
-对应门禁分别为 ≤0.15、≤0.30、≤1m，四个 LOLO fold 均失败。全量 scale-only 候选为 `a=0.0011892812185910185,b=0`，全量 median AbsRel=0.376、p90 AbsRel=1.507、10m 内 p90 绝对误差=4.054m；它只能保留作诊断候选，不能安装。`../experiment_data/depth_calibration.json` 仍为 `a/b=null`，在线模式继续保持 `da360-relative` 并拒绝应用轨迹。
+对应门禁分别为 ≤0.15、≤0.30、≤1m，四个 LOLO fold 均失败。全量 scale-only 结果为 `a=0.0011892812185910185,b=0`，全量 median AbsRel=0.376、p90 AbsRel=1.507、10m 内 p90 绝对误差=4.054m。项目负责人在检查实时深度效果后，明确接受这组固定尺度作为本项目后续 sim-to-sim 基线；正式文件同时保留 `acceptance.passed=false` 和上述原始指标，并通过 `manual_acceptance` 记录人工批准，不会伪装成自动精度门禁通过。运行 health/规划响应将其报告为 `validated-da360-metric`，同时报告 `calibration_acceptance_method=manual-user`、`calibration_automatic_gate_passed=false` 和 `calibration_acceptance_scope=sim-to-sim`。
 
 标定采集必须显式使用 `panoProfile=calibration`，让六个 cubemap 面逐面等待 tiles ready；同时把所有会进入 projection fingerprint 的参数写在 URL 中。旧参数 `panoCaptureAnyway=0` 仅保留为向后兼容映射，不应再作为新命令的主入口。例如：
 
@@ -194,15 +194,20 @@ python3 scripts/fit_da360_metric.py "${fit_args[@]}" \
   --output experiment_data/metric_fit-v2
 ```
 
-只有 `fit_report.json` 同时通过留出误差、有效 anchor、至少 4 地点和至少 12 次采集门禁，才会生成可用于在线模式的 `depth_calibration.json`。启动 metric 模式示例：
+只有 `fit_report.json` 同时通过留出误差、有效 anchor、至少 4 地点和至少 12 次采集门禁，fitter 才会自动生成 `depth_calibration.json`；人工接受则必须像当前正式文件一样保留失败的自动报告并提供完整 `manual_acceptance` 元数据。当前默认 metric 服务直接启动：
 
 ```bash
-DA360_DEPTH_MODE=da360-metric \
-DA360_DEPTH_CALIB_PATH_HOST=/absolute/path/to/depth_calibration.json \
 ./start-all.sh
 ```
 
-标定缺失、未通过或模型/模型输入尺寸/请求 RGB 尺寸/runtime projection/JPEG/resample/checkpoint 指纹不匹配时，metric 模式会在进入 GPU 前拒绝启动或请求，不会静默伪装成米制深度。Anchor 还要求六个 cubemap 面在各自像素被复制时均已报告 tiles ready；仅在导出时看到 tiles idle 不算合格。
+如需回到只预览、不向 YOPO 提供可应用轨迹的相对深度模式，必须显式运行：
+
+```bash
+DA360_DEPTH_MODE=da360-relative \
+./start-all.sh
+```
+
+标定 schema、有限数值、模型/模型输入尺寸、请求 RGB 尺寸、runtime projection、JPEG、resample 和既有指纹仍必须完全匹配，否则 metric 模式会在启动或请求阶段拒绝运行；原始 `da360-relative` 也仍然只能预览，绝不会被直接送入 YOPO。人工批准范围仅为 sim-to-sim，不等价于真实传感器绝对深度精度或自动 LOLO 门禁通过。Anchor 还要求六个 cubemap 面在各自像素被复制时均已报告 tiles ready；仅在导出时看到 tiles idle 不算合格。
 
 ### DA360 输入分辨率 pilot
 
@@ -255,11 +260,11 @@ evaluator v2 会先丢弃 30 个合法唯一 planning frames，再要求至少 6
 
 物理时间戳还必须覆盖至少 95% 的 planning 计量窗口，并满足最小帧数 `ceil(measurementDurationMs × 0.95 / 33.3ms) + 1`；窗口恰为 60s 时至少需要 1713 个 physics frames，不能用首尾两个时间戳伪造 p95。`da360-relative`、只收到服务响应、重复帧、矛盾回执、session 越界或指纹漂移都会 fail closed；因此当前 relative 模式不可能被误报成 15Hz 通过。
 
-六面 capture 仍是六次 Cesium scene render，并按 `panoFacesPerSlice=2` 向浏览器调度器 yield；projector texture 在尺寸不变时改用 `texSubImage2D` 复用。timing 现拆为 `scene_render`、`tile_wait`、`wait_rerender`、`face_upload`、`project`、`scheduler`、HTTP body/header、DA360、YOPO 和 trajectory/depth apply。它们只提供归因证据，不证明吞吐达标。2026-08-09 修复前日志只有约 3.1Hz depth、2.9Hz YOPO；当前实现尚未在真实 Firefox+GPU+城市 tiles 上证明 15Hz，也尚未完成 DA360 metric 或低空闭环门禁。
+六面 capture 仍是六次 Cesium scene render，并按 `panoFacesPerSlice=2` 向浏览器调度器 yield；projector texture 在尺寸不变时改用 `texSubImage2D` 复用。timing 现拆为 `scene_render`、`tile_wait`、`wait_rerender`、`face_upload`、`project`、`scheduler`、HTTP body/header、DA360、YOPO 和 trajectory/depth apply。它们只提供归因证据，不证明吞吐达标。2026-08-09 修复前日志只有约 3.1Hz depth、2.9Hz YOPO；当前已加载人工批准的 sim-to-sim metric 标定，但尚未在真实 Firefox+GPU+城市 tiles 上证明 15Hz 或完成低空闭环验收。
 
 流水化不会再因 RGB N+1 先完成就丢弃仍新鲜的规划响应 N：轨迹应用只核对 goal/generation/mode 和 250ms 硬龄限；canvas 则按递增 request ID 显示最新可用 depth。因此画面允许比当前 RGB 落后一帧，日志用 `depthPreviewLagFrames/depthPreviewAgeMs` 明示，而旧会话或已被更新 depth 超越的结果仍 fail closed。规划 control outcome 在 JPEG 解码前同步记录且每请求唯一；随后画面成功、失败或 stale 只产生 `mode=depth-preview` diagnostic，不进入 15Hz 规划计数。
 
-2026-08-11 的最小 live performance smoke 应显式使用 flight profile，避免把标定的 6×650ms tile quiet 带入飞行链路：
+2026-08-11 的最小 live performance smoke 应显式使用 flight profile。进入飞行前的一次性 panorama preload 会逐面等待 tiles 稳定；进入 flight 后的实时 capture 仍是 zero-wait/capture-anyway，不会把 6×650ms tile quiet 带入 YOPO 循环，也不会把 `rgbTiles=6/6` 作为自动飞行硬门禁：
 
 ```bash
 ./launch-firefox-gpu.sh \

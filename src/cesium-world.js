@@ -50,6 +50,10 @@ const CESIUM_DRONE_MODEL_SCALE = clampNumber(
 );
 const HEIGHT_CACHE_TTL_MS = 140;
 const HEIGHT_CACHE_LIMIT = 256;
+// These texture names are legacy cubemap labels.  In this simulator's flight
+// convention local +X is body-left (yaw=0 faces -Z and body-right is -X), even
+// though the +X texture has historically been named `right`.  ERP azimuth must
+// therefore be derived from the explicit NWU contract, never from these names.
 const PANORAMA_FACE_DEFS = [
     { name: 'front', dir: { x: 0, y: 0, z: -1 }, up: { x: 0, y: 1, z: 0 } },
     { name: 'right', dir: { x: 1, y: 0, z: 0 }, up: { x: 0, y: 1, z: 0 } },
@@ -237,9 +241,11 @@ class PanoramaEquirectProjector {
             vec3 directionFromPitchYaw(float pitch, float yaw) {
                 float cosPitch = cos(pitch);
                 float forward = cosPitch * cos(yaw);
-                float right = cosPitch * sin(yaw);
-                // negate x → mirror left/right to match YOPO training ERP layout
-                return normalize(vec3(-right, sin(pitch), -forward));
+                // YOPO training ERP uses body NWU (+x forward, +y left,
+                // +z up).  This renderer's component +X is that body-left
+                // axis, so yaw=+90 deg maps directly to component +X.
+                float left = cosPitch * sin(yaw);
+                return normalize(vec3(left, sin(pitch), -forward));
             }
 
             void main() {
@@ -469,7 +475,13 @@ export class CesiumWorld {
         this._panoramaFaceSize = 0;
         this._panoramaProjector = null;
         this._panoramaTileset = null;
-        this._panoramaTileLoadState = { pending: null, processing: null };
+        this._panoramaTileLoadState = {
+            pending: null,
+            processing: null,
+            errorCount: 0,
+            lastErrorAt: null,
+            lastErrorMessage: null,
+        };
         this._panoramaCaptureActiveCount = 0;
         this._panoramaCaptureRevision = 0;
         this._lastCompletedPanoramaCapture = null;
@@ -622,6 +634,11 @@ export class CesiumWorld {
         const keyPrefix = String(label || 'Google 3D Tiles').toLowerCase().replace(/[^a-z0-9]+/g, '-');
         const onFailure = (error) => {
             const message = error && error.message ? error.message : String(error || 'unknown tile error');
+            if (loadState) {
+                loadState.errorCount = Math.max(0, Number(loadState.errorCount) || 0) + 1;
+                loadState.lastErrorAt = performance.now();
+                loadState.lastErrorMessage = message;
+            }
             reportUserError(`${label} request failed`, error, {
                 key: `${keyPrefix}-failed-${message}`,
                 intervalMs: 10000,
@@ -1582,7 +1599,13 @@ export class CesiumWorld {
         this._panoramaInitPromise = null;
         this._panoramaFaceSize = 0;
         this._panoramaTileset = null;
-        this._panoramaTileLoadState = { pending: null, processing: null };
+        this._panoramaTileLoadState = {
+            pending: null,
+            processing: null,
+            errorCount: 0,
+            lastErrorAt: null,
+            lastErrorMessage: null,
+        };
         this._panoramaCaptureActiveCount = 0;
         this._lastCompletedPanoramaCapture = null;
     }
@@ -1647,7 +1670,13 @@ export class CesiumWorld {
         const tileset = await this._createGoogleTileset(null);
         this._configurePanoramaTileset(tileset);
         this._panoramaTileset = tileset;
-        this._panoramaTileLoadState = { pending: null, processing: null };
+        this._panoramaTileLoadState = {
+            pending: null,
+            processing: null,
+            errorCount: 0,
+            lastErrorAt: null,
+            lastErrorMessage: null,
+        };
         this._wireTilesetDiagnostics(null, tileset, this._panoramaTileLoadState, 'Panorama Google 3D Tiles');
         viewer.scene.primitives.add(tileset);
         viewer.resize();
@@ -1708,7 +1737,19 @@ export class CesiumWorld {
     async _capturePanoramaHybridWithViewerAsync(viewer, transform, width, height, faceSize, verticalFovDeg = 180, options = {}) {
         const totalStartedAt = performance.now();
         const projector = this._getPanoramaProjector();
-        if (!projector) return { canvas: null, complete: false, ready: false };
+        if (!projector) {
+            return {
+                canvas: null,
+                complete: false,
+                ready: false,
+                allFacesTileReady: false,
+                readyFaces: 0,
+                faces: PANORAMA_FACE_DEFS.length,
+                faceTileReadiness: Object.freeze([]),
+                readinessReason: 'capture-incomplete',
+                tileError: false,
+            };
+        }
         if (projector.readyFaces) projector.readyFaces.clear();
 
         const camera = viewer.camera;
@@ -1727,6 +1768,7 @@ export class CesiumWorld {
         const tileTimeoutMs = Math.max(0, Math.min(120000, Number(options.tileTimeoutMs) || 0));
         const tileQuietMs = Math.max(0, Math.min(5000, Number(options.tileQuietMs) || 0));
         const captureAnyway = !!options.captureAnyway;
+        const continueOnTileTimeout = options.continueOnTileTimeout === true;
         const signal = options.signal || null;
         const facesPerSlice = Math.max(1, Math.min(
             PANORAMA_FACE_DEFS.length,
@@ -1769,7 +1811,42 @@ export class CesiumWorld {
             : 1;
         this._panoramaCaptureRevision = captureRevision;
         const captureTileset = this._panoramaTileset;
+        const captureLoadState = this._panoramaTileLoadState;
+        const tileErrorCountAtStart = Math.max(0, Number(captureLoadState?.errorCount) || 0);
         this._panoramaCaptureActiveCount = Math.max(0, Number(this._panoramaCaptureActiveCount) || 0) + 1;
+
+        const readinessSnapshot = (captureComplete = false) => {
+            const frozenFaces = Object.freeze(faceTileReadiness.slice());
+            const readyFaces = frozenFaces.reduce(
+                (count, face) => count + (face.readyWhenCopied === true ? 1 : 0),
+                0,
+            );
+            const allFaceFlagsReady = captureComplete
+                && frozenFaces.length === PANORAMA_FACE_DEFS.length
+                && readyFaces === PANORAMA_FACE_DEFS.length;
+            const rawLastErrorAt = captureLoadState?.lastErrorAt;
+            const lastErrorAt = Number(rawLastErrorAt);
+            const tileError = (
+                (Math.max(0, Number(captureLoadState?.errorCount) || 0) > tileErrorCountAtStart)
+                || (rawLastErrorAt != null
+                    && Number.isFinite(lastErrorAt)
+                    && lastErrorAt >= totalStartedAt - 5000)
+            );
+            const allFacesTileReady = allFaceFlagsReady && !tileError;
+            return Object.freeze({
+                faceTileReadiness: frozenFaces,
+                readyFaces,
+                allFacesTileReady,
+                readinessReason: tileError
+                    ? 'tile-error'
+                    : allFacesTileReady
+                    ? 'tiles-ready'
+                    : captureComplete
+                    ? 'tiles-partial'
+                    : 'capture-incomplete',
+                tileError,
+            });
+        };
 
         try {
             if (frustum) {
@@ -1830,7 +1907,8 @@ export class CesiumWorld {
                     waitRerenderMs += waitRenderElapsedMs;
                     tileWaitMs += Math.max(0, waitElapsedMs - waitRenderElapsedMs);
                     throwIfAborted();
-                    if (!faceTilesReady) {
+                    if (!faceTilesReady && !continueOnTileTimeout) {
+                        const readiness = readinessSnapshot(false);
                         return {
                             canvas: null,
                             complete: false,
@@ -1838,6 +1916,7 @@ export class CesiumWorld {
                             loadingTiles: true,
                             faceIndex,
                             faces: PANORAMA_FACE_DEFS.length,
+                            ...readiness,
                             timings_ms: captureTimings(),
                         };
                     }
@@ -1863,6 +1942,14 @@ export class CesiumWorld {
             const projectStartedAt = performance.now();
             const canvas = projector.render(width, height, verticalFovDeg, faceFovDeg, topPoleGuardDeg, bottomPoleGuardDeg);
             projectMs = performance.now() - projectStartedAt;
+            // `complete` describes the image pipeline only: all six faces were
+            // copied and an ERP canvas was projected. `ready` is deliberately
+            // stricter and reports whether every face had settled 3D tiles at
+            // the instant it was copied. A partial canvas remains useful for
+            // live preview and is therefore returned to the caller.
+            const complete = !!canvas
+                && faceTileReadiness.length === PANORAMA_FACE_DEFS.length;
+            const readiness = readinessSnapshot(complete);
             if (canvas && viewer === this._panoramaViewer && captureTileset === this._panoramaTileset
                 && captureRevision > (this._lastCompletedPanoramaCapture?.revision || 0)) {
                 this._lastCompletedPanoramaCapture = Object.freeze({
@@ -1877,18 +1964,21 @@ export class CesiumWorld {
                     height,
                     faceSize,
                     verticalFovDeg,
-                    faceTileReadiness: Object.freeze(faceTileReadiness.slice()),
-                    allFacesTileReady: faceTileReadiness.length === PANORAMA_FACE_DEFS.length
-                        && faceTileReadiness.every(face => face.readyWhenCopied),
+                    complete,
+                    ready: readiness.allFacesTileReady,
+                    faceTileReadiness: readiness.faceTileReadiness,
+                    readyFaces: readiness.readyFaces,
+                    allFacesTileReady: readiness.allFacesTileReady,
+                    readinessReason: readiness.readinessReason,
+                    tileError: readiness.tileError,
                     completedAt: performance.now(),
                 });
             }
             return {
                 canvas,
-                complete: !!canvas,
-                ready: !!canvas,
-                allFacesTileReady: faceTileReadiness.length === PANORAMA_FACE_DEFS.length
-                    && faceTileReadiness.every(face => face.readyWhenCopied),
+                complete,
+                ready: readiness.allFacesTileReady,
+                ...readiness,
                 faces: PANORAMA_FACE_DEFS.length,
                 timings_ms: captureTimings(),
             };
@@ -1920,6 +2010,7 @@ export class CesiumWorld {
             tileTimeoutMs: options.tileTimeoutMs,
             tileQuietMs: options.tileQuietMs,
             captureAnyway: options.captureAnyway,
+            continueOnTileTimeout: options.continueOnTileTimeout,
             facesPerSlice: options.facesPerSlice,
             signal: options.signal,
             progressCb: options.progressCb,
@@ -2136,7 +2227,7 @@ export class CesiumWorld {
                 erp: {
                     verticalFovDeg: opts.verticalFovDeg,
                     sensorFrame: 'NWU(+x forward,+y left,+z up)',
-                    componentFrame: '(+x right,+y up,+z back)',
+                    componentFrame: '(+x body-left,+y up,+z back)',
                 },
                 sampling: {
                     gridCols: opts.gridCols,

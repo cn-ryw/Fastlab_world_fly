@@ -81,6 +81,18 @@ globalThis.window = {
 
 const { PanoramaSensor, decodeDepthImageSource } = await import('../src/panorama-sensor.js?depth-state-test');
 const DEPTH_JPEG = 'data:image/jpeg;base64,AA==';
+const RELATIVE_POLAR_SCAN = Object.freeze({
+    schema_version: 1,
+    depth_mode: 'da360-relative',
+    unit: 'x-near-reference',
+    radius: 20,
+    angle_start_deg: -135,
+    angle_step_deg: 90,
+    angle_positive: 'body-left',
+    normalization: 'per-frame-depth-p02',
+    valid_fraction: 1,
+    values: [1, 2, 3, 4],
+});
 
 function fakeBitmap(label = 'depth') {
     return { width: 8, height: 4, label, closed: false, close() { this.closed = true; } };
@@ -95,7 +107,12 @@ function newSensorWithFrame() {
     elements.get('panorama-depth-canvas').context.drawCalls.length = 0;
     const sensor = new PanoramaSensor();
     const rgbFrame = new FakeCanvas('captured-rgb');
-    assert.equal(sensor.primeFromCaptureResult(rgbFrame), true);
+    assert.equal(sensor.primeFromCaptureResult(rgbFrame, 0, {
+        transform: {
+            position: { x: 0, y: 0, z: 0 },
+            rotation: { x: 0, y: 0, z: 0 },
+        },
+    }), true);
     return sensor;
 }
 
@@ -220,7 +237,12 @@ async function nextTask() {
     const sensor = newSensorWithFrame();
     let resolveDecode;
     globalThis.createImageBitmap = () => new Promise(resolve => { resolveDecode = resolve; });
-    globalThis.fetch = async () => response({ depth_image: DEPTH_JPEG, latency_ms: 12 });
+    globalThis.fetch = async () => response({
+        depth_image: DEPTH_JPEG,
+        depth_mode: 'da360-relative',
+        polar_scan: RELATIVE_POLAR_SCAN,
+        latency_ms: 12,
+    });
 
     const pending = sensor._requestDepth(sensor.rgbCanvas);
     await nextTask();
@@ -233,6 +255,12 @@ async function nextTask() {
     assert.equal(sensor.depthCanvas.context.drawCalls.length, 1);
     assert.equal(sensor.getDepthState().mode, 'preview');
     assert.equal(sensor.depthStatusEl.textContent, 'preview 12ms');
+    assert.equal(sensor.getDepthPolarScan().frameId, 1);
+    assert.equal(sensor.getDepthPolarScan().captureYawDeg, 0);
+    assert.equal(sensor.getDepthPolarScan().scan.unit, 'x-near-reference');
+    sensor.reset();
+    assert.equal(sensor.getDepthPolarScan(), null,
+        'reset/teleport must not retain an ego-centred outline from the old pose');
 }
 
 // Decode failure keeps the canvas untouched and exposes an error state.
@@ -281,11 +309,12 @@ async function nextTask() {
                 depth_image: DEPTH_JPEG,
                 latency_ms: 18,
                 planning_authorized: true,
-                planning_reason: 'validated-da360-metric',
+                planning_reason: 'experimental-unaccepted-da360-metric',
                 endstate: [1, 2, 3, 4, 5, 6, 7, 8, 9],
                 traj_time: 1.125,
                 depth_mode: 'da360-metric',
                 calibration_id: 'calibration-v1',
+                calibration_accuracy_accepted: false,
                 service_fingerprint: 'service-v1',
                 frame_id: '2',
                 goal_id: 'goal-1',
@@ -341,10 +370,12 @@ async function nextTask() {
     assert.equal(callbackContext.goalId, goalId);
     assert.equal(callbackContext.mode, 'planning');
     assert.equal(callbackContext.serviceFingerprint, 'service-v1');
+    assert.equal(callbackContext.calibrationAccuracyAccepted, false);
     assert.equal(planningMetrics.trajectoryApplied, true);
     assert.ok(Number.isFinite(planningMetrics.trajectoryAppliedAtMs));
     assert.equal(planningMetrics.depthMode, 'da360-metric');
     assert.equal(planningMetrics.calibrationId, 'calibration-v1');
+    assert.equal(planningMetrics.calibrationAccuracyAccepted, false);
     assert.equal(planningMetrics.serviceFingerprint, 'service-v1');
 
     sensor.resetYopoGoal('cancelled');
@@ -668,6 +699,60 @@ async function nextTask() {
     assert.equal(sensor.getDepthState().mode, 'planning');
     assert.equal(sensor.getDepthState().outcome, 'stale');
     assert.equal(sensor.getDepthState().goalId, goalId);
+}
+
+// Collision/expiry/overrun replan boundaries invalidate an in-flight planning
+// response even when goal and navigation generation are unchanged.
+{
+    const sensor = newSensorWithFrame();
+    sensor.setYopoPose({ x: 0, y: 100, z: 0, vx: 0, vy: 0, vz: 0 }, 0);
+    sensor.setYopoGoal({ x: 30, y: 100, z: 0 });
+    sensor.primeFromCaptureResult(new FakeCanvas('planning-before-controller-failure'));
+
+    let resolveFetch;
+    let requestSignal = null;
+    let callbackCalls = 0;
+    globalThis.createImageBitmap = async () => fakeBitmap('stale-controller-failure-preview');
+    globalThis.fetch = (_url, options) => {
+        requestSignal = options.signal;
+        return new Promise(resolve => { resolveFetch = resolve; });
+    };
+    sensor.onYopoResult = () => { callbackCalls++; return true; };
+
+    const staleRequest = sensor._requestDepth(sensor.rgbCanvas);
+    await nextTask();
+    const frameBeforeFailure = sensor._rgbFrameId;
+    const epochBeforeFailure = sensor._planningEpoch;
+    assert.ok(requestSignal, 'controller-failure test reaches an in-flight planning request');
+
+    assert.equal(sensor.requestImmediatePlanningFrame('collision'), true);
+    assert.equal(requestSignal.aborted, true,
+        'controller failure aborts the in-flight planning request');
+    assert.equal(sensor._planningEpoch, epochBeforeFailure + 1,
+        'controller failure advances the independent planning epoch');
+    assert.equal(sensor._minimumRequestFrameId, frameBeforeFailure + 1,
+        'controller failure requires a newly captured RGB frame');
+
+    // Simulate a backend/fetch implementation that resolves despite abort.
+    // The local epoch gate must still reject the old response before apply.
+    resolveFetch(response({
+        depth_image: DEPTH_JPEG,
+        latency_ms: 30,
+        planning_authorized: true,
+        planning_reason: 'validated-da360-metric',
+        endstate: [1, 2, 3, 4, 5, 6, 7, 8, 9],
+        traj_time: 1,
+        depth_mode: 'da360-metric',
+        calibration_id: 'cal-before-failure',
+        service_fingerprint: 'svc-before-failure',
+        frame_id: '2', goal_id: 'goal-1', generation: '1',
+    }));
+    assert.equal(await staleRequest, false,
+        'pre-failure response cannot become current after a replan boundary');
+    assert.equal(callbackCalls, 0,
+        'pre-failure response never reaches the trajectory install callback');
+    assert.equal(sensor._shouldRequestDepth(), false,
+        'the old RGB frame cannot be immediately reused after invalidation');
 }
 
 // A response remains the newest available depth even if RGB capture has moved
@@ -1098,6 +1183,99 @@ for (const transition of ['profile-switch', 'goal-set']) {
     assert.equal(sensor._calibrationCapturePending, false);
 }
 
+// Tile readiness is diagnostic in the current experimental flight workflow:
+// a complete but partial RGB canvas remains visible and may be sent to YOPO.
+// The exact frame readiness must survive through callback and metrics so the
+// operator can decide whether the resulting trajectory is trustworthy.
+{
+    const sensor = new PanoramaSensor();
+    sensor.setYopoPose({
+        actualState: {
+            position: { x: 1, y: 2, z: 3 },
+            velocity: { x: 0, y: 0, z: 0 },
+        },
+        referenceState: {
+            position: { x: 1, y: 2, z: 3 },
+            velocity: { x: 0, y: 0, z: 0 },
+            acceleration: { x: 0, y: 0, z: 0 },
+        },
+        yaw: 0,
+    }, 0);
+    sensor.setYopoGoal({ x: 10, y: 2, z: 3 });
+    const faceTileReadiness = [
+        { face: 'front', readyWhenCopied: true },
+        { face: 'right', readyWhenCopied: true },
+        { face: 'back', readyWhenCopied: false },
+        { face: 'left', readyWhenCopied: false },
+        { face: 'up', readyWhenCopied: false },
+        { face: 'down', readyWhenCopied: false },
+    ];
+    assert.equal(sensor.primeFromCaptureResult({
+        canvas: new FakeCanvas('partial-planning-rgb'),
+        complete: true,
+        // Legacy producers used `ready` for canvas completion. The explicit
+        // all-face aggregate must take precedence when both are present.
+        ready: true,
+        allFacesTileReady: false,
+        readyFaces: 2,
+        faces: 6,
+        faceTileReadiness,
+        readinessReason: 'tiles-partial',
+        tileError: false,
+    }, 5, {
+        transform: {
+            position: { x: 1, y: 2, z: 3 },
+            rotation: { x: 0, y: 0, z: 0 },
+        },
+    }), true, 'partial RGB canvas should still be committed to the preview');
+
+    const state = sensor.getDepthState();
+    assert.equal(state.rgbFrameComplete, true);
+    assert.equal(state.rgbTilesReady, false);
+    assert.equal(state.rgbReadyFaces, 2);
+    assert.equal(state.rgbTotalFaces, 6);
+    assert.equal(state.faceTileReadiness.length, 6);
+
+    let planningFetches = 0;
+    let callbackContext = null;
+    const metrics = [];
+    globalThis.createImageBitmap = async () => fakeBitmap('partial-planning-depth');
+    globalThis.fetch = async url => {
+        planningFetches++;
+        assert.match(String(url), /\/yopo\/plan_full\?/);
+        return response({
+            frame_id: String(sensor._rgbFrameContext.frameId),
+            goal_id: sensor._goalId,
+            generation: String(sensor._yopoGeneration),
+            depth_image: DEPTH_JPEG,
+            depth_mode: 'da360-metric',
+            calibration_id: 'partial-rgb-test',
+            calibration_accuracy_accepted: false,
+            service_fingerprint: 'partial-rgb-service',
+            planning_authorized: true,
+            planning_reason: 'experimental-unaccepted-da360-metric',
+            endstate: [1, 0, 0, 0, 0, 0, 0, 0, 0],
+            traj_time: 1,
+            latency_ms: 3,
+            timings_ms: { da360_ms: 1, yopo_ms: 1 },
+        });
+    };
+    sensor.onYopoResult = (_endstate, _trajTime, context) => {
+        callbackContext = context;
+        return true;
+    };
+    sensor.onPerceptionMetrics = value => metrics.push(value);
+    assert.equal(await sensor._requestDepth(sensor.rgbCanvas), true);
+    assert.equal(planningFetches, 1, 'partial tile readiness must not silently block YOPO');
+    assert.equal(callbackContext.rgbTilesReady, false);
+    assert.equal(callbackContext.rgbReadyFaces, 2);
+    const planningMetric = metrics.find(value => value.mode === 'planning');
+    assert.equal(planningMetric.rgbFrameId, sensor._rgbFrameContext.frameId);
+    assert.equal(planningMetric.rgbTilesReady, false);
+    assert.equal(planningMetric.rgbReadyFaces, 2);
+    assert.equal(planningMetric.rgbReadinessReason, 'tiles-partial');
+}
+
 // HTML contract: one visible canvas, no hidden image, and 0.6 m collision defaults.
 {
     const html = await readFile(new URL('../index.html', import.meta.url), 'utf8');
@@ -1105,11 +1283,14 @@ for (const transition of ['profile-switch', 'goal-set']) {
     assert.match(html, /id="panorama-depth-canvas"/);
     assert.match(html, /id="phys-collision-radius"[^>]*value="0\.6"/);
     assert.match(html, /id="phys-collision-radius-num"[^>]*value="0\.6"/);
-    assert.equal(
-        html.match(/src\/main\.js\?v=20260807-planfull/g)?.length,
-        2,
-        'normal and slow-load fallback imports share one ES module cache key',
+    const mainModuleKeys = Array.from(
+        html.matchAll(/src\/main\.js\?v=([A-Za-z0-9._-]+)/g),
+        match => match[1],
     );
+    assert.equal(mainModuleKeys.length, 2,
+        'normal and slow-load fallback both import the main module');
+    assert.equal(new Set(mainModuleKeys).size, 1,
+        'normal and slow-load fallback imports share one ES module cache key');
 }
 
 console.log('Panorama depth state tests: all passed');

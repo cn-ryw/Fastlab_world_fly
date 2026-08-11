@@ -287,8 +287,8 @@ export class OSD {
         const barH = 22;
         const pxPerDeg = barW / 90; // 90° visible range
 
-        // Normalize yaw to 0-360
-        let heading = ((yaw % 360) + 360) % 360;
+        // Simulator yaw=0 faces local -Z (south); compass 0 is true north.
+        let heading = (((yaw + 180) % 360) + 360) % 360;
 
         ctx.save();
         ctx.beginPath();
@@ -404,9 +404,15 @@ export class OSD {
         ctx.textBaseline = 'middle';
 
         // Flight mode (left)
+        const modeLabels = {
+            drone: 'EASY',
+            fpv: 'FPV',
+            stabilized: 'LEVEL',
+            so3: 'SO3 AUTO',
+        };
         ctx.textAlign = 'left';
         ctx.fillStyle = this.color;
-        ctx.fillText(`MODE: ${mode.toUpperCase()}`, w * 0.15, y);
+        ctx.fillText(`MODE: ${modeLabels[mode] || 'FAILSAFE'}`, w * 0.15, y);
 
         // Armed status (right)
         ctx.textAlign = 'right';
@@ -431,10 +437,16 @@ export class OSD {
             } else {
                 cue = `GSPD ${groundSpeed.toFixed(1)}  TGT ${targetSpeed.toFixed(1)}  LIM ${maxSpeed.toFixed(0)}${drone.boostActive ? ' BOOST' : ''}`;
             }
-        } else if (groundSpeed < 2.0 && throttlePct > 65) {
+        } else if (mode === 'fpv' && groundSpeed < 2.0 && throttlePct > 65) {
             cue = 'FPV: pitch nose down to convert motor thrust into forward speed';
-        } else {
+        } else if (mode === 'fpv') {
             cue = `GSPD ${groundSpeed.toFixed(1)}  AIR ${airSpeed.toFixed(1)}  THR ${throttlePct}%${drone.boostActive ? ' BOOST' : ''}`;
+        } else if (mode === 'stabilized') {
+            cue = 'LEVEL: roll/pitch = self-level angle | W/S = manual thrust | pilot holds altitude';
+        } else if (mode === 'so3') {
+            cue = 'SO3 AUTO: G+scene / depth-circle click | sticks ignored | C cancel';
+        } else {
+            cue = 'FAILSAFE: invalid flight mode';
         }
 
         ctx.textAlign = 'center';

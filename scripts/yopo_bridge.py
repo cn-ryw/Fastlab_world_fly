@@ -7,7 +7,7 @@ POST /yopo/plan
   Output JSON: { endstate: [px,vx,ax, py,vy,ay, pz,vz,az], traj_time: 1.125,
                  score: float, fixed_height: float }
   注：响应里的 fixed_height 是**训练配置值**（0.8m），仅供参考。实际规划所用的
-  高度平面取自请求中的 goal.z，不再是这个常量。
+  高度平面取自请求中的 goal.y（sim 为 Y-Up），不再是这个常量。
 
 endstate 采用**轴主序**：每个轴连续排布 位置/速度/加速度，坐标为 sim 世界系
 (x=east, y=up, z=north)。这与参考实现 test_yopo_ros.py 的
@@ -51,6 +51,7 @@ DEFAULT_MODEL = os.environ.get("YOPO_MODEL_PATH", str(YOPO_ROOT / "YOPO/saved/YO
 DEFAULT_CONFIG = os.environ["YOPO_CONFIG"]
 BASE_CONFIG = "traj_opt.yaml"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+YOPO_MAX_VERTICAL_ENDPOINT_STEP_M = 4.0
 
 
 def _sha256_file(path):
@@ -366,8 +367,17 @@ class YopoRunner:
         endstate_c = endstate.reshape(-1, 3, 3).transpose(0, 2, 1)
         endstate_w = np.matmul(Rotation_wc, endstate_c)
 
-        # 把轨迹末端的 z 位移拉到高度平面上（同 test_yopo_ros.py:641）
-        endstate_w[:, 2, 0] = height_plane - yopo_pos[2]
+        # 参考实现把末端直接拉到高度平面；浏览器现在会检查整段 quintic
+        # 的 50m/s / 80m/s² 极值。若用户一次改变几十米高度，硬拉到目标
+        # 会让每一条 1.125s 轨迹都被安全门禁拒绝，规划链永久停在 hold。
+        # 因此只对这个已有的高度覆盖做单段可达限幅，连续重规划逐段逼近；
+        # 网络生成的水平动作、速度和加速度保持原样，最终仍由消费端复核。
+        height_error = height_plane - yopo_pos[2]
+        endstate_w[:, 2, 0] = np.clip(
+            height_error,
+            -YOPO_MAX_VERTICAL_ENDPOINT_STEP_M,
+            YOPO_MAX_VERTICAL_ENDPOINT_STEP_M,
+        )
 
         best = endstate_w[0]
         yopo_result = np.array([

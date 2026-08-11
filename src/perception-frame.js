@@ -49,6 +49,28 @@ function freezeState(state, label, requireAcceleration = false) {
     return Object.freeze(frozen);
 }
 
+function finiteCount(value, label, fallback) {
+    const number = value == null ? fallback : Number(value);
+    if (!Number.isSafeInteger(number) || number < 0) {
+        throw new TypeError(`${label} must be a non-negative integer`);
+    }
+    return number;
+}
+
+function freezeFaceTileReadiness(readiness) {
+    if (readiness == null) return Object.freeze([]);
+    if (!Array.isArray(readiness)) throw new TypeError('faceTileReadiness must be an array');
+    return Object.freeze(readiness.map((entry, index) => {
+        if (!entry || typeof entry !== 'object') {
+            throw new TypeError(`faceTileReadiness[${index}] must be an object`);
+        }
+        return Object.freeze({
+            face: String(entry.face ?? index),
+            readyWhenCopied: entry.readyWhenCopied === true,
+        });
+    }));
+}
+
 export class PerceptionFrame {
     constructor({
         frameId,
@@ -60,6 +82,13 @@ export class PerceptionFrame {
         yaw,
         captureProfile = 'flight',
         projectionConfig = {},
+        rgbFrameComplete = true,
+        rgbTilesReady = true,
+        rgbReadyFaces = null,
+        rgbTotalFaces = 6,
+        rgbReadinessReason = null,
+        rgbTileError = false,
+        faceTileReadiness = [],
     }) {
         const id = Number(frameId);
         if (!Number.isSafeInteger(id) || id < 0) throw new TypeError('frameId must be a non-negative integer');
@@ -77,6 +106,37 @@ export class PerceptionFrame {
         }
         this.captureProfile = captureProfile;
         this.projectionConfig = Object.freeze({ ...projectionConfig });
+        this.rgbFrameComplete = rgbFrameComplete === true;
+        this.rgbTilesReady = rgbTilesReady === true;
+        this.rgbTotalFaces = finiteCount(rgbTotalFaces, 'rgbTotalFaces', 6);
+        this.faceTileReadiness = freezeFaceTileReadiness(faceTileReadiness);
+        const inferredReadyFaces = this.faceTileReadiness.reduce(
+            (count, entry) => count + (entry.readyWhenCopied ? 1 : 0),
+            0,
+        );
+        this.rgbReadyFaces = finiteCount(
+            rgbReadyFaces,
+            'rgbReadyFaces',
+            this.faceTileReadiness.length > 0
+                ? inferredReadyFaces
+                : this.rgbTilesReady
+                ? this.rgbTotalFaces
+                : 0,
+        );
+        if (this.rgbReadyFaces > this.rgbTotalFaces) {
+            throw new TypeError('rgbReadyFaces cannot exceed rgbTotalFaces');
+        }
+        this.rgbTileError = rgbTileError === true;
+        this.rgbReadinessReason = String(
+            rgbReadinessReason
+            || (this.rgbTilesReady
+                ? 'tiles-ready'
+                : this.rgbTileError
+                ? 'tile-error'
+                : this.rgbFrameComplete
+                ? 'tiles-partial'
+                : 'capture-incomplete'),
+        );
         Object.freeze(this);
     }
 

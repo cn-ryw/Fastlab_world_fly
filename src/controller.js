@@ -35,14 +35,16 @@ const SETTINGS_IDS = [
     'cam-hfov',
     'cam-mount-angle',
     'ctrl-pos-kp', 'ctrl-pos-ki', 'ctrl-pos-kd', 'ctrl-vel-kp', 'ctrl-vel-ki', 'ctrl-vel-kd', 'ctrl-alt-kp', 'ctrl-alt-ki', 'ctrl-alt-kd',
-    'so3-kx', 'so3-kv', 'so3-kr', 'so3-komega',
     'phys-mass', 'phys-thrust', 'phys-drag-cd', 'phys-drag-area',
     'phys-drone-size', 'phys-collision-radius',
     'clean-mode-toggle', 'osd-toggle',
     'pano-level-toggle', 'yaw-lock-toggle',
 ];
 
-const CONFIG_VERSION = 5;
+const CONFIG_VERSION = 6;
+const FLIGHT_MODES = Object.freeze(['drone', 'fpv', 'stabilized', 'so3']);
+const FLIGHT_MODE_SET = new Set(FLIGHT_MODES);
+const SETTINGS_ID_SET = new Set(SETTINGS_IDS);
 const DEFAULT_EASY_MAX_SPEED = '83.333';
 const DEFAULT_EASY_MAX_VSPEED = '8';
 const DEFAULT_DRAG_AREA = '0.0015';
@@ -51,7 +53,10 @@ const PREVIOUS_EASY_MAX_SPEED = 18;
 const LEGACY_EASY_MAX_VSPEED = 6;
 const PREVIOUS_DRAG_AREA = 0.01;
 
-// Settings that are stored separately per flight mode (drone vs fpv)
+// Settings stored separately for every flight mode.  Most of these gains are
+// consumed only by Easy, but keeping a complete, independent profile for each
+// public mode makes mode switches/imports deterministic and prevents Level or
+// SO3 from accidentally aliasing the FPV snapshot.
 const PER_MODE_SETTINGS_IDS = [
     'ctrl-pos-kp', 'ctrl-pos-ki', 'ctrl-pos-kd',
     'ctrl-vel-kp', 'ctrl-vel-ki', 'ctrl-vel-kd',
@@ -65,6 +70,201 @@ const DEFAULT_MAPPING = {
     yaw:        { axisIndex: 3, inverted: false, deadzone: 0, rate: 1.0, expo: 0.0 },
     cameraTilt: { axisIndex: -1, inverted: false, deadzone: 0, rate: 1.0, expo: 0.0 },
 };
+
+const DEFAULT_PID_SETTINGS = Object.freeze({
+    'ctrl-pos-kp': '0.95', 'ctrl-pos-ki': '0', 'ctrl-pos-kd': '0',
+    'ctrl-vel-kp': '1.8', 'ctrl-vel-ki': '0.4', 'ctrl-vel-kd': '0.2',
+    'ctrl-alt-kp': '4.0', 'ctrl-alt-ki': '2.0', 'ctrl-alt-kd': '0',
+});
+const LEGACY_PID_DEFAULTS = Object.freeze({
+    'ctrl-pos-kp': '2.0', 'ctrl-pos-ki': '0.3', 'ctrl-pos-kd': '0.1',
+    'ctrl-vel-kp': '3.0', 'ctrl-vel-ki': '1.0', 'ctrl-vel-kd': '0.05',
+    'ctrl-alt-kp': '4.0', 'ctrl-alt-ki': '2.0', 'ctrl-alt-kd': '0.1',
+});
+const PID_LIMITS = Object.freeze({
+    'ctrl-pos-kp': [0, 10], 'ctrl-pos-ki': [0, 5], 'ctrl-pos-kd': [0, 5],
+    'ctrl-vel-kp': [0, 10], 'ctrl-vel-ki': [0, 5], 'ctrl-vel-kd': [0, 5],
+    'ctrl-alt-kp': [0, 10], 'ctrl-alt-ki': [0, 5], 'ctrl-alt-kd': [0, 5],
+});
+
+function _clone(value) {
+    return JSON.parse(JSON.stringify(value));
+}
+
+function _finiteClamped(value, fallback, min, max) {
+    if (value === null || value === '' || typeof value === 'boolean') return fallback;
+    const number = Number(value);
+    return Number.isFinite(number) ? Math.max(min, Math.min(max, number)) : fallback;
+}
+
+function _validMode(value) {
+    return typeof value === 'string' && FLIGHT_MODE_SET.has(value);
+}
+
+function _sanitizeMapping(saved) {
+    const source = saved && typeof saved === 'object' && !Array.isArray(saved) ? saved : {};
+    const result = {};
+    for (const action of ACTIONS) {
+        const defaults = DEFAULT_MAPPING[action];
+        const candidate = source[action] && typeof source[action] === 'object' && !Array.isArray(source[action])
+            ? source[action]
+            : {};
+        const axisNumber = candidate.axisIndex === null || typeof candidate.axisIndex === 'boolean'
+            ? NaN
+            : Number(candidate.axisIndex);
+        result[action] = {
+            axisIndex: Number.isInteger(axisNumber) && axisNumber >= -1 && axisNumber <= 63
+                ? axisNumber
+                : defaults.axisIndex,
+            inverted: typeof candidate.inverted === 'boolean' ? candidate.inverted : defaults.inverted,
+            deadzone: _finiteClamped(candidate.deadzone, defaults.deadzone, 0, 0.5),
+            rate: _finiteClamped(candidate.rate, defaults.rate, 0, 10),
+            expo: _finiteClamped(candidate.expo, defaults.expo, 0, 1),
+        };
+    }
+    return result;
+}
+
+function _sanitizeButtonMapping(saved) {
+    const source = saved && typeof saved === 'object' && !Array.isArray(saved) ? saved : {};
+    const result = {};
+    for (const action of BUTTON_ACTIONS) {
+        const defaults = DEFAULT_BUTTON_MAPPING[action];
+        const candidate = source[action] && typeof source[action] === 'object' && !Array.isArray(source[action])
+            ? source[action]
+            : {};
+        const buttonIndex = candidate.buttonIndex === null || typeof candidate.buttonIndex === 'boolean'
+            ? NaN
+            : Number(candidate.buttonIndex);
+        const axisIndex = candidate.axisIndex === null || typeof candidate.axisIndex === 'boolean'
+            ? NaN
+            : Number(candidate.axisIndex);
+        result[action] = {
+            source: candidate.source === 'axis' || candidate.source === 'button'
+                ? candidate.source
+                : defaults.source,
+            buttonIndex: Number.isInteger(buttonIndex) && buttonIndex >= -1 && buttonIndex <= 255
+                ? buttonIndex
+                : defaults.buttonIndex,
+            axisIndex: Number.isInteger(axisIndex) && axisIndex >= -1 && axisIndex <= 63
+                ? axisIndex
+                : defaults.axisIndex,
+            axisThreshold: _finiteClamped(candidate.axisThreshold, defaults.axisThreshold, 0, 1),
+            inverted: typeof candidate.inverted === 'boolean' ? candidate.inverted : defaults.inverted,
+            triggerMode: candidate.triggerMode === 'level' || candidate.triggerMode === 'toggle'
+                ? candidate.triggerMode
+                : defaults.triggerMode,
+        };
+    }
+    return result;
+}
+
+function _sanitizeHidCalibration(saved) {
+    const defaults = () => ({ min: null, center: null, max: null });
+    if (!Array.isArray(saved)) return Array.from({ length: 16 }, defaults);
+    return Array.from({ length: 16 }, (_, index) => {
+        const candidate = saved[index];
+        if (!candidate || typeof candidate !== 'object') return defaults();
+        const min = Number(candidate.min);
+        const center = Number(candidate.center);
+        const max = Number(candidate.max);
+        if (!Number.isFinite(min) || !Number.isFinite(center) || !Number.isFinite(max) ||
+            !(min < center && center < max)) {
+            return defaults();
+        }
+        return { min, center, max };
+    });
+}
+
+function _rateExpoFromMapping(mapping) {
+    const result = {};
+    const safeMapping = _sanitizeMapping(mapping);
+    for (const action of ACTIONS) {
+        result[action] = {
+            rate: safeMapping[action].rate,
+            expo: safeMapping[action].expo,
+        };
+    }
+    return result;
+}
+
+function _sanitizeRateExpoSnapshot(saved, fallback) {
+    const source = saved && typeof saved === 'object' && !Array.isArray(saved) ? saved : {};
+    const result = {};
+    for (const action of ACTIONS) {
+        const candidate = source[action] && typeof source[action] === 'object' && !Array.isArray(source[action])
+            ? source[action]
+            : {};
+        result[action] = {
+            rate: _finiteClamped(candidate.rate, fallback[action].rate, 0, 10),
+            expo: _finiteClamped(candidate.expo, fallback[action].expo, 0, 1),
+        };
+    }
+    return result;
+}
+
+function _pidSnapshotFromSettings(settings) {
+    const source = settings && typeof settings === 'object' && !Array.isArray(settings) ? settings : {};
+    const result = {};
+    for (const id of PER_MODE_SETTINGS_IDS) {
+        const value = source[id];
+        const number = value === null || value === '' || typeof value === 'boolean' ? NaN : Number(value);
+        const [min, max] = PID_LIMITS[id];
+        result[id] = Number.isFinite(number)
+            ? String(Math.max(min, Math.min(max, number)))
+            : DEFAULT_PID_SETTINGS[id];
+    }
+    return result;
+}
+
+function _sanitizePidSnapshot(saved, fallback = DEFAULT_PID_SETTINGS) {
+    const source = saved && typeof saved === 'object' && !Array.isArray(saved) ? saved : {};
+    const result = {};
+    for (const id of PER_MODE_SETTINGS_IDS) {
+        const value = source[id];
+        const number = value === null || value === '' || typeof value === 'boolean' ? NaN : Number(value);
+        const [min, max] = PID_LIMITS[id];
+        result[id] = Number.isFinite(number)
+            ? String(Math.max(min, Math.min(max, number)))
+            : String(fallback[id] ?? DEFAULT_PID_SETTINGS[id]);
+    }
+    return result;
+}
+
+function _matchesPidDefaults(saved, defaults) {
+    if (!saved || typeof saved !== 'object' || Array.isArray(saved)) return false;
+    return PER_MODE_SETTINGS_IDS.every(id => {
+        const actual = Number(saved[id]);
+        const expected = Number(defaults[id]);
+        return Number.isFinite(actual) && Math.abs(actual - expected) < 1e-9;
+    });
+}
+
+function _sanitizeModeProfiles(savedRateExpo, savedPid, mapping, settings, legacy) {
+    const rateSource = savedRateExpo && typeof savedRateExpo === 'object' && !Array.isArray(savedRateExpo)
+        ? savedRateExpo
+        : {};
+    const pidSource = savedPid && typeof savedPid === 'object' && !Array.isArray(savedPid)
+        ? savedPid
+        : {};
+    const defaultRateExpo = _rateExpoFromMapping(DEFAULT_MAPPING);
+    const legacyRateExpo = _rateExpoFromMapping(mapping);
+    const legacyPid = _pidSnapshotFromSettings(settings);
+    const modeRateExpo = {};
+    const modePidSettings = {};
+
+    for (const mode of FLIGHT_MODES) {
+        // v1-v5 had only Easy/FPV profiles. Preserve their global legacy
+        // values, while initializing Level/SO3 from neutral defaults rather
+        // than inheriting whichever FPV tuning happened to be active.
+        const legacyManualMode = legacy && (mode === 'drone' || mode === 'fpv');
+        const rateFallback = legacyManualMode ? legacyRateExpo : defaultRateExpo;
+        const pidFallback = legacyManualMode ? legacyPid : DEFAULT_PID_SETTINGS;
+        modeRateExpo[mode] = _sanitizeRateExpoSnapshot(rateSource[mode], rateFallback);
+        modePidSettings[mode] = _sanitizePidSnapshot(pidSource[mode], pidFallback);
+    }
+    return { modeRateExpo, modePidSettings };
+}
 
 /**
  * Strict-but-fuzzy comparison for gate-path control-point arrays.
@@ -120,12 +320,11 @@ export class Controller {
         this.gamepadName = '';
         this.connected = false;
 
-        // Per-mode rate/expo snapshots (mapping.rate and mapping.expo per axis)
-        // Initialized as null; _loadConfig will fill from saved data or
-        // the post-init block will snapshot from restored this.mapping.
-        this._modeRateExpo = { drone: null, fpv: null };
-        // Per-mode PID settings (slider values keyed by element id)
-        this._modePidSettings = { drone: null, fpv: null };
+        // Complete, independent per-mode snapshots.  Level and SO3 must not
+        // inherit FPV rates/expo merely because an older config omitted them.
+        const defaultProfiles = _sanitizeModeProfiles(null, null, DEFAULT_MAPPING, null, false);
+        this._modeRateExpo = defaultProfiles.modeRateExpo;
+        this._modePidSettings = defaultProfiles.modePidSettings;
         this._currentMode = 'drone';
 
         // WebHID support for RC transmitters
@@ -141,6 +340,10 @@ export class Controller {
 
         // Current input state (merged keyboard + gamepad, range [-1, 1])
         this.axes = { roll: 0, pitch: 0, throttle: 0, yaw: 0, cameraTilt: 0 };
+        // Same merged input after calibration/inversion, before deadzone and
+        // expo.  Assisted controllers use this to apply a continuous deadzone
+        // remap; legacy `axes` remains byte-for-byte compatible for FPV.
+        this.rawAxes = { roll: 0, pitch: 0, throttle: 0, yaw: 0, cameraTilt: 0 };
         this._cameraTiltKeyboard = 0;
         this._cameraTiltAxis = 0;
         this._prevCameraTiltAxis = 0;
@@ -206,15 +409,16 @@ export class Controller {
         this._setupGamepad();
         this._buildSettingsUI();
 
-        // Ensure both modes have valid rate/expo + PID snapshots.
+        // Ensure all public modes have valid, non-aliased snapshots.
         // After _loadConfig, this.mapping has the restored rate/expo values
         // and DOM sliders have the restored PID values.
-        // For legacy configs (no per-mode data), initialize both modes
-        // from these restored values so nothing is lost.
+        // `_migrateConfig` preserves legacy Easy/FPV values and supplies
+        // neutral defaults for Level/SO3.
         const curSnap = this._snapshotRateExpo();
-        for (const mode of ['drone', 'fpv']) {
-            if (!this._modeRateExpo[mode]) this._modeRateExpo[mode] = JSON.parse(JSON.stringify(curSnap));
-            if (!this._modePidSettings[mode]) this._modePidSettings[mode] = this._snapshotPidSettings();
+        const pidSnap = this._snapshotPidSettings();
+        for (const mode of FLIGHT_MODES) {
+            this._modeRateExpo[mode] = _sanitizeRateExpoSnapshot(this._modeRateExpo[mode], curSnap);
+            this._modePidSettings[mode] = _sanitizePidSnapshot(this._modePidSettings[mode], pidSnap);
         }
     }
 
@@ -225,6 +429,7 @@ export class Controller {
         // Reset axes and buttons to 0/false each frame
         for (const action of ACTIONS) {
             this.axes[action] = 0;
+            this.rawAxes[action] = 0;
         }
         this.buttons.arm = false;
         this._gpButtons.arm = false;
@@ -237,6 +442,7 @@ export class Controller {
         for (const [code, map] of Object.entries(KEYBOARD_MAP)) {
             if (this._keysDown.has(code)) {
                 this.axes[map.action] += map.value;
+                this.rawAxes[map.action] += map.value;
                 if (map.action === 'cameraTilt') {
                     this._cameraTiltKeyboard += map.value;
                 }
@@ -260,6 +466,7 @@ export class Controller {
                 if (m.axisIndex >= 0 && m.axisIndex < hidAxes.length) {
                     let val = hidAxes[m.axisIndex];
                     if (m.inverted) val = -val;
+                    this.rawAxes[action] += val;
                     if (Math.abs(val) < m.deadzone) val = 0;
                     // Apply expo curve
                     const e = m.expo || 0;
@@ -327,6 +534,7 @@ export class Controller {
                 if (m.axisIndex >= 0 && m.axisIndex < gp.axes.length) {
                     let val = gp.axes[m.axisIndex];
                     if (m.inverted) val = -val;
+                    this.rawAxes[action] += val;
                     if (Math.abs(val) < m.deadzone) val = 0;
                     // Apply expo curve: output = val * (1 - expo + expo * val²)
                     const e = m.expo || 0;
@@ -434,6 +642,7 @@ export class Controller {
         // Clamp axes
         for (const action of ACTIONS) {
             this.axes[action] = Math.max(-1, Math.min(1, this.axes[action]));
+            this.rawAxes[action] = Math.max(-1, Math.min(1, this.rawAxes[action]));
         }
 
         // Edge detection: gamepad and keyboard evaluated independently.
@@ -516,6 +725,19 @@ export class Controller {
             cameraTiltKeyboard: this._cameraTiltKeyboard,
             cameraTiltAxis: this._cameraTiltAxis,
             cameraTiltAxisChanged: Math.abs(this._cameraTiltAxis - this._prevCameraTiltAxis) > 0.01,
+            rawAxes: {
+                roll: this.rawAxes.roll,
+                pitch: this.rawAxes.pitch,
+                throttle: this.rawAxes.throttle,
+                yaw: this.rawAxes.yaw,
+                cameraTilt: this.rawAxes.cameraTilt,
+            },
+            axisConfig: {
+                roll: { deadzone: this.mapping.roll.deadzone, expo: this.mapping.roll.expo },
+                pitch: { deadzone: this.mapping.pitch.deadzone, expo: this.mapping.pitch.expo },
+                throttle: { deadzone: this.mapping.throttle.deadzone, expo: this.mapping.throttle.expo },
+                yaw: { deadzone: this.mapping.yaw.deadzone, expo: this.mapping.yaw.expo },
+            },
             boost: this.boost,
             armed: this.armed,
             resetTriggered: kbResetRising,
@@ -812,32 +1034,45 @@ export class Controller {
             settings[id] = el.type === 'checkbox' ? el.checked : el.value;
         }
 
-        // Snapshot current mode before saving so both modes are up-to-date
+        // Snapshot and normalize the active profile before serializing.
+        this._currentMode = _validMode(this._currentMode) ? this._currentMode : 'drone';
         this._modeRateExpo[this._currentMode] = this._snapshotRateExpo();
         this._modePidSettings[this._currentMode] = this._snapshotPidSettings();
+        const profiles = _sanitizeModeProfiles(
+            this._modeRateExpo,
+            this._modePidSettings,
+            this.mapping,
+            settings,
+            false,
+        );
+        this._modeRateExpo = profiles.modeRateExpo;
+        this._modePidSettings = profiles.modePidSettings;
+        settings['flight-mode-select'] = this._currentMode;
 
         return {
             configVersion: CONFIG_VERSION,
-            mapping: JSON.parse(JSON.stringify(this.mapping)),
-            buttonMapping: JSON.parse(JSON.stringify(this.buttonMapping)),
-            hidCalibration: JSON.parse(JSON.stringify(this._hidCalibration)),
+            mapping: _sanitizeMapping(this.mapping),
+            buttonMapping: _sanitizeButtonMapping(this.buttonMapping),
+            hidCalibration: _sanitizeHidCalibration(this._hidCalibration),
             settings,
-            modeRateExpo: JSON.parse(JSON.stringify(this._modeRateExpo)),
-            modePidSettings: JSON.parse(JSON.stringify(this._modePidSettings)),
+            modeRateExpo: _clone(this._modeRateExpo),
+            modePidSettings: _clone(this._modePidSettings),
             currentMode: this._currentMode,
-            gatePathSettings: JSON.parse(JSON.stringify(this.gatePathSettings)),
+            gatePathSettings: _clone(this.gatePathSettings),
         };
     }
 
     loadConfig(config) {
         config = this._migrateConfig(config);
-        if (config.mapping) this.mapping = config.mapping;
-        if (config.buttonMapping) this.buttonMapping = config.buttonMapping;
-        if (config.hidCalibration) this._hidCalibration = config.hidCalibration;
-        if (config.modeRateExpo) this._modeRateExpo = config.modeRateExpo;
-        if (config.modePidSettings) this._modePidSettings = config.modePidSettings;
-        if (config.currentMode) this._currentMode = config.currentMode;
+        this.mapping = _sanitizeMapping(config.mapping);
+        this.buttonMapping = _sanitizeButtonMapping(config.buttonMapping);
+        this._hidCalibration = _sanitizeHidCalibration(config.hidCalibration);
+        this._modeRateExpo = _clone(config.modeRateExpo);
+        this._modePidSettings = _clone(config.modePidSettings);
+        this._currentMode = _validMode(config.currentMode) ? config.currentMode : 'drone';
         if (config.settings) this._restoreSettings(config.settings);
+        this._restoreRateExpo(this._modeRateExpo[this._currentMode]);
+        this._restorePidSettings(this._modePidSettings[this._currentMode]);
         // Accept both the new `gatePathSettings` key and the legacy
         // `raceCourseSettings` key (we only need gateSize + clearance from
         // the legacy schema; everything else — seed / region / straight —
@@ -898,20 +1133,36 @@ export class Controller {
     }
 
     _restoreSettings(settings) {
+        if (!settings || typeof settings !== 'object' || Array.isArray(settings)) return;
         for (const [id, val] of Object.entries(settings)) {
+            if (!SETTINGS_ID_SET.has(id)) continue;
             const el = document.getElementById(id);
             if (!el) continue;
             if (el.type === 'checkbox') {
-                el.checked = !!val;
+                el.checked = val === true || val === 1 || val === 'true';
+                el.dispatchEvent(new Event('change'));
+            } else if (el.tagName === 'SELECT' || el.type === 'select-one') {
+                const candidate = id === 'flight-mode-select' && !_validMode(val) ? 'drone' : String(val);
+                const options = Array.from(el.options || []);
+                if (options.length > 0 && !options.some(option => option.value === candidate)) continue;
+                el.value = candidate;
                 el.dispatchEvent(new Event('change'));
             } else {
-                el.value = val;
+                const number = Number(val);
+                if (!Number.isFinite(number)) continue;
+                const min = Number(el.min);
+                const max = Number(el.max);
+                const clamped = Math.max(
+                    Number.isFinite(min) ? min : -Infinity,
+                    Math.min(Number.isFinite(max) ? max : Infinity, number),
+                );
+                el.value = String(clamped);
                 // Sync paired number input if present
                 const numEl = document.getElementById(id + '-num');
-                if (numEl) numEl.value = val;
+                if (numEl) numEl.value = String(clamped);
                 // Sync paired span display if present
                 const spanEl = document.getElementById(id + '-val');
-                if (spanEl) spanEl.textContent = parseFloat(val).toFixed(el.step && el.step.includes('.') ? 2 : 0);
+                if (spanEl) spanEl.textContent = clamped.toFixed(el.step && el.step.includes('.') ? 2 : 0);
                 el.dispatchEvent(new Event('input'));
             }
         }
@@ -920,43 +1171,28 @@ export class Controller {
     // ---- Per-mode helpers ----
 
     _snapshotRateExpo() {
-        const snap = {};
-        for (const action of ACTIONS) {
-            const m = this.mapping[action];
-            snap[action] = { rate: m.rate !== undefined ? m.rate : 1.0, expo: m.expo !== undefined ? m.expo : 0.0 };
-        }
-        return snap;
+        return _rateExpoFromMapping(this.mapping);
     }
 
     _restoreRateExpo(snap) {
-        if (!snap) return;
+        const safe = _sanitizeRateExpoSnapshot(snap, this._snapshotRateExpo());
         for (const action of ACTIONS) {
-            if (snap[action]) {
-                this.mapping[action].rate = snap[action].rate;
-                this.mapping[action].expo = snap[action].expo;
-            }
+            this.mapping[action].rate = safe[action].rate;
+            this.mapping[action].expo = safe[action].expo;
         }
     }
 
     _snapshotPidSettings() {
-        const snap = {};
+        const snap = { ...DEFAULT_PID_SETTINGS };
         for (const id of PER_MODE_SETTINGS_IDS) {
             const el = document.getElementById(id);
-            if (el) snap[id] = el.value;
+            if (el && Number.isFinite(Number(el.value))) snap[id] = String(Number(el.value));
         }
         return snap;
     }
 
     _restorePidSettings(snap) {
-        if (!snap) return;
-        for (const [id, val] of Object.entries(snap)) {
-            const el = document.getElementById(id);
-            if (!el) continue;
-            el.value = val;
-            const numEl = document.getElementById(id + '-num');
-            if (numEl) numEl.value = val;
-            el.dispatchEvent(new Event('input'));
-        }
+        this._restoreSettings(_sanitizePidSnapshot(snap));
     }
 
     /**
@@ -964,7 +1200,9 @@ export class Controller {
      * Saves current mode's rate/expo + PID, restores the new mode's values.
      */
     _onModeSwitch(newMode) {
-        const oldMode = this._currentMode;
+        newMode = _validMode(newMode) ? newMode : 'drone';
+        const oldMode = _validMode(this._currentMode) ? this._currentMode : 'drone';
+        this._currentMode = oldMode;
         if (newMode === oldMode) return;
 
         // Save current mode's values
@@ -974,6 +1212,8 @@ export class Controller {
         // Update current mode BEFORE restoring, so any _saveConfig calls
         // triggered by input events during restore snapshot to the correct mode
         this._currentMode = newMode;
+        const modeSelect = document.getElementById('flight-mode-select');
+        if (modeSelect && modeSelect.value !== newMode) modeSelect.value = newMode;
 
         // Restore new mode's values
         this._restoreRateExpo(this._modeRateExpo[newMode]);
@@ -2040,12 +2280,6 @@ export class Controller {
         this._bindSliderNum('ctrl-vel-kd', 'ctrl-vel-kd-num');
         this._bindSliderNum('ctrl-alt-kd', 'ctrl-alt-kd-num');
 
-        // SO3 geometric controller gains
-        this._bindSliderNum('so3-kx', 'so3-kx-num');
-        this._bindSliderNum('so3-kv', 'so3-kv-num');
-        this._bindSliderNum('so3-kr', 'so3-kr-num');
-        this._bindSliderNum('so3-komega', 'so3-komega-num');
-
         // Display toggle checkboxes
         for (const cbId of ['clean-mode-toggle', 'osd-toggle', 'pano-level-toggle', 'yaw-lock-toggle']) {
             const cb = document.getElementById(cbId);
@@ -2100,10 +2334,15 @@ export class Controller {
     }
 
     _migrateConfig(config) {
-        if (!config || typeof config !== 'object') return {};
-        const version = Number(config.configVersion || 1);
-        if (version < 2 && config.settings && typeof config.settings === 'object') {
-            const settings = config.settings;
+        const source = config && typeof config === 'object' && !Array.isArray(config) ? config : {};
+        const migrated = { ...source };
+        migrated.settings = source.settings && typeof source.settings === 'object' && !Array.isArray(source.settings)
+            ? { ...source.settings }
+            : {};
+        const parsedVersion = Number(source.configVersion);
+        const version = Number.isFinite(parsedVersion) ? parsedVersion : 1;
+        if (version < 2) {
+            const settings = migrated.settings;
             if (Number(settings['drone-max-speed']) === LEGACY_EASY_MAX_SPEED) {
                 settings['drone-max-speed'] = DEFAULT_EASY_MAX_SPEED;
             }
@@ -2111,8 +2350,8 @@ export class Controller {
                 settings['drone-max-vspeed'] = DEFAULT_EASY_MAX_VSPEED;
             }
         }
-        if (version < 3 && config.settings && typeof config.settings === 'object') {
-            const settings = config.settings;
+        if (version < 3) {
+            const settings = migrated.settings;
             const savedMaxSpeed = Number(settings['drone-max-speed']);
             if (!Number.isFinite(savedMaxSpeed) || savedMaxSpeed <= PREVIOUS_EASY_MAX_SPEED) {
                 settings['drone-max-speed'] = DEFAULT_EASY_MAX_SPEED;
@@ -2123,8 +2362,8 @@ export class Controller {
             }
         }
         // v4: mass 500→980g, thrust 1000→2600gf (YOPO Hummingbird params)
-        if (version < 4 && config.settings && typeof config.settings === 'object') {
-            const settings = config.settings;
+        if (version < 4) {
+            const settings = migrated.settings;
             const savedMass = Number(settings['phys-mass']);
             if (!Number.isFinite(savedMass) || savedMass <= 510) {
                 settings['phys-mass'] = '980';
@@ -2136,15 +2375,59 @@ export class Controller {
         }
         // v5: restore the YOPO training vehicle radius. Only migrate the old
         // shipped default (0.15 m); preserve an explicit user-tuned value.
-        if (version < 5 && config.settings && typeof config.settings === 'object') {
-            const settings = config.settings;
+        if (version < 5) {
+            const settings = migrated.settings;
             const savedRadius = Number(settings['phys-collision-radius']);
             if (!Number.isFinite(savedRadius) || Math.abs(savedRadius - 0.15) < 1e-9) {
                 settings['phys-collision-radius'] = '0.6';
             }
         }
-        config.configVersion = CONFIG_VERSION;
-        return config;
+        // v6 replaces all four scalar SO3 sliders with fixed axis-specific
+        // YOPO authority values.  They are deliberately discarded rather
+        // than mapped because the old and new quantities differ semantically.
+        for (const obsoleteId of [
+            'so3-kx', 'so3-kv', 'so3-kr', 'so3-komega',
+            'so3-kx-num', 'so3-kv-num', 'so3-kr-num', 'so3-komega-num',
+        ]) {
+            delete migrated.settings[obsoleteId];
+        }
+
+        let migratedModePid = source.modePidSettings;
+        if (version < CONFIG_VERSION) {
+            if (_matchesPidDefaults(migrated.settings, LEGACY_PID_DEFAULTS)) {
+                Object.assign(migrated.settings, DEFAULT_PID_SETTINGS);
+            }
+            const sourceProfiles = source.modePidSettings && typeof source.modePidSettings === 'object' &&
+                !Array.isArray(source.modePidSettings) ? source.modePidSettings : {};
+            migratedModePid = {};
+            for (const mode of FLIGHT_MODES) {
+                migratedModePid[mode] = _matchesPidDefaults(sourceProfiles[mode], LEGACY_PID_DEFAULTS)
+                    ? { ...DEFAULT_PID_SETTINGS }
+                    : sourceProfiles[mode];
+            }
+        }
+
+        migrated.mapping = _sanitizeMapping(source.mapping);
+        migrated.buttonMapping = _sanitizeButtonMapping(source.buttonMapping);
+        migrated.hidCalibration = _sanitizeHidCalibration(source.hidCalibration);
+
+        const modeFromSettings = migrated.settings['flight-mode-select'];
+        migrated.currentMode = _validMode(source.currentMode)
+            ? source.currentMode
+            : (_validMode(modeFromSettings) ? modeFromSettings : 'drone');
+        migrated.settings['flight-mode-select'] = migrated.currentMode;
+
+        const profiles = _sanitizeModeProfiles(
+            source.modeRateExpo,
+            migratedModePid,
+            migrated.mapping,
+            migrated.settings,
+            version < CONFIG_VERSION,
+        );
+        migrated.modeRateExpo = profiles.modeRateExpo;
+        migrated.modePidSettings = profiles.modePidSettings;
+        migrated.configVersion = CONFIG_VERSION;
+        return migrated;
     }
 
     _loadConfig() {
@@ -2152,35 +2435,17 @@ export class Controller {
             const saved = localStorage.getItem('drone_sim_controller_config');
             if (saved) {
                 const config = this._migrateConfig(JSON.parse(saved));
-                if (config.mapping) {
-                    for (const action of ACTIONS) {
-                        if (config.mapping[action]) {
-                            this.mapping[action] = { ...this.mapping[action], ...config.mapping[action] };
-                        }
-                    }
-                }
-                if (config.buttonMapping) {
-                    for (const bAction of BUTTON_ACTIONS) {
-                        if (config.buttonMapping[bAction]) {
-                            this.buttonMapping[bAction] = { ...this.buttonMapping[bAction], ...config.buttonMapping[bAction] };
-                        }
-                    }
-                }
-                if (config.hidCalibration) {
-                    this._hidCalibration = config.hidCalibration;
-                }
-                if (config.modeRateExpo) {
-                    this._modeRateExpo = config.modeRateExpo;
-                }
-                if (config.modePidSettings) {
-                    this._modePidSettings = config.modePidSettings;
-                }
-                if (config.currentMode) {
-                    this._currentMode = config.currentMode;
-                }
+                this.mapping = _sanitizeMapping(config.mapping);
+                this.buttonMapping = _sanitizeButtonMapping(config.buttonMapping);
+                this._hidCalibration = _sanitizeHidCalibration(config.hidCalibration);
+                this._modeRateExpo = _clone(config.modeRateExpo);
+                this._modePidSettings = _clone(config.modePidSettings);
+                this._currentMode = _validMode(config.currentMode) ? config.currentMode : 'drone';
                 if (config.settings) {
                     this._restoreSettings(config.settings);
                 }
+                this._restoreRateExpo(this._modeRateExpo[this._currentMode]);
+                this._restorePidSettings(this._modePidSettings[this._currentMode]);
                 if (config.gatePathSettings) {
                     this._mergeGatePathSettings(config.gatePathSettings);
                 } else if (config.raceCourseSettings) {

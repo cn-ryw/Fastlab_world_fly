@@ -44,6 +44,8 @@ logger.recordPerception({
     renderMs: 10, projectMs: 2, jpegMs: 3, networkMs: 30,
     serverMs: 25, da360Ms: 18, yopoMs: 4, applyMs: 1, captureToApplyMs: 60,
     frameAgeMs: 60, calibrationId: 'cal-1',
+    rgbTilesReady: false, rgbReadyFaces: 4, rgbTotalFaces: 6,
+    rgbTileError: true, rgbReadinessReason: 'tile-error',
 });
 logger.recordPerception({
     frameId: 1, goalId: 'goal-1', generation: 1,
@@ -82,6 +84,14 @@ assert.equal(log.perf.uniquePlanningFrames, 1, 'duplicate applies for one frame 
 assert.equal(log.perf.droppedByReason['old-frame'], 1);
 assert.equal(log.perf.droppedByReason['da360-relative-is-preview-only'], 1);
 assert.equal(log.perf.captureToApplyP95Ms, 60);
+assert.equal(log.perf.rgbTilesReadyPlanningFrames, 0);
+assert.equal(log.perf.rgbTilesPartialPlanningFrames, 1);
+assert.equal(log.perf.rgbTilesUnknownPlanningFrames, 0);
+assert.equal(log.perf.rgbTileErrorPlanningFrames, 1);
+assert.equal(log.perf.rgbTilesReadyPlanningPercent, 0);
+assert.equal(log.perception[0].rgbTilesReady, false);
+assert.equal(log.perception[0].rgbReadyFaces, 4);
+assert.equal(log.perception[0].rgbReadinessReason, 'tile-error');
 assert.deepEqual(log.perf.calibrationIds, ['cal-1']);
 assert.ok(log.perf.physicsUpdateIntervalP95Ms >= 0);
 assert.equal(log.perception.length, 4);

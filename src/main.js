@@ -25,13 +25,19 @@
 
 import { CesiumWorld } from './cesium-world.js?v=20260703-panorama-tile-idle';
 import { TilesCollisionProvider } from './tiles-collision.js';
-import { Controller } from './controller.js';
-import { Drone } from './drone.js?v=20260807';
-import { HUD } from './hud.js';
-import { OSD } from './osd.js';
-import { PanoramaSensor } from './panorama-sensor.js?v=20260807';
+import { Controller } from './controller.js?v=20260811-control-v6';
+import { Drone } from './drone.js?v=20260811-control-v6';
+import { HUD } from './hud.js?v=20260811-control-v6';
+import { OSD } from './osd.js?v=20260811-control-v6';
+import { PanoramaSensor } from './panorama-sensor.js?v=20260811-control-v6';
 import { FlightLogger } from './flight-logger.js?v=20260807';
 import { reportUserError } from './error-report.js';
+import { FixedStepScheduler } from './fixed-step-scheduler.js?v=20260811';
+import {
+    drawDepthTopdown,
+    depthTopdownLabels,
+    topdownClickToGoalOffset,
+} from './depth-topdown.js?v=20260811';
 
 let world = null;
 let collisionProvider = null;
@@ -80,10 +86,19 @@ const FLIGHT_PRELOAD_VIEW_ATTEMPTS = Math.round(urlNumber('flightPreloadViewAtte
 const FLIGHT_PRELOAD_STRICT = urlNumber('flightPreloadStrict', 0, 0, 1) >= 0.5;
 const PANORAMA_PRELOAD_REQUIRED = urlNumber('panoPreloadRequired', 0, 0, 1) >= 0.5;
 const VIEW_CHOICE_HINT_HTML = '1 / O: First Person &nbsp;|&nbsp; 2: Third Person<br>Easy speed: ↑/↓ forward/back, Shift boost, Tab &gt; Easy Max Speed';
-const MAX_PHYSICS_FRAME_DT = 0.25;
-const PHYSICS_SUBSTEP_DT = 0.05;
-const MAX_PHYSICS_SUBSTEPS = 3;
+const MAX_PLACEMENT_FRAME_DT = 0.05;
 const SETTINGS_READ_INTERVAL_MS = 100;
+const DEPTH_TOPDOWN_MAX_AGE_MS = 250;
+
+const flightControlScheduler = new FixedStepScheduler();
+
+function resetFlightControlClock() {
+    flightControlScheduler.reset();
+    // Exclude time spent in placement/loading/view selection from the next
+    // flight render delta as well as clearing the fractional accumulator.
+    const now = performance.now();
+    if (Number.isFinite(now)) lastFrameTime = now;
+}
 
 let lastSettingsReadTime = 0;
 let lastKeyGuideState = '';
@@ -91,6 +106,7 @@ let lastDisplaySettingsState = '';
 let lastHFovReadTime = 0;
 let cachedHFov = 120;
 let flightStartWarnings = [];
+let lastPanoramaReadinessState = '';
 
 function urlNumber(name, fallback, min = -Infinity, max = Infinity) {
     const value = new URLSearchParams(window.location.search).get(name);
@@ -159,6 +175,50 @@ function rememberFlightStartWarning(message) {
     const text = String(message || '').trim();
     if (!text || flightStartWarnings.includes(text)) return;
     flightStartWarnings.push(text);
+}
+
+function updatePanoramaReadinessIndicator() {
+    const el = document.getElementById('panorama-rgb-readiness');
+    if (!el) return;
+
+    const state = panoramaSensor?.getDepthState?.() || null;
+    const totalFaces = Number.isFinite(Number(state?.rgbTotalFaces))
+        ? Math.max(1, Math.round(Number(state.rgbTotalFaces)))
+        : 6;
+    const readyFaces = Number.isFinite(Number(state?.rgbReadyFaces))
+        ? Math.max(0, Math.min(totalFaces, Math.round(Number(state.rgbReadyFaces))))
+        : 0;
+    const reason = String(state?.rgbReadinessReason || 'capture-incomplete');
+    const tileError = state?.rgbTileError === true || reason === 'tile-error';
+    const frameSeen = Number(state?.rgbFrameId) > 0 || state?.rgbFrameComplete === true;
+
+    let displayState;
+    let label;
+    let title;
+    if (tileError) {
+        displayState = 'error';
+        label = `TILE ERROR ${readyFaces}/${totalFaces} \u00b7 AUTO UNVERIFIED`;
+        title = 'Panorama tile requests failed. Automatic testing remains enabled, but obstacle perception is not verified.';
+    } else if (state?.rgbTilesReady === true && readyFaces === totalFaces) {
+        displayState = 'ready';
+        label = `RGB READY ${readyFaces}/${totalFaces}`;
+        title = 'All panorama faces reported their scene tiles ready when captured.';
+    } else if (frameSeen) {
+        displayState = 'partial';
+        label = `RGB PARTIAL ${readyFaces}/${totalFaces} \u00b7 AUTO UNVERIFIED`;
+        title = 'A panorama frame is visible, but not every face confirmed tile readiness. Automatic testing remains enabled.';
+    } else {
+        displayState = 'loading';
+        label = `RGB LOADING ${readyFaces}/${totalFaces}`;
+        title = 'Waiting for the first panorama capture.';
+    }
+
+    const renderKey = `${displayState}|${label}|${title}`;
+    if (renderKey === lastPanoramaReadinessState) return;
+    lastPanoramaReadinessState = renderKey;
+    el.textContent = label;
+    el.dataset.state = displayState;
+    el.title = title;
 }
 
 function updateViewChoiceHint() {
@@ -242,6 +302,7 @@ export async function startTilesMode() {
     if (startTilesModeInProgress) return;
     startTilesModeInProgress = true;
     try {
+        resetFlightControlClock();
         initSubsystems();
         document.getElementById('drop-zone')?.classList.add('hidden');
         document.getElementById('loading-overlay')?.classList.add('visible');
@@ -316,12 +377,16 @@ async function preloadPanoramaBeforeFlight() {
         : (drone.getBodyTransform ? drone.getBodyTransform() : drone.getCameraTransform());
     if (!transform) return false;
 
+    const preloadController = new AbortController();
     const options = {
         ...panoramaSensor.getCaptureOptions({ preload: true }),
-        progressCb: (message) => setProgress(`Preloading 360 panorama sensor (${message})...`),
+        signal: preloadController.signal,
+        progressCb: (message) => setProgress(
+            `Preloading 360 panorama sensor · settling tiles (${message})...`,
+        ),
     };
     const started = performance.now();
-    setProgress('Preloading 360 panorama sensor before flight...');
+    setProgress('Preloading 360 panorama sensor before flight · waiting for face 1/6...');
 
     try {
         const result = await withTimeout(
@@ -333,18 +398,32 @@ async function preloadPanoramaBeforeFlight() {
             options.timeoutMs,
             '360 panorama preload'
         );
-        const ready = panoramaSensor.primeFromCaptureResult(result, performance.now() - started, {
+        const framePrimed = panoramaSensor.primeFromCaptureResult(result, performance.now() - started, {
             capturedAt: started,
             transform,
             planningState: drone.getYopoPlanningState ? drone.getYopoPlanningState() : null,
             captureProfile: options.profile,
         });
-        if (!ready && (PANORAMA_PRELOAD_REQUIRED || FLIGHT_PRELOAD_STRICT)) {
-            throw new Error('360 panorama preload did not produce a complete frame.');
+        updatePanoramaReadinessIndicator();
+        const strictPreload = PANORAMA_PRELOAD_REQUIRED || FLIGHT_PRELOAD_STRICT;
+        const sceneTilesReady = result?.ready === true && result?.allFacesTileReady === true;
+        if (!framePrimed || !sceneTilesReady) {
+            const readyFaces = Math.max(0, Number(result?.readyFaces) || 0);
+            const totalFaces = Math.max(1, Number(result?.faces) || 6);
+            const reason = String(result?.readinessReason || 'capture-incomplete');
+            const message = `panorama preload incomplete: tiles ${readyFaces}/${totalFaces} (${reason})`;
+            if (strictPreload) throw new Error(message);
+            rememberFlightStartWarning(message);
         }
-        return ready;
+        return framePrimed;
     } catch (error) {
+        if (!preloadController.signal.aborted) {
+            preloadController.abort('panorama-preload-finished-with-error');
+        }
         if (PANORAMA_PRELOAD_REQUIRED || FLIGHT_PRELOAD_STRICT) throw error;
+        rememberFlightStartWarning(
+            `panorama preload skipped: ${shortStatusMessage(error?.message || error)}`,
+        );
         reportUserError('Panorama preload failed; live capture will retry in flight', error, {
             key: 'panorama-preload',
             intervalMs: 10000,
@@ -485,37 +564,63 @@ function setupFlightGoalClickHandler() {
     };
 
     // Track G key state
-    window.addEventListener('keydown', (e) => {
+    const onGoalKeyDown = (e) => {
         if (e.code === 'KeyG' && mode === 'flight' && drone && (drone.flightMode === 'so3')) {
             _goalGdown = true;
             console.log('[G key] DOWN');
         }
-    }, true);
-    window.addEventListener('keyup', (e) => {
+    };
+    const onGoalKeyUp = (e) => {
         if (e.code === 'KeyG') { _goalGdown = false; console.log('[G key] UP'); }
-    }, true);
-    window.addEventListener('blur', () => { _goalGdown = false; });
+    };
+    const onGoalWindowBlur = () => { _goalGdown = false; };
+    window.addEventListener('keydown', onGoalKeyDown, true);
+    window.addEventListener('keyup', onGoalKeyUp, true);
+    window.addEventListener('blur', onGoalWindowBlur);
 
     canvas.addEventListener('pointerdown', onMouseDown, true);
 
     // Click on radar minimap also sets goal
     const radarCanvas = document.getElementById('radar-canvas');
-    if (radarCanvas) {
-        radarCanvas.addEventListener('mousedown', (e) => {
-            if (mode !== 'flight' || !drone || drone.flightMode !== 'so3') return;
-            e.stopPropagation();
-            const rw = radarCanvas.width, rh = radarCanvas.height;
-            const range = 200; // must match drawRadar
-            const scale = (rw/2 - 10) / range;
-            const rx = (e.offsetX - rw/2) / scale;
-            const rz = -(e.offsetY - rh/2) / scale; // invert Y
-            const goalX = drone.x + rx;
-            const goalZ = drone.z + rz;
-            const altY = goalAltitudeOverride != null ? goalAltitudeOverride : drone.y;
-            console.log('[radar goal] SET:', goalX.toFixed(1), altY.toFixed(1), goalZ.toFixed(1));
-            beginNavigationSession({ x: goalX, y: altY, z: goalZ });
-        });
-    }
+    const onRadarMouseDown = (e) => {
+        if (e.button !== 0) return;
+        if (mode !== 'flight' || !drone || drone.flightMode !== 'so3') return;
+        e.stopPropagation();
+        e.preventDefault();
+        const polarFrame = panoramaSensor?.getDepthPolarScan?.();
+        const scanAgeMs = polarFrame
+            ? Math.max(0, performance.now() - polarFrame.capturedAt)
+            : Infinity;
+        if (!polarFrame?.scan || scanAgeMs > DEPTH_TOPDOWN_MAX_AGE_MS) {
+            console.warn('[depth top-down] waypoint click ignored: no fresh depth scan');
+            return;
+        }
+        const rw = radarCanvas.width, rh = radarCanvas.height;
+        const clickGoal = topdownClickToGoalOffset(
+            polarFrame?.scan,
+            e.offsetX,
+            e.offsetY,
+            rw,
+            rh,
+        );
+        if (!clickGoal) return;
+        if (clickGoal.mapping === 'relative-test') {
+            console.warn(
+                `[depth top-down] RELATIVE TEST: circle mapped to nominal R=${clickGoal.radiusM}m; `
+                + 'depth values remain non-metric and cannot authorize YOPO planning',
+            );
+        }
+        const goalX = drone.x + clickGoal.east;
+        const goalZ = drone.z + clickGoal.north;
+        const altY = goalAltitudeOverride != null ? goalAltitudeOverride : drone.y;
+        console.log(
+            '[depth top-down goal] SET:',
+            goalX.toFixed(1), altY.toFixed(1), goalZ.toFixed(1),
+            clickGoal.mapping === 'relative-test' ? '(relative test mapping)' : '(metric)',
+        );
+        beginNavigationSession({ x: goalX, y: altY, z: goalZ });
+    };
+    if (radarCanvas) radarCanvas.addEventListener('mousedown', onRadarMouseDown);
 
     // mouse wheel adjusts goal altitude when G is held
     const onWheel = (e) => {
@@ -536,6 +641,10 @@ function setupFlightGoalClickHandler() {
     flightGoalHandler = { destroy: () => {
         canvas.removeEventListener('pointerdown', onMouseDown, true);
         canvas.removeEventListener('wheel', onWheel, { capture: true });
+        window.removeEventListener('keydown', onGoalKeyDown, true);
+        window.removeEventListener('keyup', onGoalKeyUp, true);
+        window.removeEventListener('blur', onGoalWindowBlur);
+        if (radarCanvas) radarCanvas.removeEventListener('mousedown', onRadarMouseDown);
     }};
 }
 
@@ -563,6 +672,7 @@ function beginNavigationSession(goal) {
 }
 
 async function enterPlacementMode(autoPick = false) {
+    resetFlightControlClock();
     if (mode === 'flight') {
         // Placement is a navigation terminal state, not a visual overlay.
         // Abort the request generation and clear the old trajectory/marker so
@@ -630,6 +740,7 @@ async function confirmSpawnAndFly() {
         if (coordsEl) coordsEl.style.display = 'none';
 
         drone.setSpawnPoint(spawnPoint.x, spawnPoint.y, spawnPoint.z);
+        resetFlightControlClock();
         drone.reset();
         controller.armed = true;
         panoramaSensor?.reset();
@@ -739,6 +850,7 @@ function startFlight(viewMode = 'first') {
     if (!world || !drone || !controller) return;
     cameraMode = normalizeViewMode(viewMode, 'first');
 
+    resetFlightControlClock();
     mode = 'flight';
     drone.readSettings();
     lastSettingsReadTime = performance.now();
@@ -763,7 +875,7 @@ function startFlight(viewMode = 'first') {
                 );
                 return false;
             }
-            if (!drone?.setYopoTrajectory(endstate, trajTime)) {
+            if (!drone?.setYopoTrajectory(endstate, trajTime, context)) {
                 console.warn(`[YOPO] invalid response rejected frameId=${context?.frameId ?? '-'}`);
                 return false;
             }
@@ -853,72 +965,48 @@ function drawRadar() {
     panel.classList.add('visible');
 
     const ctx = canvas.getContext('2d');
-    const w = canvas.width, h = canvas.height, cx = w/2, cy = h/2;
-    const range = 200; // meters
-    const scale = (w/2 - 10) / range;
-
-    ctx.clearRect(0, 0, w, h);
-    // Background
-    ctx.fillStyle = 'rgba(3,7,18,0.95)';
-    ctx.fillRect(0, 0, w, h);
-
-    // Range rings
-    for (let r = 50; r <= range; r += 50) {
-        ctx.beginPath();
-        ctx.arc(cx, cy, r * scale, 0, Math.PI * 2);
-        ctx.strokeStyle = 'rgba(125,211,252,0.15)';
-        ctx.stroke();
-    }
-
-    // North indicator
-    ctx.strokeStyle = '#f44';
-    ctx.lineWidth = 2;
-    ctx.beginPath();
-    ctx.moveTo(cx, cy); ctx.lineTo(cx, 8);
-    ctx.stroke();
-
-    // Drone (green dot, facing direction)
-    const dx = drone.x * scale, dz = -drone.z * scale; // x=east→right, z=north→up
-    const droneSx = cx + dx, droneSy = cy + dz;
-    ctx.fillStyle = '#0f0';
-    ctx.beginPath();
-    ctx.arc(droneSx, droneSy, 5, 0, Math.PI * 2);
-    ctx.fill();
-
-    // Goal (red dot)
+    const polarFrame = panoramaSensor?.getDepthPolarScan?.() || null;
+    const scanAgeMs = polarFrame
+        ? Math.max(0, performance.now() - polarFrame.capturedAt)
+        : Infinity;
+    const scan = scanAgeMs <= DEPTH_TOPDOWN_MAX_AGE_MS ? polarFrame?.scan || null : null;
     const goal = drone._idealGoal;
-    if (goal) {
-        const gx = goal.x * scale, gz = -goal.z * scale;
-        const goalSx = cx + gx, goalSy = cy + gz;
-        ctx.fillStyle = '#f44';
-        ctx.beginPath();
-        ctx.arc(goalSx, goalSy, 4, 0, Math.PI * 2);
-        ctx.fill();
-        // Line from drone to goal
-        ctx.strokeStyle = 'rgba(255,64,43,0.5)';
-        ctx.lineWidth = 1;
-        ctx.beginPath();
-        ctx.moveTo(droneSx, droneSy);
-        ctx.lineTo(goalSx, goalSy);
-        ctx.stroke();
-    }
+    drawDepthTopdown(ctx, canvas, scan, {
+        captureYawDeg: polarFrame?.captureYawDeg ?? drone.yaw,
+        currentYawDeg: drone.yaw,
+        originOffset: scan?.metric && polarFrame?.capturePosition
+            ? {
+                east: polarFrame.capturePosition.x - drone.x,
+                north: polarFrame.capturePosition.z - drone.z,
+            }
+            : null,
+        goalOffset: goal
+            ? { east: goal.x - drone.x, north: goal.z - drone.z }
+            : null,
+    });
 
-    // Range text
-    document.querySelector('.radar-range').textContent = `${range}m`;
-    // Drone position text
-    ctx.fillStyle = '#7dd3fc';
-    ctx.font = '8px monospace';
-    ctx.textAlign = 'center';
-    ctx.fillText(`${drone.x.toFixed(0)},${drone.z.toFixed(0)}`, droneSx, droneSy + 16);
+    const labels = depthTopdownLabels(scan);
+    const modeLabel = document.getElementById('depth-topdown-mode');
+    const rangeLabel = document.getElementById('depth-topdown-range');
+    if (modeLabel) {
+        modeLabel.textContent = polarFrame && !scan
+            ? `STALE DEPTH · ${Math.round(scanAgeMs)}ms`
+            : labels.mode;
+    }
+    if (rangeLabel) {
+        rangeLabel.textContent = scan
+            ? `${labels.range} · ${Math.round(scanAgeMs)}ms`
+            : labels.range;
+    }
 }
 
 function gameLoop(now) {
-    const frameDt = Math.min(MAX_PHYSICS_FRAME_DT, Math.max(0.001, (now - lastFrameTime) / 1000));
+    const frameDt = Math.max(0, (now - lastFrameTime) / 1000);
     lastFrameTime = now;
 
     try {
         if (mode === 'placement') {
-            moveSpawn(Math.min(PHYSICS_SUBSTEP_DT, frameDt));
+            moveSpawn(Math.min(MAX_PLACEMENT_FRAME_DT, frameDt));
             updateKeyGuide();
         } else if (mode === 'view-select') {
             updateKeyGuide();
@@ -949,26 +1037,24 @@ function updateFlight(dt) {
     }
     if (input.resetTriggered) {
         finishNavigationSession('reset', { cancelDrone: true, arrived: false });
+        resetFlightControlClock();
         drone.reset();
         controller.armed = true;
     }
 
+    const schedule = flightControlScheduler.advance(input.resetTriggered ? 0 : dt, (stepDt) => {
+        drone.update(stepDt, input, collisionProvider);
+    }, {
+        onOverrun: (overrun) => drone.handleControlOverrun?.(overrun),
+    });
+
     if (drone.flightMode === 'drone') {
         if (Math.abs(input.cameraTiltKeyboard) > 0.05) {
-            drone.adjustCameraTilt(input.cameraTiltKeyboard * 60 * dt);
+            drone.adjustCameraTilt(input.cameraTiltKeyboard * 60 * schedule.simulatedThisFrameSeconds);
         }
         if (input.cameraTiltAxisChanged) {
             drone.cameraTiltAngle = ((input.cameraTiltAxis + 1) / 2) * -90;
         }
-    }
-
-    let remainingDt = Math.max(0, Math.min(dt, PHYSICS_SUBSTEP_DT * MAX_PHYSICS_SUBSTEPS));
-    let substeps = 0;
-    while (remainingDt > 1e-6 && substeps < MAX_PHYSICS_SUBSTEPS) {
-        const stepDt = Math.min(PHYSICS_SUBSTEP_DT, remainingDt);
-        drone.update(stepDt, input, collisionProvider);
-        remainingDt -= stepDt;
-        substeps++;
     }
 
     // Camera mode only selects visualization; controller and physics stay shared.
@@ -1002,7 +1088,11 @@ function updateFlight(dt) {
             : { x: drone.x, y: drone.y, z: drone.z, vx: drone.vx, vy: drone.vy, vz: drone.vz },
         drone.getFixedYaw ? drone.getFixedYaw() : drone.yaw);
     }
+    if (drone.consumeReplanRequest?.()) {
+        panoramaSensor?.requestImmediatePlanningFrame?.('controller-replan');
+    }
     panoramaSensor?.update(world, panoramaTransform, now);
+    updatePanoramaReadinessIndicator();
 
     // Flight log recording
     if (flightLogger?.recording) {
@@ -1152,7 +1242,7 @@ function updateKeyGuide() {
     const isFPV = fm === 'fpv';
     const isStab = fm === 'stabilized';
     const isSO3 = fm === 'so3';
-    const title = isFPV ? 'FLIGHT CONTROLS - FPV' : isStab ? 'FLIGHT CONTROLS - STABILIZED' : isSO3 ? 'FLIGHT CONTROLS - SO3' : 'FLIGHT CONTROLS - EASY';
+    const title = isFPV ? 'FLIGHT CONTROLS - FPV' : isStab ? 'FLIGHT CONTROLS - LEVEL' : isSO3 ? 'FLIGHT CONTROLS - SO3 (YOPO AUTO)' : 'FLIGHT CONTROLS - EASY';
 
     const rows = isFPV ? [
         '<kbd>↑ ↓</kbd>  Pitch Forward / Back',
@@ -1166,11 +1256,8 @@ function updateKeyGuide() {
         '<kbd>W S</kbd>  Throttle Up / Down',
         '<kbd>A D</kbd>  Yaw Left / Right',
     ] : isSO3 ? [
-        '<kbd>↑ ↓</kbd>  Forward / Back',
-        '<kbd>← →</kbd>  Strafe Left / Right',
-        '<kbd>W S</kbd>  Climb / Descend',
-        '<kbd>A D</kbd>  Yaw Left / Right',
-        '<kbd>G+click</kbd> Set waypoint (YOPO auto-plan)',
+        '<span style="color:#8cff8c">Automatic trajectory control · flight sticks ignored</span>',
+        '<kbd>G+scene</kbd> / depth-circle click: Set waypoint',
         '<kbd>C</kbd>    Cancel waypoint',
     ] : [
         '<kbd>↑ ↓</kbd>  Forward / Back',
@@ -1181,7 +1268,7 @@ function updateKeyGuide() {
     ];
     rows.push(
         '<kbd>Space</kbd> Arm / Disarm',
-        '<kbd>Shift</kbd> Boost',
+        ...(isSO3 || isStab ? [] : ['<kbd>Shift</kbd> Boost']),
         '<kbd>R</kbd>    Reset',
         `<kbd>V</kbd>    View (${cameraMode === 'third' ? 'Third' : 'First'})`,
         '<kbd>M</kbd>    Flight Mode (FPV/Easy)',

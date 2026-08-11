@@ -24,6 +24,16 @@ const frame = new PerceptionFrame({
     },
     rgb: Object.freeze({ type: 'image/jpeg', size: 42 }),
     captureProfile: 'calibration',
+    rgbFrameComplete: true,
+    rgbTilesReady: false,
+    rgbReadyFaces: 2,
+    rgbTotalFaces: 6,
+    rgbReadinessReason: 'tiles-partial',
+    faceTileReadiness: [
+        { face: 'front', readyWhenCopied: true },
+        { face: 'right', readyWhenCopied: true },
+        { face: 'back', readyWhenCopied: false },
+    ],
     ...planning,
     projectionConfig: { width: 384, height: 192 },
 });
@@ -34,6 +44,11 @@ assert.deepEqual(observation.referencePosition, { x: 10, y: 20, z: 30 }, 'goal d
 assert.deepEqual(observation.velocity, { x: 4, y: 5, z: 6 }, 'observation keeps actual velocity');
 assert.deepEqual(observation.acceleration, { x: 0.1, y: 0.2, z: 0.3 }, 'observation uses reference acceleration');
 assert.equal(frame.captureProfile, 'calibration', 'capture profile is frozen with RGB provenance');
+assert.equal(frame.rgbTilesReady, false);
+assert.equal(frame.rgbReadyFaces, 2);
+assert.equal(frame.rgbTotalFaces, 6);
+assert.equal(frame.faceTileReadiness[2].readyWhenCopied, false);
+assert(Object.isFrozen(frame.faceTileReadiness) && Object.isFrozen(frame.faceTileReadiness[0]));
 assert(Object.isFrozen(frame) && Object.isFrozen(frame.transform) && Object.isFrozen(frame.actualState));
 
 assert.throws(() => new PerceptionFrame({

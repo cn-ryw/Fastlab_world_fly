@@ -1,5 +1,6 @@
 import { reportUserError } from './error-report.js';
 import { PerceptionFrame, normalizePlanningState } from './perception-frame.js';
+import { normalizeDepthPolarScan } from './depth-topdown.js';
 
 function urlNumber(name, fallback, min, max) {
     const value = new URLSearchParams(window.location.search).get(name);
@@ -254,6 +255,73 @@ function captureProgressStatus(result, hasRgb) {
     return `scanning ${faceIndex}/${faceCount}`;
 }
 
+const PANORAMA_TOTAL_FACES = 6;
+
+/**
+ * Freeze the 3D-tile readiness provenance that belongs to one projected RGB
+ * canvas. Older/custom capture implementations did not return readiness; they
+ * remain compatible and are treated as ready after a complete projection.
+ */
+function normalizeCaptureReadiness(result, structuredResult, complete) {
+    const rawFaces = structuredResult && Array.isArray(result?.faceTileReadiness)
+        ? result.faceTileReadiness
+        : [];
+    const faceTileReadiness = Object.freeze(rawFaces.map((entry, index) => Object.freeze({
+        face: String(entry?.face ?? index),
+        readyWhenCopied: entry?.readyWhenCopied === true,
+    })));
+    const requestedTotal = Number(result?.faces);
+    const rgbTotalFaces = Number.isSafeInteger(requestedTotal) && requestedTotal > 0
+        ? requestedTotal
+        : Math.max(PANORAMA_TOTAL_FACES, faceTileReadiness.length);
+    const inferredReadyFaces = faceTileReadiness.reduce(
+        (count, entry) => count + (entry.readyWhenCopied ? 1 : 0),
+        0,
+    );
+    const requestedReadyFaces = Number(result?.readyFaces);
+    const hasExplicitReadyFaces = structuredResult
+        && Number.isSafeInteger(requestedReadyFaces)
+        && requestedReadyFaces >= 0;
+    let rgbReadyFaces = hasExplicitReadyFaces ? requestedReadyFaces : inferredReadyFaces;
+    const hasExplicitReady = structuredResult && typeof result?.ready === 'boolean';
+    const hasExplicitAllReady = structuredResult
+        && typeof result?.allFacesTileReady === 'boolean';
+    const hasFaceEvidence = faceTileReadiness.length > 0;
+    // Prefer the explicit per-face aggregate when both legacy `ready`
+    // (historically canvas-ready) and `allFacesTileReady` are present.
+    const rgbTilesReady = hasExplicitAllReady
+        ? result.allFacesTileReady === true
+        : hasExplicitReady
+        ? result.ready === true
+        : hasFaceEvidence
+        ? complete && inferredReadyFaces === rgbTotalFaces
+        : complete;
+    if (rgbTilesReady && !hasExplicitReadyFaces && !hasFaceEvidence) {
+        rgbReadyFaces = rgbTotalFaces;
+    }
+    rgbReadyFaces = Math.max(0, Math.min(rgbTotalFaces, rgbReadyFaces));
+    const rgbTileError = structuredResult && result?.tileError === true;
+    const rgbReadinessReason = String(
+        structuredResult && result?.readinessReason
+        || (rgbTilesReady
+            ? 'tiles-ready'
+            : rgbTileError
+            ? 'tile-error'
+            : complete
+            ? 'tiles-partial'
+            : 'capture-incomplete'),
+    );
+    return Object.freeze({
+        rgbFrameComplete: complete === true,
+        rgbTilesReady,
+        rgbReadyFaces,
+        rgbTotalFaces,
+        rgbReadinessReason,
+        rgbTileError,
+        faceTileReadiness,
+    });
+}
+
 export class PanoramaSensor {
     constructor() {
         this.panel = document.getElementById('panorama-sensor-panel');
@@ -297,11 +365,23 @@ export class PanoramaSensor {
         this._activeDepthRequest = null;
         this._depthRequestSequence = 0;
         this._lastRenderedRequestId = 0;
+        this._depthPolarFrame = null;
         this._rgbFrameId = 0;
+        this._rgbReadiness = Object.freeze({
+            frameId: 0,
+            rgbFrameComplete: false,
+            rgbTilesReady: false,
+            rgbReadyFaces: 0,
+            rgbTotalFaces: PANORAMA_TOTAL_FACES,
+            rgbReadinessReason: 'no-rgb-frame',
+            rgbTileError: false,
+            faceTileReadiness: Object.freeze([]),
+        });
         this._lastRequestedFrameId = -1;
         this._minimumRequestFrameId = 0;
         this._forceNextDepthRequest = false;
         this._yopoGeneration = 0;    // 目标会话变化时递增，丢弃过期响应
+        this._planningEpoch = 0;     // 同一目标内重规划时递增，隔离故障前的帧/响应
         this._goalSequence = 0;
         this._goalId = null;
         this._navigationMode = 'idle';
@@ -389,6 +469,7 @@ export class PanoramaSensor {
         this.hasRgb = false;
         this._lastDepthArray = null;
         this._yopoGeneration++;   // 取消/到达时递增，使在途响应过期
+        this._planningEpoch++;
         this._goalId = null;
         this._navigationMode = 'idle';
         this._navigationTransitionReason = 'sensor-reset';
@@ -402,10 +483,24 @@ export class PanoramaSensor {
         this._consumedCalibrationCaptureIds.clear();
         this._yopoPending = false;
         this._rgbFrameId = 0;
+        this._rgbReadiness = Object.freeze({
+            frameId: 0,
+            rgbFrameComplete: false,
+            rgbTilesReady: false,
+            rgbReadyFaces: 0,
+            rgbTotalFaces: PANORAMA_TOTAL_FACES,
+            rgbReadinessReason: 'no-rgb-frame',
+            rgbTileError: false,
+            faceTileReadiness: Object.freeze([]),
+        });
         this._lastRequestedFrameId = -1;
         this._minimumRequestFrameId = 1;
         this._forceNextDepthRequest = true;
         if (this.rgbCanvas) this._drawPlaceholder(this.rgbCanvas, 'RGB PANORAMA');
+        // reset() may teleport the vehicle back to spawn. A previously drawn
+        // JPEG can remain as a visual placeholder, but an ego-centred obstacle
+        // outline must never be presented as belonging to the new pose.
+        this._depthPolarFrame = null;
         if (!retainedDepth) {
             this.hasDepth = false;
             this._drawDepthPlaceholder('DA360 offline');
@@ -417,6 +512,23 @@ export class PanoramaSensor {
 
     hasRgbFrame() {
         return this.hasRgb;
+    }
+
+    /** Schedule the next planning capture/request at the earliest safe frame. */
+    requestImmediatePlanningFrame(reason = 'controller-replan') {
+        if (this._navigationMode !== 'active' || !this._yopoGoal) return false;
+        // A controller failure changes the valid planning observation even
+        // though goalId/generation stay constant. Invalidate both asynchronous
+        // stages and require a panorama captured after this boundary.
+        this._planningEpoch++;
+        this._abortActiveDepthRequest(reason);
+        this._abortActiveCapture(reason);
+        this._minimumRequestFrameId = this._rgbFrameId + 1;
+        this.lastCaptureStartTime = -Infinity;
+        this._forceNextDepthRequest = true;
+        this._navigationTransitionReason = reason;
+        this._setDepthState('planning', 'awaiting-new-rgb-frame');
+        return true;
     }
 
     getCaptureOptions(options = {}) {
@@ -434,16 +546,31 @@ export class PanoramaSensor {
             bottomPoleGuardDeg: PANORAMA_BOTTOM_POLE_GUARD,
             jpegQuality: PANORAMA_JPEG_QUALITY,
             uploadScale: DA360_UPLOAD_SCALE,
-            frameDelayMs: calibration
-                ? (preload ? PANORAMA_PRELOAD_FRAME_DELAY_MS : PANORAMA_FRAME_DELAY_MS)
+            // Preload is a one-shot, pre-flight operation even when the live
+            // capture profile is `flight`. It must dwell on each hidden-viewer
+            // face and actually let Cesium settle its tile queue. Live flight
+            // remains the separate zero-wait/capture-anyway path below.
+            frameDelayMs: preload
+                ? PANORAMA_PRELOAD_FRAME_DELAY_MS
+                : calibration
+                ? PANORAMA_FRAME_DELAY_MS
                 : 0,
-            tileTimeoutMs: calibration
-                ? (preload ? PANORAMA_PRELOAD_FACE_TILE_TIMEOUT_MS : PANORAMA_FACE_TILE_TIMEOUT_MS)
+            tileTimeoutMs: preload
+                ? PANORAMA_PRELOAD_FACE_TILE_TIMEOUT_MS
+                : calibration
+                ? PANORAMA_FACE_TILE_TIMEOUT_MS
                 : 0,
-            tileQuietMs: calibration
-                ? (preload ? PANORAMA_PRELOAD_FACE_TILE_QUIET_MS : PANORAMA_FACE_TILE_QUIET_MS)
+            tileQuietMs: preload
+                ? PANORAMA_PRELOAD_FACE_TILE_QUIET_MS
+                : calibration
+                ? PANORAMA_FACE_TILE_QUIET_MS
                 : 0,
-            captureAnyway: !calibration,
+            captureAnyway: !preload && !calibration,
+            // A slow first direction must not prevent the other five views
+            // from issuing their tile requests during the one-shot warm-up.
+            // Calibration remains fail-closed and live flight remains the
+            // separate zero-wait capture-anyway path.
+            continueOnTileTimeout: preload,
             facesPerSlice: PANORAMA_FACES_PER_SLICE,
             timeoutMs: preload ? PANORAMA_PRELOAD_TIMEOUT_MS : 0,
         };
@@ -486,6 +613,8 @@ export class PanoramaSensor {
         canvas,
         captureTimings = null,
         captureProfile = this._captureProfile,
+        planningEpoch = this._planningEpoch,
+        readiness = normalizeCaptureReadiness(null, false, true),
     ) {
         const fallbackPosition = planningState?.actualState?.position || { x: 0, y: 0, z: 0 };
         const fallbackState = planningState || normalizePlanningState({
@@ -502,6 +631,14 @@ export class PanoramaSensor {
             transform: cloneCaptureTransform(transform, fallbackPosition),
             planningState: fallbackState,
             captureProfile: normalizeCaptureProfile(captureProfile),
+            planningEpoch,
+            rgbFrameComplete: readiness.rgbFrameComplete === true,
+            rgbTilesReady: readiness.rgbTilesReady === true,
+            rgbReadyFaces: Number(readiness.rgbReadyFaces) || 0,
+            rgbTotalFaces: Number(readiness.rgbTotalFaces) || PANORAMA_TOTAL_FACES,
+            rgbReadinessReason: String(readiness.rgbReadinessReason || 'tiles-partial'),
+            rgbTileError: readiness.rgbTileError === true,
+            faceTileReadiness: Object.freeze([...(readiness.faceTileReadiness || [])]),
             projectionConfig: Object.freeze(this._projectionConfig()),
             captureTimings: Object.freeze({ ...(captureTimings || {}) }),
             rgbPromise: this._snapshotRgbBlob(canvas),
@@ -522,6 +659,13 @@ export class PanoramaSensor {
             referenceState: planningState.referenceState,
             yaw: planningState.yaw,
             captureProfile: context.captureProfile,
+            rgbFrameComplete: context.rgbFrameComplete,
+            rgbTilesReady: context.rgbTilesReady,
+            rgbReadyFaces: context.rgbReadyFaces,
+            rgbTotalFaces: context.rgbTotalFaces,
+            rgbReadinessReason: context.rgbReadinessReason,
+            rgbTileError: context.rgbTileError,
+            faceTileReadiness: context.faceTileReadiness,
             projectionConfig: {
                 ...context.projectionConfig,
                 rgbWidth: encoded.width,
@@ -539,6 +683,7 @@ export class PanoramaSensor {
         const panoCanvas = structuredResult ? result.canvas : result;
         const complete = structuredResult ? result.complete !== false : true;
         if (!complete || !isDrawableImageSource(panoCanvas)) return false;
+        const readiness = normalizeCaptureReadiness(result, structuredResult, complete);
 
         const ctx = this.rgbCanvas.getContext('2d');
         ctx.clearRect(0, 0, this.rgbCanvas.width, this.rgbCanvas.height);
@@ -547,6 +692,7 @@ export class PanoramaSensor {
         this.lastCaptureStartTime = now;
         this.lastCaptureTime = now;
         this._rgbFrameId++;
+        this._rgbReadiness = Object.freeze({ frameId: this._rgbFrameId, ...readiness });
         const planningState = context.planningState || this._nextPlanningState;
         this._rgbFrameContext = this._makeRgbFrameContext(
             this._rgbFrameId,
@@ -556,9 +702,13 @@ export class PanoramaSensor {
             this.rgbCanvas,
             result?.timings_ms || { total: captureMs },
             context.captureProfile ?? this._captureProfile,
+            context.planningEpoch ?? this._planningEpoch,
+            readiness,
         );
         this.hasRgb = true;
-        this._setRgbStatus(`preloaded ${Math.round(captureMs)}ms`);
+        this._setRgbStatus(
+            `preloaded ${Math.round(captureMs)}ms · tiles ${readiness.rgbReadyFaces}/${readiness.rgbTotalFaces}`,
+        );
         return true;
     }
 
@@ -749,6 +899,7 @@ export class PanoramaSensor {
     }
 
     getDepthState() {
+        const readiness = this._rgbReadiness;
         return Object.freeze({
             mode: this._depthState,
             outcome: this._depthOutcome,
@@ -756,8 +907,36 @@ export class PanoramaSensor {
             goalId: this._goalId,
             frameId: this._rgbFrameId,
             generation: this._yopoGeneration,
+            planningEpoch: this._planningEpoch,
             hasDepth: this.hasDepth,
+            rgbFrameId: readiness.frameId,
+            rgbFrameComplete: readiness.rgbFrameComplete,
+            rgbTilesReady: readiness.rgbTilesReady,
+            rgbReadyFaces: readiness.rgbReadyFaces,
+            rgbTotalFaces: readiness.rgbTotalFaces,
+            rgbReadinessReason: readiness.rgbReadinessReason,
+            rgbTileError: readiness.rgbTileError,
+            faceTileReadiness: readiness.faceTileReadiness,
         });
+    }
+
+    _rgbMetrics(frameContext = null) {
+        const source = frameContext || this._rgbReadiness;
+        return Object.freeze({
+            rgbFrameId: Number.isSafeInteger(source?.frameId) ? source.frameId : null,
+            rgbFrameComplete: source?.rgbFrameComplete === true,
+            rgbTilesReady: source?.rgbTilesReady === true,
+            rgbReadyFaces: Math.max(0, Number(source?.rgbReadyFaces) || 0),
+            rgbTotalFaces: Math.max(0, Number(source?.rgbTotalFaces) || PANORAMA_TOTAL_FACES),
+            rgbReadinessReason: String(source?.rgbReadinessReason || 'no-rgb-frame'),
+            rgbTileError: source?.rgbTileError === true,
+            faceTileReadiness: Object.freeze([...(source?.faceTileReadiness || [])]),
+        });
+    }
+
+    /** Latest numerical 360-depth scan, tied to the frozen RGB capture yaw. */
+    getDepthPolarScan() {
+        return this._depthPolarFrame;
     }
 
     _desiredDepthMode() {
@@ -779,6 +958,7 @@ export class PanoramaSensor {
         if (!request) return false;
         if (this._activeDepthRequest !== request) return false;
         if (request.generation !== this._yopoGeneration) return false;
+        if (request.planningEpoch !== this._planningEpoch) return false;
         if (request.goalId !== this._goalId) return false;
         if (request.mode !== this._desiredDepthMode()) return false;
         return true;
@@ -832,6 +1012,7 @@ export class PanoramaSensor {
             frameAgeMs: request?.frameContext
                 ? performance.now() - request.frameContext.capturedAt
                 : null,
+            ...this._rgbMetrics(request?.frameContext),
         });
     }
 
@@ -879,6 +1060,7 @@ export class PanoramaSensor {
         this.lastCaptureStartTime = performance.now();
         const capturedAt = this.lastCaptureStartTime;
         const capturePlanningState = this._nextPlanningState;
+        const capturePlanningEpoch = this._planningEpoch;
         const captureTransform = cloneCaptureTransform(
             transform,
             capturePlanningState?.actualState?.position,
@@ -895,6 +1077,11 @@ export class PanoramaSensor {
                 ...this.getCaptureOptions({ profile: captureProfile }),
                 signal: captureController.signal,
             });
+            if (captureController.signal.aborted) {
+                const abortError = new Error('panorama capture aborted');
+                abortError.name = 'AbortError';
+                throw abortError;
+            }
             const structuredResult = result && typeof result === 'object' && 'complete' in result;
             const panoCanvas = structuredResult ? result.canvas : result;
             const complete = structuredResult ? result.complete !== false : true;
@@ -911,6 +1098,7 @@ export class PanoramaSensor {
                 this._setRgbStatus(rgbStatus);
                 return;
             }
+            const readiness = normalizeCaptureReadiness(result, structuredResult, complete);
 
             const ctx = this.rgbCanvas.getContext('2d');
             ctx.clearRect(0, 0, this.rgbCanvas.width, this.rgbCanvas.height);
@@ -918,6 +1106,7 @@ export class PanoramaSensor {
             this.lastCaptureTime = performance.now();
             const captureMs = this.lastCaptureTime - this.lastCaptureStartTime;
             this._rgbFrameId++;
+            this._rgbReadiness = Object.freeze({ frameId: this._rgbFrameId, ...readiness });
             this._rgbFrameContext = this._makeRgbFrameContext(
                 this._rgbFrameId,
                 capturedAt,
@@ -926,9 +1115,12 @@ export class PanoramaSensor {
                 this.rgbCanvas,
                 result?.timings_ms || { total: captureMs },
                 captureProfile,
+                capturePlanningEpoch,
+                readiness,
             );
             this.hasRgb = true;
-            const rgbStatus = `${Math.round(captureMs)}ms`;
+            const rgbStatus = `${Math.round(captureMs)}ms · tiles `
+                + `${readiness.rgbReadyFaces}/${readiness.rgbTotalFaces}`;
             this._setRgbStatus(rgbStatus);
 
             if (this._shouldRequestDepth(this.lastCaptureTime)) {
@@ -945,6 +1137,7 @@ export class PanoramaSensor {
                     intendedDepthMode: this._desiredDepthMode(),
                     goalId: this._goalId,
                     generation: this._yopoGeneration,
+                    ...this._rgbMetrics(),
                 });
                 return;
             }
@@ -1050,6 +1243,7 @@ export class PanoramaSensor {
             requestId: ++this._depthRequestSequence,
             frameId: frameContext.frameId,
             generation: this._yopoGeneration,
+            planningEpoch: frameContext.planningEpoch,
             goalId: this._goalId,
             mode,
             goal: this._yopoGoal ? { ...this._yopoGoal } : null,
@@ -1144,6 +1338,18 @@ export class PanoramaSensor {
             }
             if (!payload.depth_image) throw new Error('response missing depth_image');
 
+            let polarScan = normalizeDepthPolarScan(payload.polar_scan);
+            if (polarScan && polarScan.depthMode !== payload.depth_mode) {
+                throw new Error('polar scan depth mode does not match response depth mode');
+            }
+            const captureRotation = frame.transform?.rotation;
+            const capturePosition = frame.transform?.position;
+            const captureIsLeveled = captureRotation
+                && [captureRotation.x, captureRotation.y, captureRotation.z].every(Number.isFinite)
+                && Math.abs(captureRotation.x) <= 1e-3
+                && Math.abs(captureRotation.z) <= 1e-3;
+            if (!captureIsLeveled || !capturePosition) polarScan = null;
+
             this._depthLatency = Number.isFinite(Number(payload.latency_ms))
                 ? `${Math.round(Number(payload.latency_ms))}ms`
                 : '';
@@ -1184,13 +1390,19 @@ export class PanoramaSensor {
                         goalId: request.goalId,
                         frameId: request.frameId,
                         generation: request.generation,
+                        planningEpoch: request.planningEpoch,
                         requestId: request.requestId,
                         depthMode: payload.depth_mode || null,
                         calibrationId: payload.calibration_id || null,
+                        calibrationAccuracyAccepted:
+                            typeof payload.calibration_accuracy_accepted === 'boolean'
+                                ? payload.calibration_accuracy_accepted
+                                : null,
                         serviceFingerprint: payload.service_fingerprint || null,
                         planningAuthorized: true,
                         planningReason: payload.planning_reason || null,
                         timings: payload.timings_ms || null,
+                        ...this._rgbMetrics(frameContext),
                     });
                     const trajectoryApplyStartedAt = performance.now();
                     trajectoryApplied = this.onYopoResult
@@ -1207,6 +1419,24 @@ export class PanoramaSensor {
                     }
                 }
             }
+
+            // Commit only after identity, trust and planning-age validation.
+            // A blocked relative response remains a valid preview, but an
+            // expired or inconsistent response cannot replace this outline.
+            this._depthPolarFrame = polarScan
+                ? Object.freeze({
+                    scan: polarScan,
+                    frameId: request.frameId,
+                    requestId: request.requestId,
+                    capturedAt: frame.capturedAt,
+                    captureYawDeg: captureRotation.y,
+                    capturePosition: Object.freeze({
+                        x: capturePosition.x,
+                        y: capturePosition.y,
+                        z: capturePosition.z,
+                    }),
+                })
+                : null;
 
             const makeMetrics = ({
                 outcome,
@@ -1234,6 +1464,10 @@ export class PanoramaSensor {
                     dropReason: finalReason,
                     depthMode: payload.depth_mode || null,
                     calibrationId: payload.calibration_id || null,
+                    calibrationAccuracyAccepted:
+                        typeof payload.calibration_accuracy_accepted === 'boolean'
+                            ? payload.calibration_accuracy_accepted
+                            : null,
                     serviceFingerprint: payload.service_fingerprint || null,
                     depthPreviewError,
                     depthPreviewCommitted,
@@ -1272,6 +1506,7 @@ export class PanoramaSensor {
                     captureToApplyMs: metricAppliedAt - frame.capturedAt,
                     frameAgeMs: metricAppliedAt - frame.capturedAt,
                     serverTimings: payload.timings_ms || null,
+                    ...this._rgbMetrics(frameContext),
                 });
             };
             const outcome = request.mode !== 'planning'
@@ -1343,6 +1578,7 @@ export class PanoramaSensor {
                 console.log(
                     `[depth] ${fps.toFixed(1)}Hz mode=${request.mode} goalId=${request.goalId || '-'} ` +
                     `frameId=${request.frameId} generation=${request.generation} ` +
+                    `rgbTiles=${frameContext.rgbReadyFaces}/${frameContext.rgbTotalFaces} ` +
                     `depthLag=${depthPreviewLagFrames}f ` +
                     `reason=${finalReason ? `${outcome}:${finalReason}` : 'ok'} ` +
                     `capture=${Math.round(frameContext.captureTimings?.total || 0)}ms ` +
@@ -1420,6 +1656,7 @@ export class PanoramaSensor {
             reportUserError('DA360/YOPO request failed', error, {
                 key: 'da360-depth-request', intervalMs: 3000,
             });
+            this._depthPolarFrame = null;
             this.lastDepthTime = performance.now();
             const offline = request.abortReason === 'timeout' || error?.name === 'TypeError';
             this._setDepthState(offline ? 'offline' : 'error', shortError(error));
@@ -1433,6 +1670,7 @@ export class PanoramaSensor {
                 frameAgeMs: request.frameContext
                     ? performance.now() - request.frameContext.capturedAt
                     : null,
+                ...this._rgbMetrics(request.frameContext),
             });
             return false;
         } finally {
@@ -1456,6 +1694,7 @@ export class PanoramaSensor {
         this._abortActiveDepthRequest('goal-changed');
         this._abortActiveCapture('goal-changed');
         this._yopoGeneration++;
+        this._planningEpoch++;
         this._goalId = `goal-${++this._goalSequence}`;
         this._yopoGoal = Object.freeze({ ...goal });
         this._navigationMode = 'active';
@@ -1470,6 +1709,7 @@ export class PanoramaSensor {
         this._abortActiveDepthRequest(reason);
         this._abortActiveCapture(reason);
         this._yopoGeneration++;
+        this._planningEpoch++;
         this._goalId = null;
         this._yopoGoal = null;
         this._navigationMode = reason.includes('arriv') ? 'arrived'

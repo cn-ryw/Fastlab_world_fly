@@ -88,13 +88,13 @@
 
 ## Not implemented / not accepted
 
-### DA360 metric
+### DA360 metric（sim-to-sim 已人工接受，自动精度门禁未通过）
 
 - 4 地点×3 captures、共 12 组四件套和 LOLO 报告已完成：`../experiment_data/metric_fit-lolo-20260810-12capture/fit_report.json`。1536 anchors 中 1140 有效（74.22%），833 个在 0.5–20m。
 - 数据完整性通过，但四个留出地点的 median/p90 AbsRel、10m 内 p90 误差分别为：site-a 0.399/0.544/3.326m，site-b 0.366/2.125/5.959m，site-c 0.383/0.443/3.545m，site-d 0.313/0.982/4.051m，均未过精度门禁。
-- `success=true` 只代表 fitter 完成；acceptance=false。全量 scale-only 候选 `a=0.0011892812185910185,b=0` 的 median/p90 AbsRel=0.376/1.507、近距 p90=4.054m，不能安装；`depth_calibration.json` 仍为 `a/b=null`。
+- `success=true` 只代表 fitter 完成；自动 `acceptance.passed=false`。全量 scale-only 结果 `a=0.0011892812185910185,b=0` 的 median/p90 AbsRel=0.376/1.507、近距 p90=4.054m。项目负责人于 2026-08-11 根据实时深度效果将其人工接受为 sim-to-sim 基线；`../experiment_data/depth_calibration.json` 保留失败的自动报告并以 `manual_acceptance` 记录该决定。
 - 476×238→1036×518 pilot 在相同 134×67 source JPEG 下从 25.6ms 增至 151.9ms（5.94×），且 site-a 显著变差；不得提升 live DA360 输入到 1036×518。
-- 没有 accepted metric、metric 驱动的低空闭环或 Cesium truth parity；继续 `da360-relative` fail closed。
+- 尚未完成 metric 驱动的真实低空闭环或 Cesium truth parity；人工批准仅覆盖 sim-to-sim，不得写成自动 LOLO 精度门禁通过或真实传感器精度验收。
 
 上线门槛固定为：median AbsRel ≤15%、p90 AbsRel ≤30%、10m 内 p90 绝对误差 ≤1m、有效 anchor ≥70%、至少 4 地点与 12 captures。
 

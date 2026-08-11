@@ -132,7 +132,7 @@ da360UploadScale=0.35
 DA360_INPUT_SCALE=0.46
 DA360_RESAMPLE=bicubic
 DA360_CHANNELS_LAST=0
-DA360_DEPTH_MODE=da360-relative
+DA360_DEPTH_MODE=da360-metric
 
 ARRIVAL_DISTANCE_M=4.0
 collisionRadius=0.6
@@ -170,10 +170,10 @@ depth_m = 1 / inverse_depth_1_per_m
 - metric calibration 启动时一次加载并绑定模型、输入尺寸、resample 和 checkpoint SHA
 - metric loader 必须校验标定的 projection/JPEG fingerprint；每次请求通过 `X-Projection-Config` 携带冻结帧的完整投影配置，并在 GPU 推理前同时匹配 RGB request size、ERP/FOV、pole guard、JPEG quality 和 upload scale
 - calibration anchor 只有在六个 cubemap 面各自在复制 RGB 像素时都已报告 tiles ready 才可导出；不能用采集结束后的单次 `tilesLoaded` 状态代替逐面 provenance
-- `DA360_DEPTH_MODE=da360-metric` fail closed；校准不合格时拒绝启动
+- `DA360_DEPTH_MODE=da360-metric` fail closed；校准结构、指纹或接受来源无效时拒绝启动
 - `window.__captureMetricCalibration()` 原子导出同 captureId 的 RGB、anchors、manifest 与 raw NPZ
 
-2026-08-10 已完成 4 地点×3 captures 的真实原子数据集和 LOLO 报告：`../experiment_data/metric_fit-lolo-20260810-12capture/fit_report.json`。1536 anchors 中 1140 有效（74.22%），833 个落在 0.5–20m；四件套、指纹和地点覆盖完整。**但是 calibration 精度验收失败**：
+2026-08-10 已完成 4 地点×3 captures 的真实原子数据集和 LOLO 报告：`../experiment_data/metric_fit-lolo-20260810-12capture/fit_report.json`。1536 anchors 中 1140 有效（74.22%），833 个落在 0.5–20m；四件套、指纹和地点覆盖完整。**自动 calibration 精度门禁失败**：
 
 | 留出地点 | median AbsRel | p90 AbsRel | 10m 内 p90 绝对误差 |
 |---|---:|---:|---:|
@@ -182,11 +182,11 @@ depth_m = 1 / inverse_depth_1_per_m
 | site-c | 0.383 | 0.443 | 3.545m |
 | site-d | 0.313 | 0.982 | 4.051m |
 
-报告 `success=true` 仅表示 fitter 完成；acceptance=false。全量 scale-only 候选 `a=0.0011892812185910185,b=0` 的 median/p90 AbsRel 为 0.376/1.507，10m 内 p90 误差 4.054m，只能作诊断，不能安装。`../experiment_data/depth_calibration.json` 仍为 `a/b=null`。未完成项是 accepted DA360 metric、Cesium truth parity 与低空 metric 闭环，不再把“实际采集待完成”写成现状。
+报告 `success=true` 仅表示 fitter 完成；自动 `acceptance.passed=false`。全量 scale-only 结果 `a=0.0011892812185910185,b=0` 的 median/p90 AbsRel 为 0.376/1.507，10m 内 p90 误差 4.054m。项目负责人于 2026-08-11 检查实时深度效果后，明确人工接受该固定尺度作为后续 sim-to-sim 基线；正式 `../experiment_data/depth_calibration.json` 保留自动失败事实，并记录 `manual_acceptance`。`start-all.sh` 默认使用该正式 metric 标定；health/规划为 `validated-da360-metric`，同时暴露 `manual-user`、`automatic_gate_passed=false` 与 `sim-to-sim` 范围。未完成项仍是 Cesium truth parity 与真实低空 metric 闭环。
 
 验收门槛：0.5–20m 留出数据 median AbsRel ≤15%、p90 AbsRel ≤30%、10m 内 p90 绝对误差 ≤1m、有效 anchor ≥70%，至少 4 地点、12 captures，并使用 leave-one-location-out。
 
-未通过前只能称为 `da360-relative`，它只能 preview/采集，不能产生可应用轨迹；不得在文档、health 或实验结论中称为米制深度。`cesium-truth` fallback 尚未实现，不能写成现有能力。
+人工接受范围仅为 sim-to-sim；不得把它写成自动 LOLO 精度门禁通过或真实传感器绝对精度验收。显式 `da360-relative` 仍只能 preview/采集，不能产生可应用轨迹。`cesium-truth` fallback 尚未实现，不能写成现有能力。
 
 输入分辨率 pilot 的结论也已固定：同一解码后 134×67 JPEG 输入，476×238 推理为 25.6ms，1036×518 为 151.9ms（5.94×）；site-a median/p90 AbsRel 从 0.276/0.544 恶化到 0.569/2.468，10m 内 p90 误差从 2.666m 恶化到 19.945m。不得把 live DA360 输入改到 1036×518；上游 RGB 没有新增细节，该候选既更慢也未改善跨地点精度。
 

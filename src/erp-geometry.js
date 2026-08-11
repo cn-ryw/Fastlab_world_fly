@@ -1,7 +1,8 @@
 /**
  * ERP (Equirectangular Projection) geometry helpers.
  *
- * Pixel ↔ direction mapping MUST match the PanoramaSensor shader:
+ * Pixel ↔ direction mapping MUST match both the panorama projector and
+ * the YOPO_360 simulator/training renderer:
  *   yaw   = Math.PI - (u + 0.5) / W * 2 * Math.PI
  *   pitch = vfov / 2 - (v + 0.5) / H * vfov
  * where vfov = verticalFovDeg in radians.
@@ -48,20 +49,22 @@ export function erpPixelToAngles(u, v, W, H, vfovRad = Math.PI) {
 export function erpPixelToDirection(u, v, W, H, vfovRad = Math.PI) {
     const { yaw, pitch } = erpPixelToAngles(u, v, W, H, vfovRad);
     const cosPitch = Math.cos(pitch);
-    // dy negated to mirror left/right: matches YOPO training ERP layout
+    // YOPO's body frame is NWU: +x forward, +y left, +z up.  In particular,
+    // the quarter-width pixel (yaw=+90 deg) must point body-left.  Do not
+    // negate dy here: doing so mirrors both DA360 and YOPO inputs.
     return {
         dx: cosPitch * Math.cos(yaw),
-        dy: -cosPitch * Math.sin(yaw),
+        dy: cosPitch * Math.sin(yaw),
         dz: Math.sin(pitch),
     };
 }
 
 /**
  * Convert the canonical sensor/body NWU direction to the component axes used
- * by the panorama cubemap renderer: +X right, +Y up, +Z back.
+ * by the panorama cubemap renderer: +X body-left, +Y up, +Z back.
  *
  * Keep this mapping numerically identical to the projector shader's
- * `directionFromPitchYaw`: `vec3(-right, up, -forward)`.
+ * `directionFromPitchYaw`: `vec3(left, up, -forward)`.
  */
 export function erpDirectionToComponent(direction) {
     if (!direction || ![direction.dx, direction.dy, direction.dz].every(Number.isFinite)) {
@@ -85,8 +88,7 @@ export function erpPixelToComponentDirection(u, v, W, H, vfovRad = Math.PI) {
  * Returns {u, v} in continuous pixel coordinates (not snapped to integer).
  */
 export function erpDirectionToPixel(dx, dy, dz, W, H, vfovRad = Math.PI) {
-    // negate dy to match mirrored erpPixelToDirection
-    const yaw = Math.atan2(-dy, dx);               // (-π, π]
+    const yaw = Math.atan2(dy, dx);                // (-π, π]
     const pitch = Math.asin(Math.max(-1, Math.min(1, dz)));
     const u = (Math.PI - yaw) / (2.0 * Math.PI) * W - 0.5;
     const v = (vfovRad / 2.0 - pitch) / vfovRad * H - 0.5;

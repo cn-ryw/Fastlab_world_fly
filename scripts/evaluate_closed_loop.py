@@ -5,7 +5,8 @@ Schema v2 is deliberately fail closed.  A frame counts only when the browser
 records a successful trajectory-install acknowledgement, an allowed metric
 depth mode, complete frame identity, and stable calibration/service
 fingerprints.  The first ``warmup_frames`` legal unique frames are excluded
-from every timed perception metric.
+from every timed perception metric. RGB panorama tile readiness is reported as
+an advisory diagnostic; it is deliberately not a pass/fail gate.
 """
 
 import argparse
@@ -267,6 +268,7 @@ def _validate_planning_event(item, allowed_depth_modes):
     )
     depth_mode = _identity_token(item.get("depthMode"))
     calibration_id = _nonempty_fingerprint(item.get("calibrationId"))
+    calibration_accuracy_accepted = item.get("calibrationAccuracyAccepted") is True
     service_fingerprint = _nonempty_fingerprint(item.get("serviceFingerprint"))
     apply_at = _finite_number(item.get("trajectoryAppliedAtMs"))
     capture_to_apply = _finite_number(item.get("captureToApplyMs"))
@@ -280,6 +282,8 @@ def _validate_planning_event(item, allowed_depth_modes):
         errors.append("depthMode")
     if calibration_id is None:
         errors.append("calibrationId")
+    if not calibration_accuracy_accepted:
+        errors.append("calibrationAccuracyAccepted")
     if service_fingerprint is None:
         errors.append("serviceFingerprint")
     if apply_at is None:
@@ -293,6 +297,7 @@ def _validate_planning_event(item, allowed_depth_modes):
         "identity": identity,
         "depth_mode": depth_mode,
         "calibration_id": calibration_id,
+        "calibration_accuracy_accepted": calibration_accuracy_accepted,
         "service_fingerprint": service_fingerprint,
         "apply_at_ms": apply_at,
         "capture_to_apply_ms": capture_to_apply,
@@ -404,6 +409,22 @@ def evaluate_log(
     service_fingerprints = {event["service_fingerprint"] for event in unique}
     overage_planning_frames = sum(
         event["capture_to_apply_ms"] > hard_observation_age_ms for event in unique
+    )
+    rgb_tiles_ready_planning_frames = sum(
+        event["item"].get("rgbTilesReady") is True for event in unique
+    )
+    rgb_tiles_partial_planning_frames = sum(
+        event["item"].get("rgbTilesReady") is False for event in unique
+    )
+    rgb_tiles_unknown_planning_frames = (
+        len(unique)
+        - rgb_tiles_ready_planning_frames
+        - rgb_tiles_partial_planning_frames
+    )
+    rgb_tile_error_planning_frames = sum(
+        event["item"].get("rgbTileError") is True
+        or event["item"].get("rgbReadinessReason") == "tile-error"
+        for event in unique
     )
 
     physics_times, invalid_physics_timestamps = _physics_frame_times(log)
@@ -604,6 +625,13 @@ def evaluate_log(
         "resolved_url_errors": resolved_url_errors,
         "planning_observation_hard_age_ms": hard_observation_age_ms,
         "overage_planning_frames": overage_planning_frames,
+        "rgb_tiles_ready_planning_frames": rgb_tiles_ready_planning_frames,
+        "rgb_tiles_partial_planning_frames": rgb_tiles_partial_planning_frames,
+        "rgb_tiles_unknown_planning_frames": rgb_tiles_unknown_planning_frames,
+        "rgb_tile_error_planning_frames": rgb_tile_error_planning_frames,
+        "rgb_tiles_ready_planning_fraction": (
+            rgb_tiles_ready_planning_frames / len(unique) if unique else None
+        ),
         "maximum_capture_to_apply_ms": max(
             (event["capture_to_apply_ms"] for event in unique), default=None
         ),
@@ -651,6 +679,11 @@ def evaluate_log(
         "depth_mode_stable": len(depth_modes) == 1,
         "calibration_id_present": bool(calibration_ids)
         and not any("calibrationId" in event["errors"] for event in validated),
+        "calibration_accuracy_accepted": bool(unique)
+        and not any(
+            "calibrationAccuracyAccepted" in event["errors"]
+            for event in validated
+        ),
         "calibration_id_stable": len(calibration_ids) == 1,
         "service_fingerprint_present": bool(service_fingerprints)
         and not any("serviceFingerprint" in event["errors"] for event in validated),

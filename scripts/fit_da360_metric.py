@@ -645,7 +645,7 @@ def load_data(raw_path, anchors_path, manifest_path, rgb_path):
     if vertical_fov != projection_fingerprint["verticalFovDeg"]:
         raise ValueError("manifest/anchor ERP vertical FOV mismatch")
     if erp_metadata.get("sensorFrame") != "NWU(+x forward,+y left,+z up)" \
-            or erp_metadata.get("componentFrame") != "(+x right,+y up,+z back)":
+            or erp_metadata.get("componentFrame") != "(+x body-left,+y up,+z back)":
         raise ValueError("anchor ERP frame convention is incompatible")
     sampling_metadata = _require_mapping(
         anchor_metadata.get("sampling"), "anchors.metadata.sampling"

@@ -30,7 +30,7 @@ SCRIPTS_DIR = PROJECT_ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 import combined_server  # noqa: E402
-from da360_server import DA360Runner, create_app  # noqa: E402
+from da360_server import DA360Runner, create_app, depth_to_polar_scan  # noqa: E402
 
 
 class FakeDepthRunner:
@@ -135,6 +135,11 @@ class BackendContractTests(unittest.TestCase):
         )
         self.assertIn("loaded_config_path != config_path.resolve()", source)
 
+    def test_yopo_height_override_is_segment_bounded(self):
+        source = (SCRIPTS_DIR / "yopo_bridge.py").read_text(encoding="utf-8")
+        self.assertIn("YOPO_MAX_VERTICAL_ENDPOINT_STEP_M = 4.0", source)
+        self.assertIn("endstate_w[:, 2, 0] = np.clip(", source)
+
     @contextmanager
     def clients(self):
         standalone = create_app(FakeDepthRunner())
@@ -197,13 +202,64 @@ class BackendContractTests(unittest.TestCase):
                         "api_version", "depth_image", "depth_scale", "latency_ms", "timings_ms",
                         "model", "device", "width", "height", "request_width", "request_height",
                         "depth_mode", "calibration_id", "frame_id", "goal_id", "generation",
-                        "input_sha256",
+                        "input_sha256", "polar_scan",
                     }
                     self.assertLessEqual(required, payload.keys())
                     self.assertTrue(payload["depth_image"].startswith("data:image/jpeg;base64,"))
                     self.assertEqual(payload["frame_id"], "frame-7")
                     self.assertEqual(payload["goal_id"], "goal-2")
                     self.assertEqual(payload["generation"], "3")
+                    scan = payload["polar_scan"]
+                    self.assertEqual(scan["depth_mode"], "da360-relative")
+                    self.assertEqual(scan["unit"], "x-near-reference")
+                    self.assertEqual(scan["radius"], 20.0)
+                    self.assertEqual(len(scan["values"]), FakeDepthRunner.width)
+
+    def test_polar_scan_relative_is_explicitly_non_metric(self):
+        depth = np.full((12, 96), 4.0, dtype=np.float32)
+        depth[:, 48:52] = 2.0
+        scan = depth_to_polar_scan(depth, "da360-relative")
+        self.assertEqual(scan["unit"], "x-near-reference")
+        self.assertEqual(scan["normalization"], "per-frame-depth-p02")
+        self.assertAlmostEqual(min(value for value in scan["values"] if value), 1.0)
+        self.assertEqual(scan["angle_positive"], "body-left")
+
+    def test_polar_scan_reorders_native_erp_columns_to_increasing_body_left_angle(self):
+        # Native YOPO ERP columns are +pi -> -pi, while the public polar scan
+        # enumerates -pi -> +pi with a positive body-left angle step.  Unique
+        # values make a left/right regression directly observable.
+        depth = np.array([[10.0, 20.0, 30.0, 40.0]], dtype=np.float32)
+        scan = depth_to_polar_scan(
+            depth,
+            "da360-metric",
+            angular_bins=4,
+        )
+        self.assertEqual(scan["angle_start_deg"], -135.0)
+        self.assertEqual(scan["angle_step_deg"], 90.0)
+        self.assertEqual(scan["angle_positive"], "body-left")
+        self.assertEqual(scan["values"], [40.0, 30.0, 20.0, 10.0])
+
+    def test_polar_scan_metric_preserves_metres_and_invalid_bins(self):
+        depth = np.full((20, 96), 8.0, dtype=np.float32)
+        depth[:, 9:12] = np.nan
+        scan = depth_to_polar_scan(depth, "da360-metric")
+        self.assertEqual(scan["unit"], "metres")
+        self.assertIsNone(scan["normalization"])
+        self.assertAlmostEqual(scan["values"][75], 8.0, delta=0.05)
+        self.assertIsNone(scan["values"][85])
+        self.assertLess(scan["valid_fraction"], 1.0)
+
+    def test_polar_scan_uses_runtime_vertical_fov(self):
+        depth = np.full((12, 96), 8.0, dtype=np.float32)
+        scan = depth_to_polar_scan(
+            depth,
+            "da360-metric",
+            vertical_fov_deg=120.0,
+        )
+        self.assertEqual(scan["vertical_fov_deg"], 120.0)
+        self.assertAlmostEqual(scan["values"][0], 8.0 * np.cos(np.deg2rad(5.0)), places=3)
+        with self.assertRaisesRegex(ValueError, "vertical FOV"):
+            depth_to_polar_scan(depth, "da360-metric", vertical_fov_deg=200.0)
 
     def test_raw_contract_is_shared(self):
         with self.clients() as clients:
@@ -333,6 +389,7 @@ class BackendContractTests(unittest.TestCase):
             self.assertEqual(payload["generation"], "5")
             self.assertEqual(payload["depth_mode"], "da360-relative")
             self.assertTrue(payload["depth_image"].startswith("data:image/jpeg;base64,"))
+            self.assertEqual(payload["polar_scan"]["unit"], "x-near-reference")
             self.assertIs(payload["planning_authorized"], False)
             self.assertEqual(
                 payload["service_fingerprint"], self.expected_service_fingerprint()
@@ -350,7 +407,13 @@ class BackendContractTests(unittest.TestCase):
     def test_metric_plan_full_authorizes_trajectory_and_preserves_origins(self):
         with self.clients() as clients:
             combined_server.da360_runner.depth_mode = "da360-metric"
-            combined_server.da360_runner.calibration = {"id": "calib-1"}
+            combined_server.da360_runner.calibration = {
+                "id": "calib-1",
+                "accuracy_accepted": True,
+                "automatic_accuracy_gate_passed": False,
+                "acceptance_method": "manual-user",
+                "acceptance_scope": "sim-to-sim",
+            }
             query = (
                 "px=1&py=2&pz=3&rpx=4&rpy=5&rpz=6&"
                 "gx=10&gy=2&gz=4&vx=0&vy=0&vz=0&ax=0&ay=0&az=0&yaw=0"
@@ -363,6 +426,10 @@ class BackendContractTests(unittest.TestCase):
             payload = response.get_json()
             self.assertIs(payload["planning_authorized"], True)
             self.assertEqual(payload["planning_reason"], "validated-da360-metric")
+            self.assertIs(payload["calibration_accuracy_accepted"], True)
+            self.assertIs(payload["calibration_automatic_gate_passed"], False)
+            self.assertEqual(payload["calibration_acceptance_method"], "manual-user")
+            self.assertEqual(payload["calibration_acceptance_scope"], "sim-to-sim")
             self.assertEqual(payload["calibration_id"], "calib-1")
             self.assertEqual(
                 payload["service_fingerprint"], self.expected_service_fingerprint()
@@ -372,6 +439,39 @@ class BackendContractTests(unittest.TestCase):
             call = combined_server.yopo_runner.last_call
             np.testing.assert_array_equal(call["pos"], [1.0, 2.0, 3.0])
             np.testing.assert_array_equal(call["reference_pos"], [4.0, 5.0, 6.0])
+
+    def test_unaccepted_metric_candidate_is_explicitly_experimental_but_runs_yopo(self):
+        with self.clients() as clients:
+            combined_server.da360_runner.depth_mode = "da360-metric"
+            combined_server.da360_runner.calibration = {
+                "id": "calib-experimental",
+                "accuracy_accepted": False,
+            }
+            query = (
+                "px=1&py=2&pz=3&rpx=4&rpy=5&rpz=6&"
+                "gx=10&gy=2&gz=4&vx=0&vy=0&vz=0&ax=0&ay=0&az=0&yaw=0"
+                "&frame_id=f9&goal_id=g4&generation=5"
+            )
+            response = clients["combined"].post(
+                f"/yopo/plan_full?{query}", data=jpeg_bytes(), content_type="image/jpeg"
+            )
+            self.assertEqual(response.status_code, 200)
+            payload = response.get_json()
+            self.assertIs(payload["planning_authorized"], True)
+            self.assertEqual(
+                payload["planning_reason"],
+                "experimental-unaccepted-da360-metric",
+            )
+            self.assertEqual(payload["calibration_id"], "calib-experimental")
+            self.assertIs(payload["calibration_accuracy_accepted"], False)
+            self.assertEqual(len(payload["endstate"]), 9)
+            self.assertEqual(combined_server.yopo_runner.infer_calls, 1)
+            health = clients["combined"].get("/yopo/health").get_json()
+            self.assertIs(health["calibration_accuracy_accepted"], False)
+            self.assertEqual(
+                health["planning_reason"],
+                "experimental-unaccepted-da360-metric",
+            )
 
     def test_metric_planning_is_blocked_without_complete_service_fingerprint(self):
         with self.clients() as clients:
@@ -639,6 +739,10 @@ class BackendContractTests(unittest.TestCase):
                 loaded = runner._load_depth_calibration()
             self.assertEqual(loaded["a"], 1.25)
             self.assertEqual(len(loaded["id"]), 16)
+            self.assertIs(loaded["accuracy_accepted"], True)
+            self.assertIs(loaded["automatic_accuracy_gate_passed"], True)
+            self.assertEqual(loaded["acceptance_method"], "automatic")
+            self.assertEqual(loaded["acceptance_scope"], "accuracy-gates")
             self.assertEqual((loaded["request_width"], loaded["request_height"]), (16, 8))
 
             runner.calibration = loaded
@@ -663,9 +767,46 @@ class BackendContractTests(unittest.TestCase):
             self.assertEqual(infer_calls, [(16, 8)])
 
             rejected = dict(calibration, accepted=False)
+            rejected["acceptance"] = {"passed": False}
             path.write_text(json.dumps(rejected), encoding="utf-8")
             with patch.dict(os.environ, {"DA360_DEPTH_CALIB_PATH": str(path)}):
-                with self.assertRaisesRegex(RuntimeError, "acceptance gates"):
+                experimental = runner._load_depth_calibration()
+            self.assertIs(experimental["accuracy_accepted"], False)
+            self.assertIs(experimental["automatic_accuracy_gate_passed"], False)
+            self.assertIsNone(experimental["acceptance_method"])
+
+            manually_accepted = dict(
+                rejected,
+                accepted=True,
+                manual_acceptance={
+                    "accepted": True,
+                    "accepted_by": "project-owner",
+                    "accepted_at": "2026-08-11",
+                    "scope": "sim-to-sim",
+                    "basis": "user-reviewed live depth",
+                },
+            )
+            path.write_text(json.dumps(manually_accepted), encoding="utf-8")
+            with patch.dict(os.environ, {"DA360_DEPTH_CALIB_PATH": str(path)}):
+                manually_loaded = runner._load_depth_calibration()
+            self.assertIs(manually_loaded["accuracy_accepted"], True)
+            self.assertIs(manually_loaded["automatic_accuracy_gate_passed"], False)
+            self.assertEqual(manually_loaded["acceptance_method"], "manual-user")
+            self.assertEqual(manually_loaded["acceptance_scope"], "sim-to-sim")
+
+            wrong_scope = dict(manually_accepted)
+            wrong_scope["manual_acceptance"] = dict(
+                manually_accepted["manual_acceptance"], scope="real-world"
+            )
+            path.write_text(json.dumps(wrong_scope), encoding="utf-8")
+            with patch.dict(os.environ, {"DA360_DEPTH_CALIB_PATH": str(path)}):
+                with self.assertRaisesRegex(RuntimeError, "scope must be sim-to-sim"):
+                    runner._load_depth_calibration()
+
+            inconsistent = dict(rejected, accepted=True)
+            path.write_text(json.dumps(inconsistent), encoding="utf-8")
+            with patch.dict(os.environ, {"DA360_DEPTH_CALIB_PATH": str(path)}):
+                with self.assertRaisesRegex(RuntimeError, "acceptance statuses disagree"):
                     runner._load_depth_calibration()
 
             mismatched = dict(calibration, checkpoint_sha256="cd" * 32)

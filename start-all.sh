@@ -21,7 +21,8 @@ YOPO_BASE_CONFIG_PATH="$SCRIPT_DIR/third_party/YOPO/config/traj_opt.yaml"
 DEPENDENCY_LOCK="$SCRIPT_DIR/dependencies.lock.json"
 IMAGE_RECIPE="$SCRIPT_DIR/Dockerfile.da360-yopo"
 STARTUP_TIMEOUT="${MINDCLOUD_STARTUP_TIMEOUT:-180}"
-DEPTH_MODE="${DA360_DEPTH_MODE:-da360-relative}"
+DEFAULT_CALIBRATION_FILE="$SCRIPT_DIR/../experiment_data/depth_calibration.json"
+DEPTH_MODE="${DA360_DEPTH_MODE:-da360-metric}"
 RESAMPLE="${DA360_RESAMPLE:-bicubic}"
 INPUT_SCALE="${DA360_INPUT_SCALE:-0.46}"
 START_COMPLETE=0
@@ -212,9 +213,13 @@ if [[ -n "${DA360_DEPTH_CALIB_PATH_HOST:-}" ]]; then
     [[ -s "$DA360_DEPTH_CALIB_PATH_HOST" ]] \
         || die "calibration file missing or empty: $DA360_DEPTH_CALIB_PATH_HOST"
     CALIBRATION_FILE="$(readlink -f "$DA360_DEPTH_CALIB_PATH_HOST")"
+elif [[ "$DEPTH_MODE" == "da360-metric" ]]; then
+    [[ -s "$DEFAULT_CALIBRATION_FILE" ]] \
+        || die "default metric calibration missing or empty: $DEFAULT_CALIBRATION_FILE"
+    CALIBRATION_FILE="$(readlink -f "$DEFAULT_CALIBRATION_FILE")"
 fi
 if [[ "$DEPTH_MODE" == "da360-metric" && -z "$CALIBRATION_FILE" ]]; then
-    die "da360-metric mode requires DA360_DEPTH_CALIB_PATH_HOST"
+    die "da360-metric mode requires a calibration file"
 fi
 docker info >/dev/null 2>&1 || die "Docker daemon is unavailable"
 docker image inspect "$API_IMAGE" >/dev/null 2>&1 \

@@ -6,7 +6,7 @@ YOPO:   (/yopo/health, /yopo/plan, /yopo/plan_full)
 
 /yopo/plan_full accepts a JPEG image (same as DA360 /depth) plus pose/goal.
 It always returns DA360 depth; YOPO runs only when the selected depth mode is
-explicitly authorized for planning (currently an accepted metric calibration).
+explicitly authorized for planning (a structurally validated metric calibration).
 """
 
 import argparse
@@ -43,6 +43,7 @@ from da360_server import (
     configure_api_security,
     decode_request_image,
     depth_to_color,
+    depth_to_polar_scan,
     encode_image,
     env_float,
     env_int,
@@ -101,6 +102,8 @@ def _planning_authorization():
         return False, "yopo-not-initialized"
     if _service_fingerprint() is None:
         return False, "service-fingerprint-unavailable"
+    if calibration.get("accuracy_accepted") is False:
+        return True, "experimental-unaccepted-da360-metric"
     return True, "validated-da360-metric"
 
 
@@ -132,6 +135,7 @@ def yopo_health():
     if yopo_runner is None:
         return jsonify({"ok": False, "error": "YOPO not initialized"}), 503
     planning_authorized, planning_reason = _planning_authorization()
+    calibration = getattr(da360_runner, "calibration", None)
     return jsonify({
         "ok": True,
         "api_version": API_VERSION,
@@ -150,6 +154,15 @@ def yopo_health():
             yopo_runner, "effective_config_sha256", None
         ),
         "service_fingerprint": _service_fingerprint(),
+        "calibration_accuracy_accepted": calibration.get("accuracy_accepted")
+            if calibration else None,
+        "calibration_automatic_gate_passed": calibration.get(
+            "automatic_accuracy_gate_passed"
+        ) if calibration else None,
+        "calibration_acceptance_method": calibration.get("acceptance_method")
+            if calibration else None,
+        "calibration_acceptance_scope": calibration.get("acceptance_scope")
+            if calibration else None,
         "planning_authorized": planning_authorized,
         "planning_reason": planning_reason,
     })
@@ -242,6 +255,15 @@ def yopo_plan():
             "api_version": API_VERSION,
             "depth_mode": getattr(da360_runner, "depth_mode", "da360-relative"),
             "calibration_id": calibration.get("id") if calibration else None,
+            "calibration_accuracy_accepted": calibration.get("accuracy_accepted")
+                if calibration else None,
+            "calibration_automatic_gate_passed": calibration.get(
+                "automatic_accuracy_gate_passed"
+            ) if calibration else None,
+            "calibration_acceptance_method": calibration.get("acceptance_method")
+                if calibration else None,
+            "calibration_acceptance_scope": calibration.get("acceptance_scope")
+                if calibration else None,
             "planning_authorized": planning_authorized,
             "planning_reason": planning_reason,
             "service_fingerprint": _service_fingerprint(),
@@ -376,13 +398,21 @@ def yopo_plan_full():
         t1 = time.perf_counter()
 
         # 生成小 JPEG 深度图供前端显示（原项目做法，~6KB，不塞 1.3MB depth_array）
+        polar_scan = depth_to_polar_scan(
+            pred_depth,
+            getattr(da360_runner, "depth_mode", "da360-relative"),
+            vertical_fov_deg=(
+                request_metadata.get("projection_config") or {}
+            ).get("verticalFovDeg", 180.0),
+        )
+        t_polar = time.perf_counter()
         colored, depth_scale = depth_to_color(pred_depth)
         if getattr(da360_runner, "depth_mode", "da360-relative") == "da360-metric":
             depth_scale["unit"] = "metres"
         depth_jpeg = encode_image(colored, "jpeg", env_int("DA360_JPEG_QUALITY", 72))
         t_color = time.perf_counter()
 
-        # 2. Only validated metric depth may authorize an applicable trajectory.
+        # 2. Only structurally validated metric depth may authorize a trajectory.
         # Relative DA360 remains useful as a live preview, but scale-normalized
         # depth must never be silently fed to a metric-trained YOPO policy.
         planning_authorized, planning_reason = _planning_authorization()
@@ -409,8 +439,18 @@ def yopo_plan_full():
             "api_version": API_VERSION,
             "depth_image": depth_jpeg,
             "depth_scale": depth_scale,
+            "polar_scan": polar_scan,
             "depth_mode": getattr(da360_runner, "depth_mode", "da360-relative"),
             "calibration_id": calibration.get("id") if calibration else None,
+            "calibration_accuracy_accepted": calibration.get("accuracy_accepted")
+                if calibration else None,
+            "calibration_automatic_gate_passed": calibration.get(
+                "automatic_accuracy_gate_passed"
+            ) if calibration else None,
+            "calibration_acceptance_method": calibration.get("acceptance_method")
+                if calibration else None,
+            "calibration_acceptance_scope": calibration.get("acceptance_scope")
+                if calibration else None,
             "planning_authorized": planning_authorized,
             "planning_reason": planning_reason,
             "service_fingerprint": _service_fingerprint(),
@@ -418,7 +458,8 @@ def yopo_plan_full():
             "timings_ms": {
                 "decode_ms": (t_decode - t0) * 1000.0,
                 "da360_ms": (t1 - t_decode) * 1000.0,
-                "color_encode_ms": (t_color - t1) * 1000.0,
+                "polar_ms": (t_polar - t1) * 1000.0,
+                "color_encode_ms": (t_color - t_polar) * 1000.0,
                 "yopo_ms": (t2 - t_color) * 1000.0,
             },
             "planning_origin": {
@@ -438,7 +479,8 @@ def yopo_plan_full():
         print(
             f"[plan_full] decode={1000*(t_decode-t0):.0f}ms "
             f"da360={1000*(t1-t_decode):.0f}ms "
-            f"color+jpeg={1000*(t_color-t1):.0f}ms "
+            f"polar={1000*(t_polar-t1):.1f}ms "
+            f"color+jpeg={1000*(t_color-t_polar):.0f}ms "
             f"yopo={1000*(t2-t_color):.0f}ms "
             f"authorized={planning_authorized} reason={planning_reason} "
             f"json={1000*(t3-t2):.0f}ms total={1000*(t3-started):.0f}ms",

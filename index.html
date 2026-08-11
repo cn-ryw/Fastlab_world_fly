@@ -253,6 +253,33 @@
         .panorama-status[data-outcome="stale"] {
             color: #fcd34d;
         }
+        .panorama-readiness-badge {
+            position: absolute;
+            left: 8px;
+            bottom: 7px;
+            z-index: 2;
+            padding: 3px 6px;
+            border: 1px solid rgba(125, 211, 252, 0.5);
+            border-radius: 4px;
+            background: rgba(3, 7, 18, 0.82);
+            color: #7dd3fc;
+            font-size: 9px;
+            font-weight: 700;
+            letter-spacing: 0.2px;
+            text-shadow: 0 1px 2px #000;
+        }
+        .panorama-readiness-badge[data-state="ready"] {
+            border-color: rgba(74, 222, 128, 0.7);
+            color: #86efac;
+        }
+        .panorama-readiness-badge[data-state="partial"] {
+            border-color: rgba(250, 204, 21, 0.7);
+            color: #fde047;
+        }
+        .panorama-readiness-badge[data-state="error"] {
+            border-color: rgba(248, 113, 113, 0.8);
+            color: #fca5a5;
+        }
         .depth-legend {
             padding: 7px 9px 8px;
             background: rgba(3, 7, 18, 0.84);
@@ -302,25 +329,27 @@
             position: fixed;
             bottom: 10px;
             left: 10px;
-            width: 160px;
-            height: 160px;
+            width: 190px;
+            height: 190px;
             background: rgba(3,7,18,0.88);
             border: 1px solid rgba(125,211,252,0.42);
-            border-radius: 6px;
+            border-radius: 50%;
+            overflow: hidden;
             z-index: 200;
             display: none;
         }
         #radar-panel.visible { display: block; }
         #radar-canvas { width: 100%; height: 100%; display: block; }
         .radar-label {
-            position: absolute; top: 4px; left: 50%;
-            transform: translateX(-50%);
-            color: #f44; font-size: 11px; font-weight: 700;
+            position: absolute; top: 38px; left: 21px;
+            color: #cbd5e1; font-size: 8px; font-weight: 700;
+            white-space: nowrap;
             pointer-events: none;
         }
         .radar-range {
-            position: absolute; bottom: 4px; right: 6px;
+            position: absolute; bottom: 38px; left: 21px;
             color: #7dd3fc; font-size: 9px; pointer-events: none;
+            white-space: nowrap;
         }
 
         /* Race timing panel (F1 timing-tower style, left-middle). */
@@ -744,6 +773,8 @@
                 <span class="panorama-status" id="panorama-rgb-status">idle</span>
             </div>
             <canvas id="panorama-rgb-canvas"></canvas>
+            <div class="panorama-readiness-badge" id="panorama-rgb-readiness" data-state="loading"
+                 title="Waiting for the first panorama capture.">RGB LOADING 0/6</div>
         </div>
         <div class="panorama-pane">
             <div class="panorama-pane-header">
@@ -765,11 +796,11 @@
         </div>
     </div>
 
-    <!-- Radar minimap -->
-    <div id="radar-panel">
-        <canvas id="radar-canvas" width="160" height="160"></canvas>
-        <div class="radar-label">N</div>
-        <div class="radar-range">200m</div>
+    <!-- North-up 360-depth top-down view (not a physical radar) -->
+    <div id="radar-panel" title="Left-click to set a waypoint. Relative mode maps the circle to a nominal 20 m test radius; depth remains non-metric.">
+        <canvas id="radar-canvas" width="190" height="190"></canvas>
+        <div id="depth-topdown-mode" class="radar-label">WAITING FOR DEPTH</div>
+        <div id="depth-topdown-range" class="radar-range">R --</div>
     </div>
 
     <!-- Waypoint input -->
@@ -831,8 +862,7 @@
             <label>Up Axis</label>
             <div class="controls">
                 <select id="coord-system-select" disabled style="background:#223;color:#888;border:1px solid #334;border-radius:3px;padding:4px 8px;font-size:13px;cursor:not-allowed;">
-                    <option value="zup" selected>Z-Up</option>
-                    <option value="yup">Y-Up</option>
+                    <option value="yup" selected>Y-Up (Simulation World)</option>
                 </select>
             </div>
         </div>
@@ -844,13 +874,13 @@
                 <select id="flight-mode-select" style="background:#223;color:#ddd;border:1px solid #446;border-radius:3px;padding:4px 8px;font-size:13px;">
                     <option value="drone" selected>Drone (Easy)</option>
                     <option value="fpv">FPV (Manual)</option>
-                    <option value="stabilized">Stabilized (Self-Level)</option>
-                    <option value="so3">SO3 (Geometric)</option>
+                    <option value="stabilized">Level (Self-Level)</option>
+                    <option value="so3">SO3 (YOPO Auto)</option>
                 </select>
             </div>
         </div>
         <div style="font-size:12px;color:#8aa;margin:-2px 0 8px;line-height:1.4;">
-            Drone (Easy): ↑/↓ controls forward/back speed, W/S climbs or descends, Shift boosts lower speed settings up to the 300 km/h cap. FPV (Manual): W/S is motor thrust, so forward flight needs pitch.
+            Easy: sticks command velocity and release into brake/hold. FPV: manual body rates and motor thrust. Level: self-level roll/pitch with manual thrust—there is no altitude hold. SO3: YOPO waypoint auto-flight; movement sticks are ignored, use G+scene click or left-click the depth circle to set a goal, and C to cancel. In relative-depth mode, a circle click is a nominal 20 m interaction test only and cannot authorize a YOPO trajectory.
         </div>
         <div class="setting-row">
             <label>Easy Max Speed (m/s; 83.3 = 300 km/h)</label>
@@ -885,43 +915,43 @@
         <div class="setting-row">
             <label>Pos Kp</label>
             <div class="controls">
-                <input type="range" id="ctrl-pos-kp" min="0" max="10" value="2.0" step="0.1">
-                <input type="number" id="ctrl-pos-kp-num" min="0" max="10" step="0.1" value="2.0" style="width:60px;background:#223;color:#ddd;border:1px solid #446;border-radius:3px;padding:2px 4px;font-size:12px;">
+                <input type="range" id="ctrl-pos-kp" min="0" max="10" value="0.95" step="0.05">
+                <input type="number" id="ctrl-pos-kp-num" min="0" max="10" step="0.05" value="0.95" style="width:60px;background:#223;color:#ddd;border:1px solid #446;border-radius:3px;padding:2px 4px;font-size:12px;">
             </div>
         </div>
         <div class="setting-row">
             <label>Pos Ki</label>
             <div class="controls">
-                <input type="range" id="ctrl-pos-ki" min="0" max="5" value="0.3" step="0.05">
-                <input type="number" id="ctrl-pos-ki-num" min="0" max="5" step="0.05" value="0.3" style="width:60px;background:#223;color:#ddd;border:1px solid #446;border-radius:3px;padding:2px 4px;font-size:12px;">
+                <input type="range" id="ctrl-pos-ki" min="0" max="5" value="0" step="0.05">
+                <input type="number" id="ctrl-pos-ki-num" min="0" max="5" step="0.05" value="0" style="width:60px;background:#223;color:#ddd;border:1px solid #446;border-radius:3px;padding:2px 4px;font-size:12px;">
             </div>
         </div>
         <div class="setting-row">
             <label>Pos Kd</label>
             <div class="controls">
-                <input type="range" id="ctrl-pos-kd" min="0" max="5" value="0.1" step="0.05">
-                <input type="number" id="ctrl-pos-kd-num" min="0" max="5" step="0.05" value="0.1" style="width:60px;background:#223;color:#ddd;border:1px solid #446;border-radius:3px;padding:2px 4px;font-size:12px;">
+                <input type="range" id="ctrl-pos-kd" min="0" max="5" value="0" step="0.05">
+                <input type="number" id="ctrl-pos-kd-num" min="0" max="5" step="0.05" value="0" style="width:60px;background:#223;color:#ddd;border:1px solid #446;border-radius:3px;padding:2px 4px;font-size:12px;">
             </div>
         </div>
         <div class="setting-row">
             <label>Vel Kp</label>
             <div class="controls">
-                <input type="range" id="ctrl-vel-kp" min="0" max="10" value="3.0" step="0.1">
-                <input type="number" id="ctrl-vel-kp-num" min="0" max="10" step="0.1" value="3.0" style="width:60px;background:#223;color:#ddd;border:1px solid #446;border-radius:3px;padding:2px 4px;font-size:12px;">
+                <input type="range" id="ctrl-vel-kp" min="0" max="10" value="1.8" step="0.1">
+                <input type="number" id="ctrl-vel-kp-num" min="0" max="10" step="0.1" value="1.8" style="width:60px;background:#223;color:#ddd;border:1px solid #446;border-radius:3px;padding:2px 4px;font-size:12px;">
             </div>
         </div>
         <div class="setting-row">
             <label>Vel Ki</label>
             <div class="controls">
-                <input type="range" id="ctrl-vel-ki" min="0" max="5" value="1.0" step="0.05">
-                <input type="number" id="ctrl-vel-ki-num" min="0" max="5" step="0.05" value="1.0" style="width:60px;background:#223;color:#ddd;border:1px solid #446;border-radius:3px;padding:2px 4px;font-size:12px;">
+                <input type="range" id="ctrl-vel-ki" min="0" max="5" value="0.4" step="0.05">
+                <input type="number" id="ctrl-vel-ki-num" min="0" max="5" step="0.05" value="0.4" style="width:60px;background:#223;color:#ddd;border:1px solid #446;border-radius:3px;padding:2px 4px;font-size:12px;">
             </div>
         </div>
         <div class="setting-row">
             <label>Vel Kd</label>
             <div class="controls">
-                <input type="range" id="ctrl-vel-kd" min="0" max="5" value="0.05" step="0.01">
-                <input type="number" id="ctrl-vel-kd-num" min="0" max="5" step="0.01" value="0.05" style="width:60px;background:#223;color:#ddd;border:1px solid #446;border-radius:3px;padding:2px 4px;font-size:12px;">
+                <input type="range" id="ctrl-vel-kd" min="0" max="5" value="0.2" step="0.01">
+                <input type="number" id="ctrl-vel-kd-num" min="0" max="5" step="0.01" value="0.2" style="width:60px;background:#223;color:#ddd;border:1px solid #446;border-radius:3px;padding:2px 4px;font-size:12px;">
             </div>
         </div>
         <div class="setting-row">
@@ -941,8 +971,8 @@
         <div class="setting-row">
             <label>Alt Kd</label>
             <div class="controls">
-                <input type="range" id="ctrl-alt-kd" min="0" max="5" value="0.1" step="0.01">
-                <input type="number" id="ctrl-alt-kd-num" min="0" max="5" step="0.01" value="0.1" style="width:60px;background:#223;color:#ddd;border:1px solid #446;border-radius:3px;padding:2px 4px;font-size:12px;">
+                <input type="range" id="ctrl-alt-kd" min="0" max="5" value="0" step="0.01">
+                <input type="number" id="ctrl-alt-kd-num" min="0" max="5" step="0.01" value="0" style="width:60px;background:#223;color:#ddd;border:1px solid #446;border-radius:3px;padding:2px 4px;font-size:12px;">
             </div>
         </div>
 
@@ -962,36 +992,22 @@
             </div>
         </div>
 
-        <h3>SO3 Geometric Controller</h3>
+        <h3>SO3 Hold Controller</h3>
+        <div style="font-size:12px;color:#8aa;margin:-2px 0 8px;line-height:1.4;">
+            Kx/Kv apply only while waiting for a trajectory or holding safely. Active YOPO trajectories use direct acceleration commands.
+        </div>
         <div class="setting-row">
-            <label>Pos Gain (Kx)</label>
+            <label>Position Kx</label>
             <div class="controls">
-                <input type="range" id="so3-kx" min="0.5" max="20" value="6.0" step="0.1">
-                <input type="number" id="so3-kx-num" min="0.5" max="20" step="0.1" value="6.0" style="width:60px;background:#223;color:#ddd;border:1px solid #446;border-radius:3px;padding:2px 4px;font-size:12px;">
+                <span style="font-size:12px;color:#aaa;">XY 5.7 &nbsp;|&nbsp; Y-Up 6.2</span>
             </div>
         </div>
         <div class="setting-row">
-            <label>Vel Gain (Kv)</label>
+            <label>Velocity Kv</label>
             <div class="controls">
-                <input type="range" id="so3-kv" min="0.5" max="15" value="3.5" step="0.1">
-                <input type="number" id="so3-kv-num" min="0.5" max="15" step="0.1" value="3.5" style="width:60px;background:#223;color:#ddd;border:1px solid #446;border-radius:3px;padding:2px 4px;font-size:12px;">
+                <span style="font-size:12px;color:#aaa;">XY 3.4 &nbsp;|&nbsp; Y-Up 4.0</span>
             </div>
         </div>
-        <div class="setting-row">
-            <label>Attitude Gain (KR)</label>
-            <div class="controls">
-                <input type="range" id="so3-kr" min="5" max="200" value="70" step="1">
-                <input type="number" id="so3-kr-num" min="5" max="200" step="1" value="70" style="width:60px;background:#223;color:#ddd;border:1px solid #446;border-radius:3px;padding:2px 4px;font-size:12px;">
-            </div>
-        </div>
-        <div class="setting-row">
-            <label>Omega Damping (K&#937;)</label>
-            <div class="controls">
-                <input type="range" id="so3-komega" min="1" max="30" value="6.0" step="0.1">
-                <input type="number" id="so3-komega-num" min="1" max="30" step="0.1" value="6.0" style="width:60px;background:#223;color:#ddd;border:1px solid #446;border-radius:3px;padding:2px 4px;font-size:12px;">
-            </div>
-        </div>
-
         <h3>Physics</h3>
         <div class="setting-row">
             <label>Mass (g)</label>
@@ -1086,7 +1102,7 @@
                         window.googleTilesFlightStart();
                         return;
                     }
-                    import('./src/main.js?v=20260807-planfull')
+                    import('./src/main.js?v=20260811-control-v6')
                         .then(function (mod) {
                             var start = window.googleTilesFlightStart || mod.startTilesMode;
                             if (typeof start === 'function') start();
@@ -1097,6 +1113,6 @@
             });
         }());
     </script>
-    <script type="module" src="src/main.js?v=20260807-planfull"></script>
+    <script type="module" src="src/main.js?v=20260811-control-v6"></script>
 </body>
 </html>
