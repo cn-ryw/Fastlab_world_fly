@@ -39,22 +39,49 @@ TEXT_SUFFIXES = {
     ".sh", ".toml", ".ts", ".tsx", ".txt", ".yaml", ".yml",
 }
 TEXT_NAMES = {"Dockerfile", "LICENSE", "NOTICE"}
+ROOT = Path(__file__).resolve().parents[1]
+EXPORT_IGNORED_ROOTS = {
+    ".git", ".venv", ".venv-test", "artifacts", "experiment_data",
+    "htmlcov", "logs", "models",
+}
+EXPORT_IGNORED_PREFIXES = {
+    ("asset", "vendor"),
+    ("third_party", "Cesium"),
+    ("third_party", "DA360"),
+}
 
 
 def git_output(*args, binary=False):
-    return subprocess.check_output(["git", *args], text=not binary)
+    return subprocess.check_output(
+        ["git", *args], text=not binary, cwd=ROOT, stderr=subprocess.DEVNULL
+    )
 
 
 def tracked_paths(staged=False):
     command = ("diff", "--cached", "--name-only", "--diff-filter=ACMR") if staged else ("ls-files",)
-    paths = [line for line in git_output(*command).splitlines() if line]
-    return paths if staged else [path for path in paths if Path(path).is_file()]
+    try:
+        paths = [line for line in git_output(*command).splitlines() if line]
+    except subprocess.CalledProcessError:
+        if staged:
+            raise RuntimeError("--staged requires a Git working tree")
+        paths = []
+        for candidate in ROOT.rglob("*"):
+            if not candidate.is_file():
+                continue
+            relative = candidate.relative_to(ROOT)
+            parts = relative.parts
+            if not parts or parts[0] in EXPORT_IGNORED_ROOTS:
+                continue
+            if any(parts[:len(prefix)] == prefix for prefix in EXPORT_IGNORED_PREFIXES):
+                continue
+            paths.append(relative.as_posix())
+    return paths if staged else [path for path in paths if (ROOT / path).is_file()]
 
 
 def file_bytes(path, staged=False):
     if staged:
         return git_output("show", f":{path}", binary=True)
-    with open(path, "rb") as stream:
+    with (ROOT / path).open("rb") as stream:
         return stream.read()
 
 
