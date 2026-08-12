@@ -637,6 +637,7 @@ export class PanoramaSensor {
         this._goalSequence = 0;
         this._goalId = null;
         this._navigationMode = 'idle';
+        this._navigationKind = null;
         this._navigationTransitionReason = 'initialized';
         this._yopoPending = false;
         this._yopoGoal = null;
@@ -731,6 +732,7 @@ export class PanoramaSensor {
         this._planningPauseReason = null;
         this._goalId = null;
         this._navigationMode = 'idle';
+        this._navigationKind = null;
         this._navigationTransitionReason = 'sensor-reset';
         this._yopoGoal = null;
         this._yopoPose = null;
@@ -2639,7 +2641,7 @@ export class PanoramaSensor {
         return true;
     }
 
-    setYopoGoal(goal) {
+    setYopoGoal(goal, navigationKind = 'fixed') {
         if (!goal) {
             this.resetYopoGoal('empty-goal');
             return null;
@@ -2657,12 +2659,24 @@ export class PanoramaSensor {
         this._goalId = `goal-${++this._goalSequence}`;
         this._yopoGoal = Object.freeze({ ...goal });
         this._navigationMode = 'active';
+        this._navigationKind = navigationKind === 't8l-rolling' ? 't8l-rolling' : 'fixed';
         this._navigationTransitionReason = 'goal-set';
         this._minimumRequestFrameId = this._rgbFrameId + 1;
         this._forceNextDepthRequest = true;
         this._lastPlanningPreviewFetchAt = -Infinity;
         this._setDepthState('planning', 'awaiting-new-rgb-frame');
         return this._goalId;
+    }
+
+    /** Update a rolling target without changing the asynchronous session identity. */
+    updateYopoGoal(goal, navigationKind = 't8l-rolling') {
+        const values = [goal?.x, goal?.y, goal?.z].map(Number);
+        if (this._navigationMode !== 'active' || !this._goalId
+            || !values.every(Number.isFinite)) return false;
+        this._yopoGoal = Object.freeze({ x: values[0], y: values[1], z: values[2] });
+        this._navigationKind = navigationKind === 't8l-rolling' ? 't8l-rolling' : 'fixed';
+        this._navigationTransitionReason = 'goal-updated';
+        return true;
     }
 
     resetYopoGoal(reason = 'goal-reset') {
@@ -2677,6 +2691,7 @@ export class PanoramaSensor {
         this._planningPauseReason = null;
         this._goalId = null;
         this._yopoGoal = null;
+        this._navigationKind = null;
         this._navigationMode = reason.includes('arriv') ? 'arrived'
             : reason.includes('cancel') || reason.includes('mode') || reason.includes('reset') ? 'cancelled'
             : 'idle';
@@ -2707,6 +2722,7 @@ export class PanoramaSensor {
     getNavigationSession() {
         return Object.freeze({
             mode: this._navigationMode,
+            kind: this._navigationKind,
             goalId: this._goalId,
             generation: this._yopoGeneration,
             transitionReason: this._navigationTransitionReason,

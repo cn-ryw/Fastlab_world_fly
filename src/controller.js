@@ -23,6 +23,7 @@
 import { editPath } from './path-editor.js';
 import { formatLap } from './gates.js';
 import { reportUserError } from './error-report.js';
+import { T8LSerialInput } from './t8l-serial-input.js';
 
 const ACTIONS = ['roll', 'pitch', 'throttle', 'yaw', 'cameraTilt'];
 const BUTTON_ACTIONS = ['arm', 'modeSwitch'];
@@ -292,8 +293,9 @@ const DEFAULT_BUTTON_MAPPING = {
     // axes) and selects between 'toggle' (rising edge flips state) and 'level'
     // (switch position directly reflects state). Button-source bindings and
     // the keyboard always use edge-based toggle regardless of this field.
-    arm:        { source: 'button', buttonIndex: 0,  axisIndex: -1, axisThreshold: 0.5, inverted: false, triggerMode: 'toggle' },
-    // Unassigned by default — user can bind any channel/button via the settings panel.
+    // Safety-sensitive switches are unassigned by default. The user learns
+    // their actual T8L channel/button explicitly in the settings panel.
+    arm:        { source: 'button', buttonIndex: -1, axisIndex: -1, axisThreshold: 0.5, inverted: false, triggerMode: 'toggle' },
     modeSwitch: { source: 'button', buttonIndex: -1, axisIndex: -1, axisThreshold: 0.5, inverted: false, triggerMode: 'toggle' },
 };
 
@@ -334,6 +336,25 @@ export class Controller {
         this._hidCalibration = Array.from({length: 16}, () => ({ min: null, center: null, max: null }));
         this._hidConnected = false;
         this._hidDeviceName = '';
+
+        // RadioMaster T8L exposes a CDC ACM/Web Serial interface rather than
+        // a Linux joystick on the tested firmware. It owns input whenever its
+        // serial port is open, even during a stale interval, so control never
+        // falls through to an unrelated HID/gamepad.
+        this._t8lSerial = new T8LSerialInput();
+        this._t8lWasFresh = false;
+        this._t8lStaleLatched = false;
+        this._t8lFailsafePending = false;
+        this._inputSource = 'keyboard';
+        this._t8lSerial.addEventListener('connect', () => this._buildSettingsUI());
+        this._t8lSerial.addEventListener('stale', () => {
+            this._t8lFailsafePending = true;
+            this._t8lStaleLatched = true;
+        });
+        this._t8lSerial.addEventListener('disconnect', () => {
+            this._t8lFailsafePending = true;
+            this._buildSettingsUI();
+        });
         
         // Option to disable Gamepad API (allows Chrome WebHID to claim the device)
         this._gamepadApiDisabled = false;
@@ -426,6 +447,7 @@ export class Controller {
      * Call once per frame to poll gamepad and update axes.
      */
     update() {
+        const armedAtFrameStart = this.armed;
         // Reset axes and buttons to 0/false each frame
         for (const action of ACTIONS) {
             this.axes[action] = 0;
@@ -452,19 +474,35 @@ export class Controller {
             this.boost = true;
         }
 
-        // Gamepad input (prefer WebHID if connected)
+        // Device input priority: T8L Serial -> WebHID -> Gamepad. An open but
+        // stale T8L still owns the slot with zero axes until its stream
+        // recovers or the user explicitly disconnects it.
+        const t8l = this._t8lSerial.snapshot();
+        const t8lWasFresh = this._t8lWasFresh;
         const hidAxes = this._getHIDAxes();
         const gp = this._getGamepad();
-        
-        if (hidAxes) {
+        const t8lAxes = t8l.connected ? (t8l.fresh ? t8l.axes : new Array(10).fill(0)) : null;
+        const deviceAxes = t8lAxes || hidAxes;
+        const usingT8l = !!t8lAxes;
+        const deviceControlsFresh = !usingT8l || t8l.fresh;
+        if (t8l.fresh) this._t8lStaleLatched = false;
+        if (t8l.connected && !t8l.fresh && t8l.ageMs > 250 && !this._t8lStaleLatched) {
+            this._t8lFailsafePending = true;
+            this._t8lStaleLatched = true;
+        }
+        if (!t8l.connected) this._t8lStaleLatched = false;
+        this._t8lWasFresh = t8l.fresh;
+
+        if (deviceAxes) {
             // Use WebHID input
             this.connected = true;
-            this.gamepadName = this._hidDeviceName + ' (HID)';
+            this._inputSource = usingT8l ? 't8l-serial' : 'webhid';
+            this.gamepadName = usingT8l ? 'RadioMaster T8L (Serial)' : this._hidDeviceName + ' (HID)';
 
             for (const action of ACTIONS) {
                 const m = this.mapping[action];
-                if (m.axisIndex >= 0 && m.axisIndex < hidAxes.length) {
-                    let val = hidAxes[m.axisIndex];
+                if (m.axisIndex >= 0 && m.axisIndex < deviceAxes.length) {
+                    let val = deviceAxes[m.axisIndex];
                     if (m.inverted) val = -val;
                     this.rawAxes[action] += val;
                     if (Math.abs(val) < m.deadzone) val = 0;
@@ -488,8 +526,9 @@ export class Controller {
             for (const bAction of BUTTON_ACTIONS) {
                 const bm = this.buttonMapping[bAction];
                 let pressed = false;
-                if (bm.source === 'axis' && bm.axisIndex >= 0 && bm.axisIndex < hidAxes.length) {
-                    let v = hidAxes[bm.axisIndex];
+                if (deviceControlsFresh && bm.source === 'axis'
+                    && bm.axisIndex >= 0 && bm.axisIndex < deviceAxes.length) {
+                    let v = deviceAxes[bm.axisIndex];
                     if (bm.inverted) v = -v;
                     pressed = v > bm.axisThreshold;
                 }
@@ -501,8 +540,8 @@ export class Controller {
                 let maxDelta = 0;
                 let bestAxis = -1;
                 let bestSign = 1;
-                for (let i = 0; i < hidAxes.length; i++) {
-                    const delta = hidAxes[i] - this._listenBaseline[i];
+                for (let i = 0; i < deviceAxes.length; i++) {
+                    const delta = deviceAxes[i] - this._listenBaseline[i];
                     if (Math.abs(delta) > Math.abs(maxDelta)) {
                         maxDelta = delta;
                         bestAxis = i;
@@ -524,9 +563,11 @@ export class Controller {
             }
 
             // Update HID display
-            this._updateHIDDisplay(hidAxes);
+            if (usingT8l) this._updateT8LDisplay(t8l);
+            else this._updateHIDDisplay(hidAxes);
         } else if (gp) {
             this.connected = true;
+            this._inputSource = 'gamepad';
             this.gamepadName = gp.id;
 
             for (const action of ACTIONS) {
@@ -629,6 +670,7 @@ export class Controller {
             this._updateGamepadDisplay(gp);
         } else {
             this.connected = false;
+            this._inputSource = 'keyboard';
         }
 
         // Keyboard buttons. The mode-switch key (M) is suppressed while the
@@ -652,12 +694,11 @@ export class Controller {
         const kbResetRising  = kbReset      && !this._prevKbButtons.reset;
         const kbModeRising   = kbModeSwitch && !this._prevKbButtons.modeSwitch;
 
-        // Suppress rising-edges on the frame the input device becomes
-        // connected so a switch already held in its “pressed” position at
-        // startup / hot-reconnect does not spuriously fire arm or modeSwitch.
-        // Level-mode bindings are exempt because their whole purpose is to
-        // reflect the switch position at all times, including on load.
-        const justConnected = this.connected && !this._wasConnected;
+        // Suppress switch transitions on the first valid frame after connect
+        // or stale-link recovery. A held switch must not arm or change mode
+        // just because channel data resumed.
+        const justConnected = (this.connected && !this._wasConnected)
+            || (usingT8l && t8l.fresh && !t8lWasFresh);
         this._wasConnected = this.connected;
 
         // A binding is "level-mode active" only when it is an axis source
@@ -688,7 +729,7 @@ export class Controller {
         // suppresses the first-frame phantom edge on hot-reconnect so a
         // switch sitting in its active position at connect time doesn't
         // spuriously override the current armed state.
-        if (armAxisLevel && this.connected) {
+        if (armAxisLevel && this.connected && deviceControlsFresh) {
             const gpArmChanged = this._gpButtons.arm !== this._prevGpButtons.arm;
             if (!justConnected && gpArmChanged) this.armed = this._gpButtons.arm;
         } else if (!justConnected && gpArmRising) {
@@ -696,10 +737,12 @@ export class Controller {
         }
 
         // Gamepad / HID mode switch — same transition semantics as arm above.
-        if (modeAxisLevel && this.connected) {
+        if (modeAxisLevel && this.connected && deviceControlsFresh) {
             const gpModeChanged = this._gpButtons.modeSwitch !== this._prevGpButtons.modeSwitch;
             if (!justConnected && gpModeChanged) {
-                const targetMode = this._gpButtons.modeSwitch ? 'fpv' : 'drone';
+                const targetMode = usingT8l
+                    ? (this._gpButtons.modeSwitch ? 'so3' : 'drone')
+                    : (this._gpButtons.modeSwitch ? 'fpv' : 'drone');
                 if (this._currentMode !== targetMode) {
                     const ms = document.getElementById('flight-mode-select');
                     if (ms) ms.value = targetMode;
@@ -716,6 +759,20 @@ export class Controller {
         this._prevKbButtons.reset      = kbReset;
         this._prevKbButtons.modeSwitch = kbModeSwitch;
 
+        const t8lFailsafeTriggered = this._t8lFailsafePending;
+        this._t8lFailsafePending = false;
+        if (t8lFailsafeTriggered) {
+            // Link loss is a safety boundary. Do not let a fallback device or
+            // keyboard edge alter arming or inject one frame of motion while
+            // main.js cancels navigation and enters SO3 position hold.
+            this.armed = armedAtFrameStart;
+            for (const action of ACTIONS) {
+                this.axes[action] = 0;
+                this.rawAxes[action] = 0;
+            }
+            this._cameraTiltKeyboard = 0;
+            this._cameraTiltAxis = 0;
+        }
         return {
             roll: this.axes.roll,
             pitch: this.axes.pitch,
@@ -741,6 +798,15 @@ export class Controller {
             boost: this.boost,
             armed: this.armed,
             resetTriggered: kbResetRising,
+            inputSource: this._inputSource,
+            t8l: Object.freeze({
+                connected: t8l.connected,
+                fresh: t8l.fresh,
+                ageMs: t8l.ageMs,
+                rawChannels: Object.freeze([...t8l.rawChannels]),
+                axes: Object.freeze([...t8l.axes]),
+                failsafeTriggered: t8lFailsafeTriggered,
+            }),
             rates: {
                 roll:  this.mapping.roll.rate  !== undefined ? this.mapping.roll.rate  : 1.0,
                 pitch: this.mapping.pitch.rate !== undefined ? this.mapping.pitch.rate : 1.0,
@@ -750,6 +816,13 @@ export class Controller {
     }
 
     startListening(action, callback) {
+        const t8l = this._t8lSerial.snapshot();
+        if (t8l.connected && t8l.fresh) {
+            this._listenAction = action;
+            this._listenCallback = callback;
+            this._listenBaseline = [...t8l.axes];
+            return true;
+        }
         // Support both Gamepad API and WebHID
         if (this._hidConnected) {
             this._listenAction = action;
@@ -1539,6 +1612,36 @@ export class Controller {
         }
     }
 
+    async connectT8L() {
+        try {
+            await this._t8lSerial.connect();
+            this._buildSettingsUI();
+            return true;
+        } catch (error) {
+            reportUserError('T8L serial connection failed', error, {
+                key: 't8l-serial-connect', intervalMs: 3000,
+            });
+            return false;
+        }
+    }
+
+    async disconnectT8L() {
+        await this._t8lSerial.disconnect('user-disconnect');
+        this._buildSettingsUI();
+    }
+
+    getT8LSnapshot() {
+        return this._t8lSerial.snapshot();
+    }
+
+    setFlightMode(mode) {
+        if (!_validMode(mode) || this._currentMode === mode) return false;
+        const select = document.getElementById('flight-mode-select');
+        if (select) select.value = mode;
+        this._onModeSwitch(mode);
+        return true;
+    }
+
     _getHIDAxes() {
         return this._hidConnected ? this._hidAxes : null;
     }
@@ -1741,11 +1844,14 @@ export class Controller {
                         b.textContent = b._origText || 'Assign';
                     });
 
+                    const t8l = this._t8lSerial.snapshot();
+                    const viaT8l = t8l.connected && t8l.fresh;
                     const viaHid = this._hidConnected;
                     const onAxis = (a, axisIdx, inverted) => {
                         bm.source = 'axis';
                         bm.axisIndex = axisIdx;
                         bm.inverted = inverted;
+                        if (viaT8l) bm.triggerMode = 'level';
                         this._saveConfig();
                         this._buildSettingsUI();
                     };
@@ -1758,7 +1864,7 @@ export class Controller {
                     };
 
                     let started;
-                    if (viaHid) {
+                    if (viaT8l || viaHid) {
                         // HID has no button concept; axis-listen only.
                         started = this.startListening(bAction, onAxis);
                     } else {
@@ -1772,7 +1878,7 @@ export class Controller {
 
                     if (started) {
                         assignBtn2.classList.add('listening');
-                        assignBtn2.textContent = viaHid ? 'Flick…' : 'Press / Move…';
+                        assignBtn2.textContent = (viaT8l || viaHid) ? 'Flick…' : 'Press / Move…';
                     } else {
                         alert('No gamepad or HID device detected.');
                     }
@@ -1855,6 +1961,16 @@ export class Controller {
         const statusEl = document.getElementById('gamepad-status');
         if (statusEl) {
             let statusHtml = '';
+            const t8l = this._t8lSerial.snapshot();
+            if (t8l.connected) {
+                const freshness = t8l.fresh
+                    ? `<span style="color:#4f4;">fresh · ${t8l.frameRateHz.toFixed(1)} Hz</span>`
+                    : `<span style="color:#f44;">stale · ${Number.isFinite(t8l.ageMs) ? Math.round(t8l.ageMs) + ' ms' : 'no frames'}</span>`;
+                statusHtml += `<div style="margin-bottom:8px;"><span style="color:#4af;">T8L Serial Connected</span> · ${freshness}`
+                    + `<button id="disconnect-t8l-btn" style="margin-left:12px;padding:4px 12px;background:#533;border:1px solid #f44;color:#f44;border-radius:4px;cursor:pointer;font-size:12px;">Disconnect T8L</button></div>`;
+            } else {
+                statusHtml += `<div style="margin-bottom:8px;"><button id="connect-t8l-btn" style="padding:4px 12px;background:#335;border:1px solid #4af;color:#4af;border-radius:4px;cursor:pointer;font-size:12px;">Connect T8L Serial</button></div>`;
+            }
             
             // Disable Gamepad API checkbox
             const disabledChecked = this._gamepadApiDisabled ? 'checked' : '';
@@ -1894,6 +2010,9 @@ export class Controller {
             }
             
             statusEl.innerHTML = statusHtml;
+
+            document.getElementById('connect-t8l-btn')?.addEventListener('click', () => this.connectT8L());
+            document.getElementById('disconnect-t8l-btn')?.addEventListener('click', () => this.disconnectT8L());
             
             // Bind disable checkbox
             const disableCheckbox = document.getElementById('disable-gamepad-api');
@@ -2174,6 +2293,24 @@ export class Controller {
                 `</div>` +
                 `<span style="width:70px;text-align:right;font-size:11px;font-family:monospace;color:${mag > 0.01 ? '#4f4' : '#666'};">${val >= 0 ? '+' : ''}${val.toFixed(4)}</span>` +
                 `</div>`;
+        }
+        el.innerHTML = html;
+    }
+
+    _updateT8LDisplay(snapshot) {
+        const el = document.getElementById('gamepad-axes-display');
+        if (!el) return;
+        let html = `<div style="color:#4af;margin-bottom:8px;font-size:12px;">T8L Web Serial · ${snapshot.fresh ? snapshot.frameRateHz.toFixed(1) + ' Hz' : 'STALE'}</div>`;
+        for (let i = 0; i < Math.min(10, snapshot.axes.length); i++) {
+            const value = snapshot.axes[i];
+            const pct = ((value + 1) / 2) * 100;
+            const color = snapshot.fresh && Math.abs(value) > 0.01 ? '#4af' : '#335';
+            html += `<div style="display:flex;align-items:center;gap:4px;margin-bottom:3px;">`
+                + `<span style="width:30px;text-align:right;color:#aaa;">CH${i + 1}</span>`
+                + `<div style="flex:1;height:12px;background:#223;border-radius:3px;position:relative;overflow:hidden;">`
+                + `<div style="position:absolute;left:50%;width:1px;height:100%;background:#555;"></div>`
+                + `<div style="position:absolute;left:${Math.min(pct, 50)}%;width:${Math.abs(pct - 50)}%;height:100%;background:${color};"></div></div>`
+                + `<span style="width:92px;text-align:right;font:11px monospace;color:#aaa;">${snapshot.rawChannels[i]} · ${value >= 0 ? '+' : ''}${value.toFixed(3)}</span></div>`;
         }
         el.innerHTML = html;
     }

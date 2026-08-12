@@ -58,6 +58,27 @@ assert(
         'retargeting preserves the actual velocity state');
 }
 
+// A rolling target update keeps the current Poly5 and never enters the fixed
+// waypoint arrival state, even when its moving target is inside 4 m.
+{
+    const drone = new Drone();
+    drone.x = 0; drone.y = 10; drone.z = 0;
+    drone.flightMode = 'so3';
+    drone._prevFlightMode = 'so3';
+    drone.setIdealGoal({ x: 8, y: 10, z: 0 });
+    assert(drone.setYopoTrajectory(
+        [4, 0, 0, 10, 0, 0, 0, 0, 0],
+        1.125,
+    ) === true, 'rolling test precondition trajectory accepted');
+    const trajectory = drone._yopoPolyX;
+    assert(drone.updateRollingGoal({ x: 1, y: 10, z: 0 }) === true,
+        'rolling goal update is accepted');
+    assert(drone._yopoPolyX === trajectory,
+        'same-session rolling update preserves the executing Poly5');
+    for (let step = 0; step < 100; step++) drone.update(0.005, { armed: true }, null);
+    assert(drone._idealGoal !== null, 'rolling goal does not use fixed-waypoint arrived cleanup');
+}
+
 for (const distance of [3.9, 4.1, 8.9]) {
     const drone = new Drone();
     drone.x = 0; drone.y = 10; drone.z = 0;

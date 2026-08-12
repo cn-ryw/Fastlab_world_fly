@@ -252,6 +252,7 @@ export class Drone {
 
         // ---- Ideal controller state ----
         this._idealGoal = null;      // {x,y,z,yaw} or null
+        this._navigationKind = null; // fixed | t8l-rolling | null
         this._arrivalDistanceM = ARRIVAL_DISTANCE_M;
         this._terminalPhase = 'idle';
         this._terminalSettledTimeS = 0;
@@ -634,6 +635,7 @@ export class Drone {
         // goal while the next perception response is still in flight.
         this._clearYopoMotionState();
         this._idealGoal = goal ? { x: goal.x, y: goal.y, z: goal.z, yaw: goal.yaw } : null;
+        this._navigationKind = goal ? 'fixed' : null;
         this._resetTerminalNavigation(goal ? 'approach' : 'idle');
         this._so3FixedYaw = goal ? this.yaw : null;
         this._so3YawSetpointDeg = this.yaw;
@@ -649,6 +651,24 @@ export class Drone {
         this.setIdealGoal(null);
     }
 
+    /** Move a teleoperation target without invalidating the active YOPO Poly5. */
+    updateRollingGoal(goal) {
+        const values = [goal?.x, goal?.y, goal?.z].map(Number);
+        if (!values.every(Number.isFinite)) return false;
+        const terminalOwnsMotion = this._terminalPhase === 'terminal-track'
+            || this._terminalPhase === 'terminal-decelerating'
+            || this._terminalPhase === 'settling';
+        if (terminalOwnsMotion) this._abortTerminalNavigation('rolling-goal-updated');
+        this._idealGoal = { x: values[0], y: values[1], z: values[2], yaw: goal?.yaw };
+        this._navigationKind = 't8l-rolling';
+        this._terminalPhase = 'approach';
+        this._goalReached = false;
+        this._goalReachedSimTimeS = null;
+        this._navigationState = 'active';
+        this._navigationTransitionReason = 'rolling-goal-updated';
+        return true;
+    }
+
     _clearYopoMotionState() {
         this._yopoPlanTriggered = false;
         this._trajectory.clear('motion-cleared');
@@ -658,6 +678,7 @@ export class Drone {
     /** Cancel current waypoint without teleporting physical velocity. */
     cancelWaypoint() {
         this._idealGoal = null;
+        this._navigationKind = null;
         this._clearYopoMotionState();
         this._resetTerminalNavigation('idle');
         this._replanRequested = false;
@@ -976,6 +997,7 @@ export class Drone {
         // 清除所有导航/轨迹状态 —— reset 可能发生在重选出生点后，
         // 旧坐标系下的多项式、目标、高度参考在新坐标系里毫无意义。
         this._idealGoal = null;
+        this._navigationKind = null;
         this._trajectory.clear('reset');
         this._yopoPlanTriggered = false;
         this._navigationState = 'idle';
@@ -1092,6 +1114,7 @@ export class Drone {
         this._replanRequested = false;
         this._yopoPlanTriggered = false;
         this._idealGoal = null;
+        this._navigationKind = null;
         this._terminalPhase = 'arrived';
         this._terminalSettledTimeS = ARRIVAL_SETTLE_TIME_S;
         this._navigationState = 'arrived';
@@ -1102,7 +1125,8 @@ export class Drone {
         if (!this._idealGoal
             || this.flightMode !== 'so3'
             || !armed
-            || !this._yopoPlanTriggered) {
+            || !this._yopoPlanTriggered
+            || this._navigationKind === 't8l-rolling') {
             return;
         }
 

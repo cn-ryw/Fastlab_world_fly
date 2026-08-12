@@ -63,6 +63,20 @@ third_party/DA360/checkpoints/DA360_large.pth
 4. 选择视角并进入飞行。
 5. SO3 模式下按住 `G` 点击场景或雷达设置目标；`G`+滚轮修改目标高度；`C` 取消。
 
+### T8L 串口遥控
+
+RadioMaster T8L 以 VCP 模式接入后，先运行 `./launch.sh --input-status` 检查设备；若提示权限不足，运行一次
+`./launch.sh --setup-input`，重新插拔遥控器（新增用户组后可能需要重新登录）。使用 Chrome/Chromium 打开
+`127.0.0.1` 页面，在 Settings 中点击 **Connect T8L** 并在浏览器设备选择器中选中 RadioMaster。
+
+- 默认 CH1/CH2/CH3/CH4 为 Roll/Pitch/Throttle/Yaw；通道映射、反向、死区、Rate/Expo 继续在 Settings 中配置。
+- Arm 和 Mode 默认不绑定。点击对应的 Assign 后拨动开关完成学习；T8L 开关自动使用 level 模式，避免首帧误触。
+- Mode 低位为 Easy，高位为 SO3。SO3 中 CH1/CH2 按 YOPO 遥控算法持续移动黄色 8 m 航点，高度保持为无人机当前高度。
+- 250 ms 未收到合法串口帧会清除活动航点和旧轨迹、强制 SO3 原地悬停，但保留当前解锁状态；物理断开后需要再次点击 Connect T8L。
+
+串口参数固定为 460800 baud，识别 VID/PID `19f5:5740`；当前稳定设备名通常为
+`/dev/serial/by-id/usb-RADIOMASTER_RadioMaster_T8L_RADIOMASTER-if00`。Web Serial 必须运行在 localhost 或 HTTPS 安全上下文中。
+
 到达阈值为 **4.0m**，来自权威 YOPO `traj_opt.yaml`。`radio_range` 不是到达距离。
 终端候选不会被目标点直线环截断，而是沿原 Poly5 执行到底；随后须在无碰撞条件下将三维速度降到
 0.75m/s以内并连续稳定0.4s，才报告 arrived。

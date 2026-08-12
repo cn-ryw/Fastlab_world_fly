@@ -19,19 +19,20 @@
  * Main entry point for the Google 3D Tiles flight mode.
  *
  * Rendering is Cesium + Google Photorealistic 3D Tiles. Flight dynamics,
- * controller mapping, WebHID/Gamepad support, HUD and OSD are retained
+ * controller mapping, T8L Web Serial/WebHID/Gamepad support, HUD and OSD are retained
  * from the original simulator.
  */
 
 import { CesiumWorld } from './cesium-world.js?v=20260703-panorama-tile-idle';
 import { TilesCollisionProvider } from './tiles-collision.js';
-import { Controller } from './controller.js?v=20260811-control-v6';
-import { Drone } from './drone.js?v=20260811-control-v6';
+import { Controller } from './controller.js?v=20260812-t8l';
+import { Drone } from './drone.js?v=20260812-t8l';
 import { HUD } from './hud.js?v=20260811-control-v6';
 import { OSD } from './osd.js?v=20260811-control-v6';
-import { PanoramaSensor } from './panorama-sensor.js?v=20260811-control-v6';
-import { FlightLogger } from './flight-logger.js?v=20260807';
+import { PanoramaSensor } from './panorama-sensor.js?v=20260812-t8l';
+import { FlightLogger } from './flight-logger.js?v=20260812-t8l';
 import { reportUserError } from './error-report.js';
+import { computeT8LRollingGoal } from './t8l-rolling-goal.js?v=20260812';
 import { FixedStepScheduler } from './fixed-step-scheduler.js?v=20260811';
 import {
     drawDepthTopdown,
@@ -89,6 +90,12 @@ const VIEW_CHOICE_HINT_HTML = '1 / O: First Person &nbsp;|&nbsp; 2: Third Person
 const MAX_PLACEMENT_FRAME_DT = 0.05;
 const SETTINGS_READ_INTERVAL_MS = 100;
 const DEPTH_TOPDOWN_MAX_AGE_MS = 250;
+const T8L_ROLLING_GOAL_INTERVAL_MS = 50;
+
+const t8lRollingNavigation = {
+    active: false,
+    lastUpdateAt: -Infinity,
+};
 
 const flightControlScheduler = new FixedStepScheduler();
 
@@ -648,7 +655,7 @@ function setupFlightGoalClickHandler() {
     }};
 }
 
-function beginNavigationSession(goal) {
+function beginNavigationSession(goal, navigationKind = 'fixed') {
     if (!goal || !drone || !panoramaSensor) return null;
     if (flightLogger?.recording || panoramaSensor.getDepthState().goalId) {
         finishNavigationSession('goal-changed', {
@@ -659,16 +666,57 @@ function beginNavigationSession(goal) {
             arrived: false,
         });
     }
-    drone.setIdealGoal(goal);
+    if (navigationKind === 't8l-rolling') {
+        // A rolling session starts a new request generation. Clear any Poly5
+        // inherited from a previous fixed goal once, then keep later rolling
+        // updates inside this same session without interrupting its trajectory.
+        drone.setIdealGoal(goal);
+        drone.updateRollingGoal(goal);
+    } else {
+        drone.setIdealGoal(goal);
+    }
     world?.showGoalMarker(goal);
     // 目标高度即 YOPO 的高度平面，服务端会把轨迹末端拉到该平面。
-    const goalId = panoramaSensor.setYopoGoal(goal);
+    const goalId = panoramaSensor.setYopoGoal(goal, navigationKind);
     const navigation = panoramaSensor.getDepthState();
     flightLogger?.start(goal, spawnAltitudeMeters, {
         goalId,
         generation: navigation.generation,
+        kind: navigationKind,
     });
     return goalId;
+}
+
+function stopT8LRollingNavigation(reason) {
+    if (!t8lRollingNavigation.active) return;
+    t8lRollingNavigation.active = false;
+    t8lRollingNavigation.lastUpdateAt = -Infinity;
+    finishNavigationSession(reason, { cancelDrone: true, arrived: false });
+}
+
+function updateT8LRollingNavigation(input, now) {
+    const eligible = input?.t8l?.connected && input.t8l.fresh && input.armed
+        && drone?.flightMode === 'so3' && mode === 'flight';
+    if (!eligible) {
+        stopT8LRollingNavigation(input?.t8l?.fresh ? 't8l-inactive' : 't8l-link-lost');
+        return;
+    }
+    if (now - t8lRollingNavigation.lastUpdateAt < T8L_ROLLING_GOAL_INTERVAL_MS) return;
+    t8lRollingNavigation.lastUpdateAt = now;
+    const goal = computeT8LRollingGoal(
+        { x: drone.x, y: drone.y, z: drone.z },
+        input.t8l.axes,
+    );
+    if (!goal) return;
+    if (!t8lRollingNavigation.active) {
+        beginNavigationSession(goal, 't8l-rolling');
+        t8lRollingNavigation.active = true;
+    } else {
+        drone.updateRollingGoal(goal);
+        panoramaSensor.updateYopoGoal(goal, 't8l-rolling');
+        world?.showGoalMarker(goal);
+        flightLogger?.updateGoal(goal);
+    }
 }
 
 async function enterPlacementMode(autoPick = false) {
@@ -1047,6 +1095,12 @@ function updateFlight(dt) {
 
     const now = performance.now();
     const input = controller.update();
+    if (input.t8l?.failsafeTriggered) {
+        controller.setFlightMode('so3');
+        drone.readSettings();
+        t8lRollingNavigation.active = false;
+        finishNavigationSession('t8l-link-lost', { cancelDrone: true, arrived: false });
+    }
     const modeSelect = document.getElementById('flight-mode-select');
     if (
         now - lastSettingsReadTime >= SETTINGS_READ_INTERVAL_MS ||
@@ -1055,6 +1109,7 @@ function updateFlight(dt) {
         drone.readSettings();
         lastSettingsReadTime = now;
     }
+    updateT8LRollingNavigation(input, now);
     if (input.resetTriggered) {
         finishNavigationSession('reset', { cancelDrone: true, arrived: false });
         resetFlightControlClock();
@@ -1405,6 +1460,8 @@ function setupThirdPersonPointerControls() {
 }
 
 function finishNavigationSession(reason, { cancelDrone = false, arrived = false } = {}) {
+    t8lRollingNavigation.active = false;
+    t8lRollingNavigation.lastUpdateAt = -Infinity;
     flightLogger?.stop(arrived);
     if (cancelDrone) drone?.cancelWaypoint();
     panoramaSensor?.resetYopoGoal(reason);

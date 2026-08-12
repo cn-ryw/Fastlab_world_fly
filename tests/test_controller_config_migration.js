@@ -82,7 +82,7 @@ assert(damaged.settings['flight-mode-select'] === 'drone', 'invalid saved mode s
 assert(damaged.mapping.roll.axisIndex === 0 && damaged.mapping.roll.inverted === false, 'damaged axis mapping uses safe defaults');
 assert(damaged.mapping.roll.rate === 10 && damaged.mapping.roll.expo === 0, 'finite mapping ranges are clamped');
 assert(damaged.mapping.pitch.axisIndex === 1, 'non-object mapping action uses its default');
-assert(damaged.buttonMapping.arm.source === 'button' && damaged.buttonMapping.arm.buttonIndex === 0, 'damaged button binding uses defaults');
+assert(damaged.buttonMapping.arm.source === 'button' && damaged.buttonMapping.arm.buttonIndex === -1, 'damaged arm binding fails safe to unassigned');
 assert(damaged.hidCalibration.length === 16 && damaged.hidCalibration[0].min === null, 'invalid HID calibration is cleared safely');
 assert(damaged.modeRateExpo.fpv.roll.rate === 1, 'invalid per-mode rate falls back safely');
 assert(damaged.modePidSettings.drone['ctrl-pos-kp'] === '0.95', 'non-finite PID falls back to v6 default');

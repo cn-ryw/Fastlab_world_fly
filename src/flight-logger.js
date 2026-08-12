@@ -234,6 +234,7 @@ export class FlightLogger {
         this._physicsUpdateIntervals = [];
         this._lastPhysicsUpdateAt = null;
         this._navigationIdentity = null;
+        this._navigationKind = null;
         this._crossSessionPerceptionDropped = 0;
     }
 
@@ -264,8 +265,15 @@ export class FlightLogger {
                 generation: String(navigation.generation),
             })
             : null;
+        this._navigationKind = navigation?.kind === 't8l-rolling' ? 't8l-rolling' : 'fixed';
         this._crossSessionPerceptionDropped = 0;
         console.log('[FlightLog] recording started, goal:', goal);
+    }
+
+    updateGoal(goal) {
+        if (!this._recording || !goal) return;
+        const values = [goal.x, goal.y, goal.z].map(Number);
+        if (values.every(Number.isFinite)) this._goal = { x: values[0], y: values[1], z: values[2] };
     }
 
     /** 记录一次已返回给 UI 的深度预览延迟；规划吞吐以 uniquePlanningHz 为准。 */
@@ -362,6 +370,12 @@ export class FlightLogger {
             thrust:     Math.round(drone.thrustOutput || 0),
             groundSpeed: Math.round((drone.groundSpeed || 0) * 100) / 100,
             mode: drone.flightMode || '',
+            navigationKind: this._navigationKind,
+            activeGoal: drone._idealGoal ? {
+                x: roundedFinite(drone._idealGoal.x),
+                y: roundedFinite(drone._idealGoal.y),
+                z: roundedFinite(drone._idealGoal.z),
+            } : null,
             control,
             scheduler: schedule ? {
                 steps: Number(schedule.steps) || 0,
@@ -494,6 +508,7 @@ export class FlightLogger {
             spawnAltitude: this._spawnAlt,
             goal: this._goal,
             navigationSession: this._navigationIdentity,
+            navigationKind: this._navigationKind,
             frameCount: this._frames.length,
             duration_s: Math.round(duration * 100) / 100,
             arrived,

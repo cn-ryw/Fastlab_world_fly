@@ -152,6 +152,41 @@ function newSensorWithFrame() {
     return sensor;
 }
 
+// Rolling updates mutate only the target. They retain the request identity,
+// and a request already in flight owns an immutable goal snapshot.
+{
+    const sensor = newSensorWithFrame();
+    sensor.setYopoPose({
+        actualState: {
+            position: { x: 0, y: 10, z: 0 },
+            velocity: { x: 0, y: 0, z: 0 },
+        },
+        referenceState: {
+            position: { x: 0, y: 10, z: 0 },
+            velocity: { x: 0, y: 0, z: 0 },
+            acceleration: { x: 0, y: 0, z: 0 },
+        },
+        yaw: 0,
+    }, 0);
+    const firstGoal = { x: 8, y: 10, z: 0 };
+    sensor.setYopoGoal(firstGoal, 't8l-rolling');
+    const before = sensor.getNavigationSession();
+    const pending = sensor._requestDepth(sensor.rgbCanvas);
+    assert.deepEqual(sensor._activeDepthRequest.goal, firstGoal,
+        'request freezes the rolling target present at request start');
+
+    assert.equal(sensor.updateYopoGoal({ x: -8, y: 10, z: 0 }), true);
+    const after = sensor.getNavigationSession();
+    assert.equal(after.goalId, before.goalId, 'rolling update retains goalId');
+    assert.equal(after.generation, before.generation, 'rolling update retains generation');
+    assert.equal(after.kind, 't8l-rolling');
+    assert.deepEqual(sensor._activeDepthRequest.goal, firstGoal,
+        'later rolling updates cannot mutate an in-flight request snapshot');
+
+    sensor.resetYopoGoal('test-cancel');
+    assert.equal(await pending, false, 'cancel rejects the old asynchronous request');
+}
+
 // request-started is UI-only and repeated terminal states are coalesced so
 // Firefox DevTools is not flooded at perception rate. Distinct terminal,
 // error, stale, blocked, and rejected states remain visible.
