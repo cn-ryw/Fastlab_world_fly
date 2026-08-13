@@ -2399,6 +2399,8 @@ for (const transition of ['profile-switch', 'goal-set']) {
     globalThis.fetch = async url => {
         planningFetches++;
         assert.match(String(url), /\/yopo\/plan_full\?/);
+        assert.equal(new URL(String(url)).searchParams.has('unknown_faces'), false,
+            'live planning must send captured RGB without a face-wide obstacle mask');
         return response({
             frame_id: String(sensor._rgbFrameContext.frameId),
             goal_id: sensor._goalId,

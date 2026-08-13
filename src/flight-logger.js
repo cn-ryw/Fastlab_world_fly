@@ -1,4 +1,4 @@
-import { demoPerformance } from './demo-performance.js?v=20260813-panorama-unknown-mask-r7';
+import { demoPerformance } from './demo-performance.js?v=20260813-perf-singleton-r13';
 
 /**
  * Flight data logger — records pose, velocity, goal, and controller state

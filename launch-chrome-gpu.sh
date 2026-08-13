@@ -3,7 +3,7 @@
 set -Eeuo pipefail
 
 readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-readonly DEFAULT_URL='http://127.0.0.1:8080/?panoProfile=flight&perfProfile=demo30&tileRequestsPerServer=12&panoPreloadRequired=0&flightPreloadRadius=300&flightPreloadViewTimeoutMs=30000&flightPreloadViewAttempts=2'
+readonly DEFAULT_URL='http://127.0.0.1:8080/?panoProfile=flight&perfProfile=demo30&tileRequestsPerServer=12&panoramaTileSse=256&panoPreloadRequired=0&flightPreloadRadius=300&flightPreloadViewTimeoutMs=30000&flightPreloadViewAttempts=2'
 readonly DEFAULT_LOG_FILE="${SCRIPT_DIR}/.dev-chrome.log"
 
 info() { printf '[chrome-gpu] %s\n' "$*"; }

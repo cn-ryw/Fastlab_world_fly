@@ -30,7 +30,7 @@
 
 import { formatError, reportUserError } from './error-report.js';
 import { erpDirectionToComponent, sampleAnchorDirections } from './erp-geometry.js';
-import { demoPerformance } from './demo-performance.js?v=20260813-panorama-unknown-mask-r7';
+import { demoPerformance } from './demo-performance.js?v=20260813-perf-singleton-r13';
 
 const DEFAULT_ION_TOKEN = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJqdGkiOiJlMTg2MGFhOS02YTdhLTQ1NWMtYjkzMi05YjQ2ODRlZjI5YTgiLCJpZCI6MjUxNzM1LCJpYXQiOjE3MzAyODI0ODN9.prWAxx4RB8teelutQQbVqdxhgRZpZ4zjw8wzM-8k1Ug';
 const DEFAULT_ASSET_ID = 2275207;
@@ -460,17 +460,12 @@ export class CesiumWorld {
             8192,
             2048
         ));
+        const defaultPanoramaTileSSE = demoPerformance.config.profile === 'demo30' ? 256 : 512;
         this.panoramaTileSSE = clampNumber(
-            urlNumber('panoramaTileSse', options.panoramaTileSSE ?? 512),
+            urlNumber('panoramaTileSse', options.panoramaTileSSE ?? defaultPanoramaTileSSE),
             4,
             1024,
-            512
-        );
-        this.panoramaPreloadTileSSE = clampNumber(
-            urlNumber('panoramaPreloadTileSse', options.panoramaPreloadTileSSE ?? 256),
-            4,
-            512,
-            256
+            defaultPanoramaTileSSE
         );
         // The hidden 96 px capture faces are used for local obstacle sensing,
         // not a globe-scale horizon. A finite far plane materially reduces the
@@ -1648,39 +1643,39 @@ export class CesiumWorld {
         return this.waitForTilesIdle(timeoutMs, quietMs);
     }
 
-    _configurePanoramaTileset(tileset, preloadMode = false) {
+    _configurePanoramaTileset(tileset) {
         if (!tileset) return;
 
         const setIfPresent = (key, value) => {
             if (key in tileset) tileset[key] = value;
         };
-        const leanStreaming = !preloadMode && this.panoramaLeanStreaming;
+        const baselineProfile = demoPerformance.config.profile === 'baseline';
+        const leanStreaming = baselineProfile && this.panoramaLeanStreaming;
 
-        setIfPresent(
-            'maximumScreenSpaceError',
-            preloadMode ? this.panoramaPreloadTileSSE : this.panoramaTileSSE,
-        );
+        setIfPresent('maximumScreenSpaceError', this.panoramaTileSSE);
         setIfPresent('cullRequestsWhileMoving', false);
-        setIfPresent('preloadWhenHidden', preloadMode || !leanStreaming);
-        setIfPresent('preloadFlightDestinations', preloadMode || !leanStreaming);
+        setIfPresent('preloadWhenHidden', baselineProfile && !leanStreaming);
+        setIfPresent('preloadFlightDestinations', baselineProfile && !leanStreaming);
         setIfPresent('foveatedScreenSpaceError', false);
         setIfPresent(
             'dynamicScreenSpaceError',
-            !preloadMode && demoPerformance.config.dynamicSse !== 'off',
+            demoPerformance.config.dynamicSse !== 'off',
         );
         setIfPresent('dynamicScreenSpaceErrorDensity', 0.004);
         setIfPresent('dynamicScreenSpaceErrorFactor', 12);
-        setIfPresent('loadSiblings', preloadMode || !leanStreaming);
-        setIfPresent('skipLevelOfDetail', leanStreaming);
-        setIfPresent('baseScreenSpaceError', leanStreaming ? 1536 : 512);
-        setIfPresent('skipScreenSpaceErrorFactor', leanStreaming ? 18 : 8);
-        setIfPresent('skipLevels', leanStreaming ? 2 : 0);
-        setIfPresent('immediatelyLoadDesiredLevelOfDetail', preloadMode || !leanStreaming);
-        setIfPresent('preferLeaves', preloadMode || !leanStreaming);
+        // demo30 uses normal parent-first replacement refinement. A coarse
+        // parent remains visible until its children arrive, avoiding blank
+        // blocks without expanding requests to siblings or hidden views.
+        setIfPresent('loadSiblings', baselineProfile && !leanStreaming);
+        setIfPresent('skipLevelOfDetail', baselineProfile && leanStreaming);
+        setIfPresent('baseScreenSpaceError', baselineProfile && leanStreaming ? 1536 : 512);
+        setIfPresent('skipScreenSpaceErrorFactor', baselineProfile && leanStreaming ? 18 : 8);
+        setIfPresent('skipLevels', baselineProfile && leanStreaming ? 2 : 0);
+        setIfPresent('immediatelyLoadDesiredLevelOfDetail', baselineProfile && !leanStreaming);
+        setIfPresent('preferLeaves', baselineProfile && !leanStreaming);
 
-        // Keep the high-quality startup sweep resident after the runtime
-        // streaming knobs return to their lightweight values. The hidden
-        // viewer owns a separate tileset/GPU cache from the main Cesium view.
+        // The hidden viewer owns a separate cache from the main view. Keep it
+        // large enough to avoid churn without switching policy while capturing.
         if ('maximumMemoryUsage' in tileset) tileset.maximumMemoryUsage = 1536;
         if ('cacheBytes' in tileset) tileset.cacheBytes = 1536 * 1024 * 1024;
         if ('maximumCacheOverflowBytes' in tileset) tileset.maximumCacheOverflowBytes = 512 * 1024 * 1024;
@@ -1850,12 +1845,7 @@ export class CesiumWorld {
                 canvas: null,
                 complete: false,
                 ready: false,
-                allFacesTileReady: false,
-                readyFaces: 0,
                 faces: PANORAMA_FACE_DEFS.length,
-                faceTileReadiness: Object.freeze([]),
-                readinessReason: 'capture-incomplete',
-                tileError: false,
             };
         }
         if (projector.readyFaces) projector.readyFaces.clear();
@@ -1913,7 +1903,9 @@ export class CesiumWorld {
             scheduler_yield: schedulerMs,
             total: performance.now() - totalStartedAt,
         });
+        const trackTileReadiness = !captureAnyway;
         const faceTileReadiness = [];
+        let capturedFaces = 0;
         const captureRevision = Number.isSafeInteger(this._panoramaCaptureRevision)
             ? this._panoramaCaptureRevision + 1
             : 1;
@@ -1925,13 +1917,8 @@ export class CesiumWorld {
 
         const readinessSnapshot = (captureComplete = false) => {
             const frozenFaces = Object.freeze(faceTileReadiness.slice());
-            // `settledWhenCopied` means the requested target LOD was complete.
-            // `readyWhenCopied` is the weaker live-flight contract: Cesium had
-            // renderable 3D Tiles for the face. Keep preload/SETTLED reporting
-            // tied to the strict condition so coarse fallback tiles cannot make
-            // a warm-up look complete.
             const readyFaces = frozenFaces.reduce(
-                (count, face) => count + (face.settledWhenCopied === true ? 1 : 0),
+                (count, face) => count + (face.readyWhenCopied === true ? 1 : 0),
                 0,
             );
             const allFaceFlagsReady = captureComplete
@@ -1991,19 +1978,8 @@ export class CesiumWorld {
                     this._renderViewerNow(viewer);
                     sceneRenderMs += performance.now() - sceneRenderStartedAt;
                 }
-                let faceTilesReady = false;
-                if (captureAnyway) {
-                    const loadState = this._panoramaTileLoadState;
-                    const queueKnown = loadState && (
-                        loadState.pending !== null || loadState.processing !== null
-                    );
-                    const queueIdle = !queueKnown || (
-                        (loadState.pending || 0) <= 0 && (loadState.processing || 0) <= 0
-                    );
-                    faceTilesReady = !!captureTileset
-                        && captureTileset.tilesLoaded === true
-                        && queueIdle;
-                } else if (tileTimeoutMs > 0) {
+                let faceTilesReady = true;
+                if (trackTileReadiness && tileTimeoutMs > 0) {
                     const tileWaitStartedAt = performance.now();
                     const waitRenderTimings = { renderMs: 0, renderCount: 0 };
                     faceTilesReady = await this.waitForTilesIdle(
@@ -2033,52 +2009,19 @@ export class CesiumWorld {
                             timings_ms: captureTimings(),
                         };
                     }
-                } else {
+                } else if (trackTileReadiness) {
                     faceTilesReady = !!captureTileset && captureTileset.tilesLoaded === true;
                 }
-                const selectedTileCount = Array.isArray(captureTileset?._selectedTiles)
-                    ? captureTileset._selectedTiles.length
-                    : null;
-                const renderCommandCount = Number.isFinite(
-                    captureTileset?._statistics?.numberOfCommands
-                )
-                    ? captureTileset._statistics.numberOfCommands
-                    : null;
-                const rawFaceErrorAt = captureLoadState?.lastErrorAt;
-                const faceErrorAt = Number(rawFaceErrorAt);
-                const tileErrorWhenCopied = (
-                    Math.max(0, Number(captureLoadState?.errorCount) || 0) > tileErrorCountAtStart
-                    || (rawFaceErrorAt != null
-                        && Number.isFinite(faceErrorAt)
-                        && faceErrorAt >= totalStartedAt)
-                );
-                // `tilesLoaded` only says that every tile meeting the target
-                // SSE is loaded. While moving it is commonly false even though
-                // a parent LOD already covers the view. Treat such a face as
-                // usable only when this exact render selected tile content and
-                // emitted draw commands. A genuinely blank/error face remains
-                // unresolved and is conservatively masked as an obstacle.
-                const renderabilityKnown = selectedTileCount !== null
-                    && renderCommandCount !== null;
-                const faceTilesRenderable = !tileErrorWhenCopied && (
-                    faceTilesReady
-                    || (renderabilityKnown
-                        && selectedTileCount > 0
-                        && renderCommandCount > 0)
-                );
                 const faceUploadStartedAt = performance.now();
                 projector.updateFace(faceDef.name, viewer.scene.canvas);
                 faceUploadMs += performance.now() - faceUploadStartedAt;
-                faceTileReadiness.push(Object.freeze({
-                    face: faceDef.name,
-                    // Backward-compatible live-planning field consumed by the
-                    // unknown-face mask. It now means renderable, not final LOD.
-                    readyWhenCopied: faceTilesRenderable,
-                    settledWhenCopied: faceTilesReady,
-                    selectedTileCount,
-                    renderCommandCount,
-                    tileErrorWhenCopied,
-                }));
+                capturedFaces++;
+                if (trackTileReadiness) {
+                    faceTileReadiness.push(Object.freeze({
+                        face: faceDef.name,
+                        readyWhenCopied: faceTilesReady,
+                    }));
+                }
 
                 if ((faceIndex + 1) % facesPerSlice === 0 && faceIndex + 1 < PANORAMA_FACE_DEFS.length) {
                     const yieldStartedAt = performance.now();
@@ -2091,14 +2034,9 @@ export class CesiumWorld {
             const projectStartedAt = performance.now();
             const canvas = projector.render(width, height, verticalFovDeg, faceFovDeg, topPoleGuardDeg, bottomPoleGuardDeg);
             projectMs = performance.now() - projectStartedAt;
-            // `complete` describes the image pipeline only: all six faces were
-            // copied and an ERP canvas was projected. `ready` is deliberately
-            // stricter and reports whether every face had settled 3D tiles at
-            // the instant it was copied. A partial canvas remains useful for
-            // live preview and is therefore returned to the caller.
             const complete = !!canvas
-                && faceTileReadiness.length === PANORAMA_FACE_DEFS.length;
-            const readiness = readinessSnapshot(complete);
+                && capturedFaces === PANORAMA_FACE_DEFS.length;
+            const readiness = trackTileReadiness ? readinessSnapshot(complete) : null;
             if (canvas && viewer === this._panoramaViewer && captureTileset === this._panoramaTileset
                 && captureRevision > (this._lastCompletedPanoramaCapture?.revision || 0)) {
                 this._lastCompletedPanoramaCapture = Object.freeze({
@@ -2114,20 +2052,22 @@ export class CesiumWorld {
                     faceSize,
                     verticalFovDeg,
                     complete,
-                    ready: readiness.allFacesTileReady,
-                    faceTileReadiness: readiness.faceTileReadiness,
-                    readyFaces: readiness.readyFaces,
-                    allFacesTileReady: readiness.allFacesTileReady,
-                    readinessReason: readiness.readinessReason,
-                    tileError: readiness.tileError,
+                    ready: readiness ? readiness.allFacesTileReady : complete,
+                    faceTileReadiness: readiness?.faceTileReadiness || Object.freeze([]),
+                    readyFaces: readiness?.readyFaces ?? (complete ? PANORAMA_FACE_DEFS.length : 0),
+                    allFacesTileReady: readiness?.allFacesTileReady ?? null,
+                    readinessReason: readiness?.readinessReason || (
+                        complete ? 'capture-complete' : 'capture-incomplete'
+                    ),
+                    tileError: readiness?.tileError === true,
                     completedAt: performance.now(),
                 });
             }
             return {
                 canvas,
                 complete,
-                ready: readiness.allFacesTileReady,
-                ...readiness,
+                ready: readiness ? readiness.allFacesTileReady : complete,
+                ...(readiness || {}),
                 faces: PANORAMA_FACE_DEFS.length,
                 timings_ms: captureTimings(),
             };
@@ -2151,134 +2091,27 @@ export class CesiumWorld {
         const faceSize = Math.max(64, Math.round(options.faceSize || 128));
         const verticalFovDeg = Math.max(1, Math.min(180, Number(options.verticalFovDeg) || 180));
         const viewer = await this._ensurePanoramaCaptureViewer(faceSize);
-        const requestScheduler = this.Cesium?.RequestScheduler;
-        const savedRequestsPerServer = requestScheduler
-            && 'maximumRequestsPerServer' in requestScheduler
-            ? requestScheduler.maximumRequestsPerServer
-            : null;
-        if (savedRequestsPerServer !== null) {
-            requestScheduler.maximumRequestsPerServer = Math.max(
-                savedRequestsPerServer,
-                Number(demoPerformance.config.preloadTileRequestsPerServer) || 18,
-            );
-        }
-        this._configurePanoramaTileset(this._panoramaTileset, true);
-        try {
-            const areaPreload = await this._preloadPanoramaAreaWithViewer(
-                viewer,
-                transform,
-                options,
-            );
-            const result = await this._capturePanoramaHybridWithViewerAsync(
-                viewer,
-                transform,
-                width,
-                height,
-                faceSize,
-                verticalFovDeg,
-                {
-                    faceFovDeg: options.faceFovDeg,
-                    topPoleGuardDeg: options.topPoleGuardDeg,
-                    bottomPoleGuardDeg: options.bottomPoleGuardDeg,
-                    frameDelayMs: options.frameDelayMs,
-                    tileTimeoutMs: options.tileTimeoutMs,
-                    tileQuietMs: options.tileQuietMs,
-                    captureAnyway: options.captureAnyway,
-                    continueOnTileTimeout: options.continueOnTileTimeout,
-                    facesPerSlice: options.facesPerSlice,
-                    signal: options.signal,
-                    progressCb: options.progressCb,
-                },
-            );
-            return { ...result, areaPreload };
-        } finally {
-            this._configurePanoramaTileset(this._panoramaTileset, false);
-            if (savedRequestsPerServer !== null) {
-                requestScheduler.maximumRequestsPerServer = savedRequestsPerServer;
-            }
-        }
-    }
-
-    async _preloadPanoramaAreaWithViewer(viewer, transform, options = {}) {
-        const radius = clampNumber(options.areaRadiusMeters, 0, 600, 0);
-        if (!viewer || radius <= 0) {
-            return Object.freeze({ positions: 0, faces: 0, settledFaces: 0 });
-        }
-
-        const spacing = clampNumber(options.areaSpacingMeters, 60, 300, 150);
-        const maxPositions = Math.round(clampNumber(options.areaMaxPositions, 1, 25, 13));
-        const faceTimeoutMs = clampNumber(options.areaFaceTimeoutMs, 100, 10000, 1500);
-        const faceQuietMs = clampNumber(options.areaFaceQuietMs, 0, 2000, 120);
-        const faceFovDeg = clampNumber(options.faceFovDeg, 90, 170, 130);
-        const signal = options.signal || null;
-        const progressCb = typeof options.progressCb === 'function' ? options.progressCb : null;
-        const basis = this.getTransformBasisFixed(transform);
-        const camera = viewer.camera;
-        const frustum = camera.frustum;
-        const targets = this._buildPreloadTargets(radius, spacing, maxPositions);
-        const horizontalFaces = PANORAMA_FACE_DEFS.filter(face => (
-            face.name === 'front' || face.name === 'right'
-            || face.name === 'back' || face.name === 'left'
-        ));
-        let settledFaces = 0;
-        let visitedFaces = 0;
-
-        if (frustum) {
-            if ('fov' in frustum) frustum.fov = faceFovDeg * Math.PI / 180;
-            if ('near' in frustum) frustum.near = 0.03;
-            if ('far' in frustum) frustum.far = this.panoramaFarMeters || 1200;
-        }
-
-        for (let positionIndex = 0; positionIndex < targets.length; positionIndex++) {
-            const offset = targets[positionIndex];
-            const destination = this.localToCartesian({
-                x: transform.position.x + offset.x,
-                y: transform.position.y,
-                z: transform.position.z + offset.z,
-            });
-            for (let faceIndex = 0; faceIndex < horizontalFaces.length; faceIndex++) {
-                if (signal?.aborted) {
-                    const error = new Error(String(signal.reason || 'panorama area preload aborted'));
-                    error.name = 'AbortError';
-                    throw error;
-                }
-                const face = horizontalFaces[faceIndex];
-                progressCb?.(
-                    `area ${positionIndex + 1}/${targets.length}, ${face.name} `
-                    + `(${settledFaces}/${visitedFaces || 1} settled)`,
-                );
-                camera.setView({
-                    destination,
-                    orientation: {
-                        direction: this._componentDirectionToFixed(basis, face.dir),
-                        up: this._componentDirectionToFixed(basis, face.up),
-                    },
-                });
-                viewer.scene.requestRender();
-                this._renderViewerNow(viewer);
-                const settled = await this.waitForTilesIdle(
-                    faceTimeoutMs,
-                    faceQuietMs,
-                    this._panoramaTileset,
-                    this._panoramaTileLoadState,
-                    viewer,
-                    null,
-                    signal,
-                );
-                visitedFaces++;
-                if (settled) settledFaces++;
-            }
-        }
-
-        progressCb?.(
-            `area sweep complete: ${settledFaces}/${visitedFaces} horizontal views settled`,
+        return this._capturePanoramaHybridWithViewerAsync(
+            viewer,
+            transform,
+            width,
+            height,
+            faceSize,
+            verticalFovDeg,
+            {
+                faceFovDeg: options.faceFovDeg,
+                topPoleGuardDeg: options.topPoleGuardDeg,
+                bottomPoleGuardDeg: options.bottomPoleGuardDeg,
+                frameDelayMs: options.frameDelayMs,
+                tileTimeoutMs: options.tileTimeoutMs,
+                tileQuietMs: options.tileQuietMs,
+                captureAnyway: options.captureAnyway,
+                continueOnTileTimeout: options.continueOnTileTimeout,
+                facesPerSlice: options.facesPerSlice,
+                signal: options.signal,
+                progressCb: options.progressCb,
+            },
         );
-        return Object.freeze({
-            radiusMeters: radius,
-            positions: targets.length,
-            faces: visitedFaces,
-            settledFaces,
-        });
     }
 
     async capturePanoramaIncrementalAsync(transform, options = {}) {

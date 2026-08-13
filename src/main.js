@@ -23,21 +23,21 @@
  * from the original simulator.
  */
 
-import { CesiumWorld } from './cesium-world.js?v=20260813-panorama-renderable-r8';
+import { CesiumWorld } from './cesium-world.js?v=20260813-perf-singleton-r13';
 import { TilesCollisionProvider } from './tiles-collision.js?v=20260813-panorama-continuity-r2';
 import { Controller } from './controller.js?v=20260812-shared-controller-config';
 import { Drone } from './drone.js?v=20260813-panorama-continuity-r2';
 import { HUD } from './hud.js?v=20260811-control-v6';
 import { OSD } from './osd.js?v=20260811-control-v6';
-import { PanoramaSensor } from './panorama-sensor.js?v=20260813-panorama-unknown-mask-r7';
-import { FlightLogger } from './flight-logger.js?v=20260813-panorama-unknown-mask-r7';
+import { PanoramaSensor } from './panorama-sensor.js?v=20260813-perf-singleton-r13';
+import { FlightLogger } from './flight-logger.js?v=20260813-perf-singleton-r13';
 import { reportUserError } from './error-report.js';
 import {
     computeT8LRollingGoal,
     T8L_GOAL_DEADZONE,
 } from './t8l-rolling-goal.js?v=20260813-so3-goal-50m';
 import { FixedStepScheduler } from './fixed-step-scheduler.js?v=20260811';
-import { demoPerformance } from './demo-performance.js?v=20260813-panorama-unknown-mask-r7';
+import { demoPerformance } from './demo-performance.js?v=20260813-perf-singleton-r13';
 import {
     drawDepthTopdown,
     depthTopdownLabels,
@@ -217,11 +217,6 @@ function updatePanoramaReadinessIndicator() {
     const totalFaces = Number.isFinite(Number(state?.rgbTotalFaces))
         ? Math.max(1, Math.round(Number(state.rgbTotalFaces)))
         : 6;
-    const readyFaces = Number.isFinite(Number(state?.rgbReadyFaces))
-        ? Math.max(0, Math.min(totalFaces, Math.round(Number(state.rgbReadyFaces))))
-        : 0;
-    const reason = String(state?.rgbReadinessReason || 'capture-incomplete');
-    const tileError = state?.rgbTileError === true || reason === 'tile-error';
     const frameSeen = Number(state?.rgbFrameId) > 0 || state?.rgbFrameComplete === true;
     const capturedFaces = state?.rgbFrameComplete === true
         ? totalFaces
@@ -230,21 +225,17 @@ function updatePanoramaReadinessIndicator() {
     let displayState;
     let label;
     let title;
-    if (tileError) {
-        displayState = 'error';
-        label = `CAPTURED ${capturedFaces}/${totalFaces} \u00b7 TILE ERROR`;
-        title = 'The RGB frame was captured, but a panorama tile request failed. Autonomous perception is not verified.';
-    } else if (state?.rgbTilesReady === true && readyFaces === totalFaces) {
+    if (state?.rgbFrameComplete === true) {
         displayState = 'ready';
-        label = `CAPTURED ${capturedFaces}/${totalFaces} \u00b7 SETTLED ${readyFaces}/${totalFaces}`;
-        title = 'All six panorama faces were captured and reported settled scene tiles.';
+        label = `RGB READY ${capturedFaces}/${totalFaces}`;
+        title = 'A complete six-face RGB panorama is available to DA360.';
     } else if (frameSeen) {
         displayState = 'partial';
-        label = `CAPTURED ${capturedFaces}/${totalFaces} \u00b7 SETTLED ${readyFaces}/${totalFaces} \u00b7 UNVERIFIED`;
-        title = 'Captured faces and settled tile faces are separate diagnostics. YOPO trajectory output is not modified.';
+        label = `RGB CAPTURING ${capturedFaces}/${totalFaces}`;
+        title = 'The current six-face panorama is still being assembled.';
     } else {
         displayState = 'loading';
-        label = `RGB LOADING ${readyFaces}/${totalFaces}`;
+        label = `RGB LOADING 0/${totalFaces}`;
         title = 'Waiting for the first panorama capture.';
     }
 
@@ -416,30 +407,39 @@ async function preloadPanoramaBeforeFlight() {
     if (!transform) return false;
 
     const preloadController = new AbortController();
+    const strictPreload = PANORAMA_PRELOAD_REQUIRED || FLIGHT_PRELOAD_STRICT;
+    const captureOptions = panoramaSensor.getCaptureOptions({ preload: strictPreload });
     const options = {
-        ...panoramaSensor.getCaptureOptions({ preload: true }),
-        timeoutMs: Math.max(
-            Number(panoramaSensor.getCaptureOptions({ preload: true })?.timeoutMs) || 0,
-            Number(demoPerformance.config.preloadTimeoutMs) || 180000,
-        ),
-        areaRadiusMeters: Number(demoPerformance.config.preloadRadiusMeters) || 300,
-        areaSpacingMeters: Number(demoPerformance.config.preloadAreaSpacingMeters) || 150,
-        areaMaxPositions: Number(demoPerformance.config.preloadAreaMaxPositions) || 13,
-        areaFaceTimeoutMs: Number(demoPerformance.config.preloadAreaFaceTimeoutMs) || 1500,
-        areaFaceQuietMs: Number(demoPerformance.config.preloadAreaFaceQuietMs) || 120,
+        ...captureOptions,
+        timeoutMs: strictPreload
+            ? Math.max(
+                Number(captureOptions.timeoutMs) || 0,
+                Number(demoPerformance.config.preloadTimeoutMs) || 30000,
+            )
+            : 10000,
         signal: preloadController.signal,
         progressCb: (message) => setProgress(
-            `Preloading 360 panorama sensor · settling tiles (${message})...`,
+            `Warming 360 panorama sensor (${message})...`,
+        ),
+    };
+    const warmPassOptions = {
+        ...panoramaSensor.getCaptureOptions({ preload: false }),
+        signal: preloadController.signal,
+        progressCb: (message) => setProgress(
+            `Warming 360 panorama sensor · pass 1/2 (${message})...`,
         ),
     };
     const started = performance.now();
-    setProgress('Preloading 360 panorama sensor before flight · waiting for face 1/6...');
+    setProgress('Warming 360 panorama sensor before flight · pass 1/2...');
 
     try {
         const result = await withTimeout(
             (async () => {
                 const warmup = warmPanoramaViewerInBackground();
                 if (warmup) await warmup;
+                await world.preloadPanoramaAtTransform(transform, warmPassOptions);
+                await new Promise(resolve => window.setTimeout(resolve, 750));
+                setProgress('Capturing 360 panorama sensor · pass 2/2...');
                 return world.preloadPanoramaAtTransform(transform, options);
             })(),
             options.timeoutMs,
@@ -452,22 +452,31 @@ async function preloadPanoramaBeforeFlight() {
             captureProfile: options.profile,
         });
         updatePanoramaReadinessIndicator();
-        const strictPreload = PANORAMA_PRELOAD_REQUIRED || FLIGHT_PRELOAD_STRICT;
         const sceneTilesReady = result?.ready === true && result?.allFacesTileReady === true;
+        const captureAccepted = result?.complete === true && result?.tileError !== true;
         demoPerformance.recordPreload('panorama', {
-            ready: sceneTilesReady,
-            readyFaces: Number(result?.readyFaces) || 0,
+            ready: framePrimed && captureAccepted,
+            readyFaces: strictPreload
+                ? Number(result?.readyFaces) || 0
+                : (result?.complete === true ? Number(result?.faces) || 6 : 0),
             totalFaces: Number(result?.faces) || 6,
             elapsedMs: performance.now() - started,
         });
-        if (!framePrimed || !sceneTilesReady) {
+        if (!framePrimed || !captureAccepted) {
             const readyFaces = Math.max(0, Number(result?.readyFaces) || 0);
             const totalFaces = Math.max(1, Number(result?.faces) || 6);
             const reason = String(result?.readinessReason || 'capture-incomplete');
             const capturedFaces = result?.complete === true ? totalFaces : 0;
-            const message = `panorama preload: captured ${capturedFaces}/${totalFaces}, settled ${readyFaces}/${totalFaces} (${reason})`;
+            const message = strictPreload
+                ? `panorama preload: captured ${capturedFaces}/${totalFaces}, settled ${readyFaces}/${totalFaces} (${reason})`
+                : `panorama warmup did not produce a complete RGB frame (${capturedFaces}/${totalFaces})`;
             if (strictPreload) throw new Error(message);
             rememberFlightStartWarning(message);
+        } else if (strictPreload && !sceneTilesReady) {
+            rememberFlightStartWarning(
+                `panorama captured ${Number(result?.faces) || 6}/6; tile queue still refining `
+                + `(settled ${Number(result?.readyFaces) || 0}/6)`,
+            );
         }
         return framePrimed;
     } catch (error) {

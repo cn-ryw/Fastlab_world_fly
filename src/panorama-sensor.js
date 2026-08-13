@@ -1,5 +1,5 @@
 import { reportUserError } from './error-report.js';
-import { demoPerformance } from './demo-performance.js?v=20260813-panorama-unknown-mask-r7';
+import { demoPerformance } from './demo-performance.js?v=20260813-perf-singleton-r13';
 import { PerceptionFrame, normalizePlanningState } from './perception-frame.js';
 import { normalizeDepthPolarScan } from './depth-topdown.js';
 
@@ -1056,9 +1056,7 @@ export class PanoramaSensor {
             readiness,
         );
         this.hasRgb = true;
-        this._setRgbStatus(
-            `preloaded ${Math.round(captureMs)}ms · tiles ${readiness.rgbReadyFaces}/${readiness.rgbTotalFaces}`,
-        );
+        this._setRgbStatus(`preloaded ${Math.round(captureMs)}ms`);
         return true;
     }
 
@@ -1311,64 +1309,6 @@ export class PanoramaSensor {
 
     _desiredDepthMode() {
         return this._yopoGoal ? 'planning' : 'preview';
-    }
-
-    _criticalRgbReadiness(readiness = this._rgbReadiness) {
-        const criticalFaces = ['front', 'right', 'back', 'left'];
-        const faceStates = new Map(
-            (readiness?.faceTileReadiness || []).map(face => [face.face, face]),
-        );
-        const unresolvedFaces = criticalFaces.filter(
-            face => faceStates.get(face)?.readyWhenCopied !== true,
-        );
-        return Object.freeze({
-            ready: readiness?.rgbFrameComplete === true
-                && readiness?.rgbTileError !== true
-                && unresolvedFaces.length === 0,
-            unresolvedFaces: Object.freeze(unresolvedFaces),
-        });
-    }
-
-    _allowPlanningFromCurrentRgb() {
-        if (!this._yopoGoal) {
-            this._planningRgbBlocked = false;
-            this._planningRgbBlockKey = null;
-            return true;
-        }
-
-        const status = this._criticalRgbReadiness();
-        if (status.ready) {
-            this._planningRgbBlocked = false;
-            this._planningRgbBlockKey = null;
-            return true;
-        }
-
-        const unresolved = status.unresolvedFaces.length
-            ? status.unresolvedFaces.join(',')
-            : this._rgbReadiness?.rgbReadinessReason || 'capture-incomplete';
-        const reason = `awaiting-critical-rgb-tiles:${unresolved}`;
-        this._setDepthState('planning', reason, { outcome: 'blocked' });
-        if (!this._planningRgbBlocked || this._planningRgbBlockKey !== reason) {
-            this._planningRgbBlocked = true;
-            this._planningRgbBlockKey = reason;
-            this._abortActiveDepthRequest('rgb-tiles-unresolved');
-            try {
-                this.onPlanningBlocked?.(Object.freeze({
-                    reason: 'rgb-tiles-unresolved',
-                    detail: reason,
-                    frameId: this._rgbFrameId,
-                    goalId: this._goalId,
-                    generation: this._yopoGeneration,
-                    unresolvedFaces: status.unresolvedFaces,
-                }));
-            } catch (error) {
-                reportUserError('Planning RGB hold callback failed', error, {
-                    key: 'planning-rgb-hold-callback',
-                    intervalMs: 3000,
-                });
-            }
-        }
-        return false;
     }
 
     _shouldRequestDepth(now = performance.now()) {
@@ -1828,9 +1768,7 @@ export class PanoramaSensor {
             );
             this._rgbFrameContext = frameContext;
             this.hasRgb = true;
-            const rgbStatus = `${Math.round(captureMs)}ms · tiles `
-                + `${readiness.rgbReadyFaces}/${readiness.rgbTotalFaces}`;
-            this._setRgbStatus(rgbStatus);
+            this._setRgbStatus(`${Math.round(captureMs)}ms`);
 
             if (this._shouldRequestDepth(this.lastCaptureTime)) {
                 this._requestDepth(this.rgbCanvas);
@@ -2116,11 +2054,6 @@ export class PanoramaSensor {
                     frame_id: String(request.frameId),
                     goal_id: String(request.goalId),
                     generation: String(request.generation),
-                    unknown_faces: frame.faceTileReadiness
-                        .filter(face => face?.readyWhenCopied !== true)
-                        .map(face => String(face.face || ''))
-                        .filter(Boolean)
-                        .join(','),
                     // Control responses are always compact. Operator preview
                     // is fetched later from the exact cached planning depth on
                     // an independent latest-only worker.
@@ -2533,7 +2466,6 @@ export class PanoramaSensor {
                     `[depth] ${fps.toFixed(1)}Hz mode=${request.mode} goalId=${request.goalId || '-'} `
                     + `frameId=${request.frameId} generation=${request.generation} `
                     + `rgbCaptured=${frameContext.rgbFrameComplete ? frameContext.rgbTotalFaces : 0}/${frameContext.rgbTotalFaces} `
-                    + `rgbSettled=${frameContext.rgbReadyFaces}/${frameContext.rgbTotalFaces} `
                     + `depthLag=${depthPreviewLagFrames}f `
                     + `reason=${finalReason ? `${outcome}:${finalReason}` : 'ok'} `
                     + `capture=${Math.round(frameContext.captureTimings?.total || 0)}ms `

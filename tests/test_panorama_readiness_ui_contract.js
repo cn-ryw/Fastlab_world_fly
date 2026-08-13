@@ -6,9 +6,9 @@ const html = readFileSync(new URL('../index.html', import.meta.url), 'utf8');
 
 assert.match(html, /id="panorama-rgb-readiness"/);
 assert.match(html, /RGB LOADING 0\/6/);
-assert.match(main, /RGB READY \$\{readyFaces\}\/\$\{totalFaces\}/);
-assert.match(main, /RGB PARTIAL \$\{readyFaces\}\/\$\{totalFaces\} .*AUTO UNVERIFIED/);
-assert.match(main, /TILE ERROR \$\{readyFaces\}\/\$\{totalFaces\} .*AUTO UNVERIFIED/);
+assert.match(main, /RGB READY \$\{capturedFaces\}\/\$\{totalFaces\}/);
+assert.match(main, /RGB CAPTURING \$\{capturedFaces\}\/\$\{totalFaces\}/);
+assert.doesNotMatch(main, /AUTO UNVERIFIED|TILE ERROR|SETTLED/);
 
 // A structured panorama can have a projected canvas while one or more 3D-tile
 // faces are still incomplete. Explicit strict preload must require both facts.
@@ -16,9 +16,8 @@ assert.match(
     main,
     /result\?\.ready === true && result\?\.allFacesTileReady === true/,
 );
-assert.match(main, /if \(!framePrimed \|\| !sceneTilesReady\)/);
+assert.match(main, /if \(!framePrimed \|\| \(strictPreload && !sceneTilesReady\)\)/);
 assert.match(main, /if \(strictPreload\) throw new Error\(message\)/);
-assert.match(main, /panorama preload incomplete: tiles \$\{readyFaces\}\/\$\{totalFaces\}/);
 assert.match(main, /signal: preloadController\.signal/);
 assert.match(main, /preloadController\.abort\('panorama-preload-finished-with-error'\)/);
 
