@@ -52,6 +52,9 @@ export class TilesCollisionProvider {
         this.sweepRadiusFactor = Number.isFinite(options.sweepRadiusFactor)
             ? Math.max(0.35, Math.min(0.95, options.sweepRadiusFactor))
             : 0.72;
+        this.sweepProbeMode = ['center', 'cross'].includes(options.sweepProbeMode)
+            ? options.sweepProbeMode
+            : 'sphere';
         this.heightProbeWidth = Number.isFinite(options.heightProbeWidth) ? options.heightProbeWidth : 0.35;
         this.minPenetration = Number.isFinite(options.minPenetration) ? options.minPenetration : 0.015;
         this.minRayDistance = Number.isFinite(options.minRayDistance) ? options.minRayDistance : 0.04;
@@ -146,6 +149,29 @@ export class TilesCollisionProvider {
             ? normalize({ x: -dir.x, y: 0, z: -dir.z }, { x: 0, y: 0, z: 1 })
             : normalize({ x: -dir.x, y: -dir.y, z: -dir.z }, { x: 0, y: 1, z: 0 });
 
+        // The historical single center sweep remains continuous over every
+        // physics segment, while avoiding four additional synchronous Cesium
+        // GPU readbacks per step. Keep the five-probe swept sphere available
+        // to the baseline profile for controlled A/B comparison.
+        if (this.sweepProbeMode === 'center') {
+            const maxDistance = motionDistance + radius + this.sweptExtra;
+            const hit = this.world.pickLocalRay(prev, dir, maxDistance);
+            if (!this._validRayHit(prev, hit, maxDistance)) return;
+
+            const penetration = motionDistance + radius + this.horizontalSkin - hit.distance;
+            if (penetration <= this.minPenetration) return;
+            hits.push({
+                normal: Math.abs(dir.y) < 0.7
+                    ? fallback
+                    : hitNormalFromPoint(center.x, center.y, center.z, hit.position, fallback),
+                penetration,
+                source: 'swept',
+                pointCount: 1,
+                position: { ...hit.position },
+            });
+            return;
+        }
+
         // Approximate a swept sphere rather than ray-casting only its centre.
         // The four offset probes catch wall corners, roof edges and thin meshes
         // touched by the vehicle radius between two physics frames.
@@ -167,9 +193,13 @@ export class TilesCollisionProvider {
             { x: 0, y: 0, z: 0, center: true },
             { x: side.x * offsetRadius, y: side.y * offsetRadius, z: side.z * offsetRadius },
             { x: -side.x * offsetRadius, y: -side.y * offsetRadius, z: -side.z * offsetRadius },
-            { x: up.x * offsetRadius, y: up.y * offsetRadius, z: up.z * offsetRadius },
-            { x: -up.x * offsetRadius, y: -up.y * offsetRadius, z: -up.z * offsetRadius },
         ];
+        if (this.sweepProbeMode === 'sphere') {
+            probes.push(
+                { x: up.x * offsetRadius, y: up.y * offsetRadius, z: up.z * offsetRadius },
+                { x: -up.x * offsetRadius, y: -up.y * offsetRadius, z: -up.z * offsetRadius },
+            );
+        }
 
         for (let probeIndex = 0; probeIndex < probes.length; probeIndex++) {
             const probe = probes[probeIndex];
@@ -193,6 +223,7 @@ export class TilesCollisionProvider {
                 source: probe.center ? 'swept-center' : 'swept-radius',
                 pointCount: probes.length,
                 probeIndex,
+                position: { ...hit.position },
             });
         }
     }
@@ -222,6 +253,7 @@ export class TilesCollisionProvider {
                     penetration,
                     source: 'ray',
                     pointCount: 1,
+                    position: { ...hit.position },
                 });
             }
         }

@@ -377,16 +377,16 @@ for (const [facesPerSlice, expectedYields] of [[2, 2], [3, 1], [6, 0]]) {
         || flightOptions.frameDelayMs !== 0
         || flightOptions.tileTimeoutMs !== 0
         || flightOptions.tileQuietMs !== 0
-        || flightOptions.facesPerSlice !== 2) {
-        throw new Error('flight profile must force zero-wait capture with the 2-face default');
+        || flightOptions.facesPerSlice !== 3) {
+        throw new Error('demo30 flight profile must use the 3-face 15 Hz target');
     }
     const flightPreloadOptions = flightSensor.getCaptureOptions({ preload: true });
     if (flightPreloadOptions.captureAnyway
         || !flightPreloadOptions.continueOnTileTimeout
-        || flightPreloadOptions.frameDelayMs !== 96
-        || flightPreloadOptions.tileTimeoutMs !== 6000
-        || flightPreloadOptions.tileQuietMs !== 650
-        || flightPreloadOptions.timeoutMs !== 60000) {
+        || flightPreloadOptions.frameDelayMs !== 32
+        || flightPreloadOptions.tileTimeoutMs !== 4000
+        || flightPreloadOptions.tileQuietMs !== 150
+        || flightPreloadOptions.timeoutMs !== 30000) {
         throw new Error('flight preload must settle hidden-viewer tiles before zero-wait live capture');
     }
 

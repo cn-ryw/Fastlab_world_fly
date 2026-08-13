@@ -30,6 +30,7 @@
 
 import { formatError, reportUserError } from './error-report.js';
 import { erpDirectionToComponent, sampleAnchorDirections } from './erp-geometry.js';
+import { demoPerformance } from './demo-performance.js?v=20260813-panorama-unknown-mask-r7';
 
 const DEFAULT_ION_TOKEN = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJqdGkiOiJlMTg2MGFhOS02YTdhLTQ1NWMtYjkzMi05YjQ2ODRlZjI5YTgiLCJpZCI6MjUxNzM1LCJpYXQiOjE3MzAyODI0ODN9.prWAxx4RB8teelutQQbVqdxhgRZpZ4zjw8wzM-8k1Ug';
 const DEFAULT_ASSET_ID = 2275207;
@@ -465,6 +466,12 @@ export class CesiumWorld {
             1024,
             512
         );
+        this.panoramaPreloadTileSSE = clampNumber(
+            urlNumber('panoramaPreloadTileSse', options.panoramaPreloadTileSSE ?? 256),
+            4,
+            512,
+            256
+        );
         // The hidden 96 px capture faces are used for local obstacle sensing,
         // not a globe-scale horizon. A finite far plane materially reduces the
         // six repeated tileset traversals without changing ERP dimensions or
@@ -523,12 +530,7 @@ export class CesiumWorld {
         this.Cesium = Cesium;
         Cesium.Ion.defaultAccessToken = this.token;
 
-        if (Cesium.RequestScheduler && 'maximumRequestsPerServer' in Cesium.RequestScheduler) {
-            Cesium.RequestScheduler.maximumRequestsPerServer = Math.max(
-                Cesium.RequestScheduler.maximumRequestsPerServer || 0,
-                18
-            );
-        }
+        demoPerformance.configureCesium(Cesium);
 
         if (progressCb) progressCb('Creating Cesium viewer...');
         this.viewer = new Cesium.Viewer(this.containerId, {
@@ -564,6 +566,13 @@ export class CesiumWorld {
                 },
             },
         });
+
+        demoPerformance.attachViewer(this.viewer, () => ({
+            main: this.getTileLoadStatus?.() || null,
+            panorama: this._panoramaTileLoadState
+                ? { ...this._panoramaTileLoadState }
+                : null,
+        }));
 
         this.viewer.scene.fog.enabled = false;
         this.viewer.scene.highDynamicRange = false;
@@ -761,11 +770,12 @@ export class CesiumWorld {
         setIfPresent('foveatedScreenSpaceError', true);
         setIfPresent('foveatedConeSize', flightMode ? 0.2 : 0.28);
         setIfPresent('foveatedMinimumScreenSpaceErrorRelaxation', flightMode ? 4 : 2);
-        setIfPresent('dynamicScreenSpaceError', true);               // 远处自动降 LOD
+        const dynamicSseEnabled = demoPerformance.config.dynamicSse !== 'off';
+        setIfPresent('dynamicScreenSpaceError', dynamicSseEnabled);  // 远处自动降 LOD
         setIfPresent('dynamicScreenSpaceErrorDensity', 0.2);
         setIfPresent('dynamicScreenSpaceErrorFactor', 4.0);
         setIfPresent('foveatedTimeDelay', flightMode ? 0.08 : 0.15);
-        setIfPresent('dynamicScreenSpaceError', true);
+        setIfPresent('dynamicScreenSpaceError', dynamicSseEnabled);
         setIfPresent('dynamicScreenSpaceErrorDensity', flightMode ? 0.0035 : 0.0025);
         setIfPresent('dynamicScreenSpaceErrorFactor', flightMode ? 12 : 8);
         setIfPresent('loadSiblings', false);
@@ -985,6 +995,17 @@ export class CesiumWorld {
     async preloadLocalArea(centerLocal, options = {}) {
         if (!this.viewer || !this.ready || !centerLocal) return null;
         const Cesium = this.Cesium;
+        const requestScheduler = Cesium?.RequestScheduler;
+        const savedRequestsPerServer = requestScheduler
+            && 'maximumRequestsPerServer' in requestScheduler
+            ? requestScheduler.maximumRequestsPerServer
+            : null;
+        if (savedRequestsPerServer !== null) {
+            requestScheduler.maximumRequestsPerServer = Math.max(
+                savedRequestsPerServer,
+                Number(demoPerformance.config.preloadTileRequestsPerServer) || 18,
+            );
+        }
         const camera = this.viewer.camera;
         const saved = {
             position: Cesium.Cartesian3.clone(camera.positionWC),
@@ -1075,6 +1096,9 @@ export class CesiumWorld {
                 report.finalIdle = await this.waitForTilesIdle(finalIdleTimeoutMs, 350);
             }
         } finally {
+            if (savedRequestsPerServer !== null) {
+                requestScheduler.maximumRequestsPerServer = savedRequestsPerServer;
+            }
             camera.setView({
                 destination: saved.position,
                 orientation: {
@@ -1624,34 +1648,42 @@ export class CesiumWorld {
         return this.waitForTilesIdle(timeoutMs, quietMs);
     }
 
-    _configurePanoramaTileset(tileset) {
+    _configurePanoramaTileset(tileset, preloadMode = false) {
         if (!tileset) return;
 
         const setIfPresent = (key, value) => {
             if (key in tileset) tileset[key] = value;
         };
+        const leanStreaming = !preloadMode && this.panoramaLeanStreaming;
 
-        setIfPresent('maximumScreenSpaceError', this.panoramaTileSSE);
+        setIfPresent(
+            'maximumScreenSpaceError',
+            preloadMode ? this.panoramaPreloadTileSSE : this.panoramaTileSSE,
+        );
         setIfPresent('cullRequestsWhileMoving', false);
-        setIfPresent('preloadWhenHidden', !this.panoramaLeanStreaming);
-        setIfPresent('preloadFlightDestinations', !this.panoramaLeanStreaming);
+        setIfPresent('preloadWhenHidden', preloadMode || !leanStreaming);
+        setIfPresent('preloadFlightDestinations', preloadMode || !leanStreaming);
         setIfPresent('foveatedScreenSpaceError', false);
-        setIfPresent('dynamicScreenSpaceError', true);
+        setIfPresent(
+            'dynamicScreenSpaceError',
+            !preloadMode && demoPerformance.config.dynamicSse !== 'off',
+        );
         setIfPresent('dynamicScreenSpaceErrorDensity', 0.004);
         setIfPresent('dynamicScreenSpaceErrorFactor', 12);
-        setIfPresent('loadSiblings', !this.panoramaLeanStreaming);
-        setIfPresent('skipLevelOfDetail', this.panoramaLeanStreaming);
-        if (this.panoramaLeanStreaming) {
-            setIfPresent('baseScreenSpaceError', 1536);
-            setIfPresent('skipScreenSpaceErrorFactor', 18);
-            setIfPresent('skipLevels', 2);
-        }
-        setIfPresent('immediatelyLoadDesiredLevelOfDetail', !this.panoramaLeanStreaming);
-        setIfPresent('preferLeaves', !this.panoramaLeanStreaming);
+        setIfPresent('loadSiblings', preloadMode || !leanStreaming);
+        setIfPresent('skipLevelOfDetail', leanStreaming);
+        setIfPresent('baseScreenSpaceError', leanStreaming ? 1536 : 512);
+        setIfPresent('skipScreenSpaceErrorFactor', leanStreaming ? 18 : 8);
+        setIfPresent('skipLevels', leanStreaming ? 2 : 0);
+        setIfPresent('immediatelyLoadDesiredLevelOfDetail', preloadMode || !leanStreaming);
+        setIfPresent('preferLeaves', preloadMode || !leanStreaming);
 
-        if ('maximumMemoryUsage' in tileset) tileset.maximumMemoryUsage = 768;
-        if ('cacheBytes' in tileset) tileset.cacheBytes = 768 * 1024 * 1024;
-        if ('maximumCacheOverflowBytes' in tileset) tileset.maximumCacheOverflowBytes = 256 * 1024 * 1024;
+        // Keep the high-quality startup sweep resident after the runtime
+        // streaming knobs return to their lightweight values. The hidden
+        // viewer owns a separate tileset/GPU cache from the main Cesium view.
+        if ('maximumMemoryUsage' in tileset) tileset.maximumMemoryUsage = 1536;
+        if ('cacheBytes' in tileset) tileset.cacheBytes = 1536 * 1024 * 1024;
+        if ('maximumCacheOverflowBytes' in tileset) tileset.maximumCacheOverflowBytes = 512 * 1024 * 1024;
     }
 
     _destroyPanoramaCaptureViewer() {
@@ -1893,8 +1925,13 @@ export class CesiumWorld {
 
         const readinessSnapshot = (captureComplete = false) => {
             const frozenFaces = Object.freeze(faceTileReadiness.slice());
+            // `settledWhenCopied` means the requested target LOD was complete.
+            // `readyWhenCopied` is the weaker live-flight contract: Cesium had
+            // renderable 3D Tiles for the face. Keep preload/SETTLED reporting
+            // tied to the strict condition so coarse fallback tiles cannot make
+            // a warm-up look complete.
             const readyFaces = frozenFaces.reduce(
-                (count, face) => count + (face.readyWhenCopied === true ? 1 : 0),
+                (count, face) => count + (face.settledWhenCopied === true ? 1 : 0),
                 0,
             );
             const allFaceFlagsReady = captureComplete
@@ -1999,12 +2036,48 @@ export class CesiumWorld {
                 } else {
                     faceTilesReady = !!captureTileset && captureTileset.tilesLoaded === true;
                 }
+                const selectedTileCount = Array.isArray(captureTileset?._selectedTiles)
+                    ? captureTileset._selectedTiles.length
+                    : null;
+                const renderCommandCount = Number.isFinite(
+                    captureTileset?._statistics?.numberOfCommands
+                )
+                    ? captureTileset._statistics.numberOfCommands
+                    : null;
+                const rawFaceErrorAt = captureLoadState?.lastErrorAt;
+                const faceErrorAt = Number(rawFaceErrorAt);
+                const tileErrorWhenCopied = (
+                    Math.max(0, Number(captureLoadState?.errorCount) || 0) > tileErrorCountAtStart
+                    || (rawFaceErrorAt != null
+                        && Number.isFinite(faceErrorAt)
+                        && faceErrorAt >= totalStartedAt)
+                );
+                // `tilesLoaded` only says that every tile meeting the target
+                // SSE is loaded. While moving it is commonly false even though
+                // a parent LOD already covers the view. Treat such a face as
+                // usable only when this exact render selected tile content and
+                // emitted draw commands. A genuinely blank/error face remains
+                // unresolved and is conservatively masked as an obstacle.
+                const renderabilityKnown = selectedTileCount !== null
+                    && renderCommandCount !== null;
+                const faceTilesRenderable = !tileErrorWhenCopied && (
+                    faceTilesReady
+                    || (renderabilityKnown
+                        && selectedTileCount > 0
+                        && renderCommandCount > 0)
+                );
                 const faceUploadStartedAt = performance.now();
                 projector.updateFace(faceDef.name, viewer.scene.canvas);
                 faceUploadMs += performance.now() - faceUploadStartedAt;
                 faceTileReadiness.push(Object.freeze({
                     face: faceDef.name,
-                    readyWhenCopied: faceTilesReady,
+                    // Backward-compatible live-planning field consumed by the
+                    // unknown-face mask. It now means renderable, not final LOD.
+                    readyWhenCopied: faceTilesRenderable,
+                    settledWhenCopied: faceTilesReady,
+                    selectedTileCount,
+                    renderCommandCount,
+                    tileErrorWhenCopied,
                 }));
 
                 if ((faceIndex + 1) % facesPerSlice === 0 && faceIndex + 1 < PANORAMA_FACE_DEFS.length) {
@@ -2078,18 +2151,133 @@ export class CesiumWorld {
         const faceSize = Math.max(64, Math.round(options.faceSize || 128));
         const verticalFovDeg = Math.max(1, Math.min(180, Number(options.verticalFovDeg) || 180));
         const viewer = await this._ensurePanoramaCaptureViewer(faceSize);
-        return this._capturePanoramaHybridWithViewerAsync(viewer, transform, width, height, faceSize, verticalFovDeg, {
-            faceFovDeg: options.faceFovDeg,
-            topPoleGuardDeg: options.topPoleGuardDeg,
-            bottomPoleGuardDeg: options.bottomPoleGuardDeg,
-            frameDelayMs: options.frameDelayMs,
-            tileTimeoutMs: options.tileTimeoutMs,
-            tileQuietMs: options.tileQuietMs,
-            captureAnyway: options.captureAnyway,
-            continueOnTileTimeout: options.continueOnTileTimeout,
-            facesPerSlice: options.facesPerSlice,
-            signal: options.signal,
-            progressCb: options.progressCb,
+        const requestScheduler = this.Cesium?.RequestScheduler;
+        const savedRequestsPerServer = requestScheduler
+            && 'maximumRequestsPerServer' in requestScheduler
+            ? requestScheduler.maximumRequestsPerServer
+            : null;
+        if (savedRequestsPerServer !== null) {
+            requestScheduler.maximumRequestsPerServer = Math.max(
+                savedRequestsPerServer,
+                Number(demoPerformance.config.preloadTileRequestsPerServer) || 18,
+            );
+        }
+        this._configurePanoramaTileset(this._panoramaTileset, true);
+        try {
+            const areaPreload = await this._preloadPanoramaAreaWithViewer(
+                viewer,
+                transform,
+                options,
+            );
+            const result = await this._capturePanoramaHybridWithViewerAsync(
+                viewer,
+                transform,
+                width,
+                height,
+                faceSize,
+                verticalFovDeg,
+                {
+                    faceFovDeg: options.faceFovDeg,
+                    topPoleGuardDeg: options.topPoleGuardDeg,
+                    bottomPoleGuardDeg: options.bottomPoleGuardDeg,
+                    frameDelayMs: options.frameDelayMs,
+                    tileTimeoutMs: options.tileTimeoutMs,
+                    tileQuietMs: options.tileQuietMs,
+                    captureAnyway: options.captureAnyway,
+                    continueOnTileTimeout: options.continueOnTileTimeout,
+                    facesPerSlice: options.facesPerSlice,
+                    signal: options.signal,
+                    progressCb: options.progressCb,
+                },
+            );
+            return { ...result, areaPreload };
+        } finally {
+            this._configurePanoramaTileset(this._panoramaTileset, false);
+            if (savedRequestsPerServer !== null) {
+                requestScheduler.maximumRequestsPerServer = savedRequestsPerServer;
+            }
+        }
+    }
+
+    async _preloadPanoramaAreaWithViewer(viewer, transform, options = {}) {
+        const radius = clampNumber(options.areaRadiusMeters, 0, 600, 0);
+        if (!viewer || radius <= 0) {
+            return Object.freeze({ positions: 0, faces: 0, settledFaces: 0 });
+        }
+
+        const spacing = clampNumber(options.areaSpacingMeters, 60, 300, 150);
+        const maxPositions = Math.round(clampNumber(options.areaMaxPositions, 1, 25, 13));
+        const faceTimeoutMs = clampNumber(options.areaFaceTimeoutMs, 100, 10000, 1500);
+        const faceQuietMs = clampNumber(options.areaFaceQuietMs, 0, 2000, 120);
+        const faceFovDeg = clampNumber(options.faceFovDeg, 90, 170, 130);
+        const signal = options.signal || null;
+        const progressCb = typeof options.progressCb === 'function' ? options.progressCb : null;
+        const basis = this.getTransformBasisFixed(transform);
+        const camera = viewer.camera;
+        const frustum = camera.frustum;
+        const targets = this._buildPreloadTargets(radius, spacing, maxPositions);
+        const horizontalFaces = PANORAMA_FACE_DEFS.filter(face => (
+            face.name === 'front' || face.name === 'right'
+            || face.name === 'back' || face.name === 'left'
+        ));
+        let settledFaces = 0;
+        let visitedFaces = 0;
+
+        if (frustum) {
+            if ('fov' in frustum) frustum.fov = faceFovDeg * Math.PI / 180;
+            if ('near' in frustum) frustum.near = 0.03;
+            if ('far' in frustum) frustum.far = this.panoramaFarMeters || 1200;
+        }
+
+        for (let positionIndex = 0; positionIndex < targets.length; positionIndex++) {
+            const offset = targets[positionIndex];
+            const destination = this.localToCartesian({
+                x: transform.position.x + offset.x,
+                y: transform.position.y,
+                z: transform.position.z + offset.z,
+            });
+            for (let faceIndex = 0; faceIndex < horizontalFaces.length; faceIndex++) {
+                if (signal?.aborted) {
+                    const error = new Error(String(signal.reason || 'panorama area preload aborted'));
+                    error.name = 'AbortError';
+                    throw error;
+                }
+                const face = horizontalFaces[faceIndex];
+                progressCb?.(
+                    `area ${positionIndex + 1}/${targets.length}, ${face.name} `
+                    + `(${settledFaces}/${visitedFaces || 1} settled)`,
+                );
+                camera.setView({
+                    destination,
+                    orientation: {
+                        direction: this._componentDirectionToFixed(basis, face.dir),
+                        up: this._componentDirectionToFixed(basis, face.up),
+                    },
+                });
+                viewer.scene.requestRender();
+                this._renderViewerNow(viewer);
+                const settled = await this.waitForTilesIdle(
+                    faceTimeoutMs,
+                    faceQuietMs,
+                    this._panoramaTileset,
+                    this._panoramaTileLoadState,
+                    viewer,
+                    null,
+                    signal,
+                );
+                visitedFaces++;
+                if (settled) settledFaces++;
+            }
+        }
+
+        progressCb?.(
+            `area sweep complete: ${settledFaces}/${visitedFaces} horizontal views settled`,
+        );
+        return Object.freeze({
+            radiusMeters: radius,
+            positions: targets.length,
+            faces: visitedFaces,
+            settledFaces,
         });
     }
 

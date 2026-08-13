@@ -35,6 +35,9 @@ class FakeContext2D {
     createImageData(width, height) {
         return { data: new Uint8ClampedArray(width * height * 4) };
     }
+    getImageData(_x, _y, width, height) {
+        return { data: new Uint8ClampedArray(width * height * 4) };
+    }
     createLinearGradient() { return { addColorStop() {} }; }
 }
 
@@ -706,7 +709,7 @@ async function nextTask() {
     await sensor._waitForDepthPreviewIdle();
     assert.equal(sensor.depthCanvas.context.drawCalls.length, 1);
 
-    sensor._lastPlanningPreviewFetchAt -= 2001;
+    sensor._lastPlanningPreviewFetchAt -= 501;
     globalThis.createImageBitmap = async () => fakeBitmap('sampled-preview');
     sensor.setYopoPose({ x: 2, y: 100, z: 0, vx: 1, vy: 0, vz: 0, simTimeS: 1.1 }, 0);
     sensor.primeFromCaptureResult(new FakeCanvas('sampled-preview-third-rgb'));
@@ -714,7 +717,7 @@ async function nextTask() {
     await sensor._waitForDepthPreviewIdle();
     assert.equal(planningUrls[2].searchParams.get('include_preview'), '0');
     assert.equal(previewUrls.length, 2,
-        'independent preview sampling resumes after the 2 s cadence window');
+        'independent preview sampling resumes after the 0.5 s demo cadence window');
 }
 
 // If preview-producing planning responses outrun decoding, retain only the

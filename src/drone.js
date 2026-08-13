@@ -226,6 +226,8 @@ export class Drone {
         // ---- Output state ----
         this.isColliding      = false;
         this.collisionIntensity = 0;
+        this.lastCollisionEvent = null;
+        this._collisionEventSequence = 0;
         this.speed            = 0;
         this.groundSpeed      = 0;
         this.airSpeed         = 0;
@@ -2814,6 +2816,8 @@ export class Drone {
         if (collisionProvider && typeof collisionProvider.queryCollisionResponse === 'function') {
             let anyCollision = false;
             let strongest = 0;
+            let strongestHit = null;
+            const impactVelocity = { x: this.vx, y: this.vy, z: this.vz };
 
             for (let i = 0; i < 3; i++) {
                 const collision = collisionProvider.queryCollisionResponse(this.x, this.y, this.z, this.collisionRadius, {
@@ -2825,7 +2829,10 @@ export class Drone {
                 if (!collision || collision.penetration <= 0) break;
 
                 anyCollision = true;
-                strongest = Math.max(strongest, collision.penetration);
+                if (collision.penetration > strongest) {
+                    strongest = collision.penetration;
+                    strongestHit = collision;
+                }
 
                 const pushDist = collision.penetration + 0.04;
                 this.x += collision.normal.x * pushDist;
@@ -2836,7 +2843,8 @@ export class Drone {
                               this.vy * collision.normal.y +
                               this.vz * collision.normal.z;
                 if (vDotN < 0) {
-                    const bounce = collision.source === 'swept' || collision.source === 'ray'
+                    const bounce = String(collision.source || '').startsWith('swept')
+                        || collision.source === 'ray'
                         ? Math.max(this.bounceDamping, 0.55)
                         : this.bounceDamping;
                     this.vx -= collision.normal.x * vDotN * (1 + bounce);
@@ -2857,6 +2865,31 @@ export class Drone {
             if (anyCollision) {
                 this.isColliding = true;
                 this.collisionIntensity = Math.min(1, strongest / Math.max(this.collisionRadius, 0.05));
+                if (!wasColliding) {
+                    this.lastCollisionEvent = Object.freeze({
+                        sequence: ++this._collisionEventSequence,
+                        simTimeS: this._simTimeS,
+                        position: Object.freeze({ x: this.x, y: this.y, z: this.z }),
+                        contactPoint: strongestHit?.position
+                            ? Object.freeze({ ...strongestHit.position })
+                            : null,
+                        normal: strongestHit?.normal
+                            ? Object.freeze({ ...strongestHit.normal })
+                            : null,
+                        velocity: Object.freeze(impactVelocity),
+                        speedMps: Math.hypot(
+                            impactVelocity.x,
+                            impactVelocity.y,
+                            impactVelocity.z,
+                        ),
+                        penetrationM: strongest,
+                        source: strongestHit?.source || 'unknown',
+                        probeIndex: Number.isInteger(strongestHit?.probeIndex)
+                            ? strongestHit.probeIndex
+                            : null,
+                        pointCount: Number(strongestHit?.pointCount) || null,
+                    });
+                }
                 if (this.flightMode === 'drone') {
                     this._targetX = this.x;
                     this._targetY = this.y;

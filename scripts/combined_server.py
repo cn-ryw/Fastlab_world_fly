@@ -74,6 +74,55 @@ _depth_cache_lock = threading.Lock()
 _planning_preview_cache = OrderedDict()
 
 
+_UNKNOWN_FACE_COLUMN_RANGES = {
+    # ERP projector: yaw = pi - u*2pi. Cubemap selection changes at 45 deg.
+    "front": ((0.375, 0.625),),
+    "right": ((0.125, 0.375),),
+    "back": ((0.0, 0.125), (0.875, 1.0)),
+    "left": ((0.625, 0.875),),
+}
+
+
+def _apply_unknown_panorama_obstacles(pred_depth, raw_faces):
+    """Map unresolved horizontal panorama sectors to conservative near depth."""
+    requested = {
+        item.strip().lower()
+        for item in str(raw_faces or "").split(",")
+        if item.strip()
+    }
+    faces = tuple(face for face in _UNKNOWN_FACE_COLUMN_RANGES if face in requested)
+    if not faces:
+        return pred_depth, {
+            "faces": [], "masked_fraction": 0.0, "depth_m": None,
+        }
+
+    depth_m = max(0.04, min(5.0, env_float("YOPO_UNKNOWN_TILE_DEPTH_M", 0.6)))
+    result = np.asarray(pred_depth, dtype=np.float32).copy()
+    if result.ndim < 2:
+        raise ValueError("DA360 depth must have at least two dimensions")
+    height, width = result.shape[-2:]
+    # Horizontal cubemap faces drive the central ERP band. Preserve the polar
+    # caps, whose readiness is represented independently by up/down faces.
+    row_start = max(0, min(height, int(round(height * 0.20))))
+    row_end = max(row_start + 1, min(height, int(round(height * 0.80))))
+    masked_columns = set()
+    for face in faces:
+        for start_fraction, end_fraction in _UNKNOWN_FACE_COLUMN_RANGES[face]:
+            col_start = max(0, min(width, int(round(width * start_fraction))))
+            col_end = max(col_start + 1, min(width, int(round(width * end_fraction))))
+            current = result[..., row_start:row_end, col_start:col_end]
+            result[..., row_start:row_end, col_start:col_end] = np.where(
+                np.isfinite(current), np.minimum(current, depth_m), depth_m,
+            )
+            masked_columns.update(range(col_start, col_end))
+    fraction = (row_end - row_start) * len(masked_columns) / max(1, height * width)
+    return result, {
+        "faces": list(faces),
+        "masked_fraction": float(fraction),
+        "depth_m": float(depth_m),
+    }
+
+
 def _depth_cache_entry(pred_depth, request_metadata):
     """Freeze one inference result and its provenance for cache publication."""
     calibration = getattr(da360_runner, "calibration", None)
@@ -575,6 +624,10 @@ def yopo_plan_full():
         request_metadata = _request_image_metadata(image)
         t_decode = time.perf_counter()
         pred_depth = _infer_configured_depth(da360_runner, image, request_metadata)
+        pred_depth, unknown_obstacles = _apply_unknown_panorama_obstacles(
+            pred_depth,
+            request.args.get("unknown_faces"),
+        )
         t1 = time.perf_counter()
         _cache_planning_depth(pred_depth, request_metadata, identity)
 
@@ -656,6 +709,7 @@ def yopo_plan_full():
             "planning_authorized": planning_authorized,
             "planning_reason": planning_reason,
             "service_session_id": SERVICE_SESSION_ID,
+            "unknown_obstacles": unknown_obstacles,
             "latency_ms": (time.perf_counter() - started) * 1000.0,
             "timings_ms": {
                 "decode_ms": (t_decode - t0) * 1000.0,
@@ -693,6 +747,7 @@ def yopo_plan_full():
             f"color+jpeg={1000*(t_color-t_polar):.0f}ms "
             f"yopo={1000*(t2-t_color):.0f}ms "
             f"preview={include_preview} "
+            f"unknown_faces={','.join(unknown_obstacles['faces']) or '-'} "
             f"authorized={planning_authorized} reason={planning_reason} "
             f"json={1000*(t3-t2):.0f}ms total={1000*(t3-started):.0f}ms",
             flush=True,

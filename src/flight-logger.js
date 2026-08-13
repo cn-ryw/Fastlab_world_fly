@@ -1,3 +1,5 @@
+import { demoPerformance } from './demo-performance.js?v=20260813-panorama-unknown-mask-r7';
+
 /**
  * Flight data logger — records pose, velocity, goal, and controller state
  * during goal-based autonomous navigation.  Auto-starts on goal set,
@@ -62,11 +64,16 @@ const SAFE_URL_QUERY_KEYS = new Set([
     'flightPreloadViewTimeoutMs',
     'flightPreloadViewAttempts',
     'flightPreloadStrict',
+    'perfProfile',
+    'tileRequestsPerServer',
+    'dynamicSse',
 ]);
 
 const SAFE_URL_ENUM_VALUES = Object.freeze({
     panoProfile: new Set(['flight', 'calibration']),
     panoCaptureProfile: new Set(['flight', 'calibration']),
+    perfProfile: new Set(['demo30', 'baseline']),
+    dynamicSse: new Set(['current', 'off']),
 });
 
 function isSafeResolvedUrlParam(key, values) {
@@ -227,6 +234,10 @@ export class FlightLogger {
         this._yopoLatencies = [];
         this._yopoTrackerCount = 0;  // 帧数：有活跃 YOPO 轨迹
         this._perceptionMetrics = [];
+        this._collisionEvents = [];
+        if (!Number.isSafeInteger(this._lastCollisionSequence)) {
+            this._lastCollisionSequence = 0;
+        }
         this._planningApplyTimes = [];
         this._appliedPlanningFrames = new Set();
         this._dropReasons = {};
@@ -252,6 +263,7 @@ export class FlightLogger {
         this._yopoLatencies = [];
         this._yopoTrackerCount = 0;
         this._perceptionMetrics = [];
+        this._collisionEvents = [];
         this._planningApplyTimes = [];
         this._appliedPlanningFrames = new Set();
         this._dropReasons = {};
@@ -349,6 +361,26 @@ export class FlightLogger {
         }
         this._lastPhysicsUpdateAt = now;
         const control = compactControlDiagnostics(drone);
+        const collisionEvent = drone.lastCollisionEvent;
+        let collision = null;
+        if (collisionEvent && collisionEvent.sequence > this._lastCollisionSequence) {
+            this._lastCollisionSequence = collisionEvent.sequence;
+            collision = {
+                sequence: collisionEvent.sequence,
+                simTimeS: roundedFinite(collisionEvent.simTimeS, 6),
+                position: diagnosticVector(collisionEvent.position),
+                contactPoint: diagnosticVector(collisionEvent.contactPoint),
+                normal: diagnosticVector(collisionEvent.normal),
+                velocity: diagnosticVector(collisionEvent.velocity),
+                speedMps: roundedFinite(collisionEvent.speedMps),
+                penetrationM: roundedFinite(collisionEvent.penetrationM, 4),
+                source: collisionEvent.source || null,
+                probeIndex: collisionEvent.probeIndex ?? null,
+                pointCount: collisionEvent.pointCount ?? null,
+                recordedAtMs: now,
+            };
+            this._collisionEvents.push(collision);
+        }
         this._frames.push({
             recordedAtMs: now,
             t: Math.round(t * 1000) / 1000,
@@ -376,6 +408,7 @@ export class FlightLogger {
                 y: roundedFinite(drone._idealGoal.y),
                 z: roundedFinite(drone._idealGoal.z),
             } : null,
+            collision,
             control,
             scheduler: schedule ? {
                 steps: Number(schedule.steps) || 0,
@@ -494,6 +527,7 @@ export class FlightLogger {
         const calibrationIds = [...new Set(
             this._perceptionMetrics.map(item => item.calibrationId).filter(Boolean)
         )];
+        const demoMetrics = demoPerformance.snapshotSince(this._startTime);
 
         const log = {
             schemaVersion: 2,
@@ -504,6 +538,10 @@ export class FlightLogger {
             runtime: {
                 userAgent: globalThis.navigator?.userAgent || null,
                 hardwareConcurrency: Number(globalThis.navigator?.hardwareConcurrency) || null,
+                performanceProfile: demoMetrics.performanceProfile,
+                tileRequestsPerServer: demoMetrics.tileRequestsPerServer,
+                dynamicSse: demoMetrics.dynamicSse,
+                yopoStrategy: demoMetrics.yopoStrategy,
             },
             spawnAltitude: this._spawnAlt,
             goal: this._goal,
@@ -619,13 +657,29 @@ export class FlightLogger {
                 )),
                 terminalPhaseCounts,
                 physicsUpdateIntervalP95Ms: percentile(this._physicsUpdateIntervals, 0.95),
-                flightLoopIntervalP95Ms: percentile(this._physicsUpdateIntervals, 0.95),
+                flightLoopIntervalP95Ms: demoMetrics.mainFrameIntervalP95Ms,
+                mainMedianFps: demoMetrics.mainMedianFps,
+                mainFrameIntervalP50Ms: demoMetrics.mainFrameIntervalP50Ms,
+                mainFrameIntervalP95Ms: demoMetrics.mainFrameIntervalP95Ms,
+                mainFrameIntervalP99Ms: demoMetrics.mainFrameIntervalP99Ms,
+                mainLongFrame100MsCount: demoMetrics.mainLongFrame100MsCount,
+                mainLongFrame250MsCount: demoMetrics.mainLongFrame250MsCount,
+                planningCaptureHz: demoMetrics.planningCaptureHz,
+                previewCaptureHz: demoMetrics.previewCaptureHz,
+                latestSlotDroppedFrames: demoMetrics.latestSlotDroppedFrames,
+                adaptiveResolutionScaleMin: demoMetrics.adaptiveResolutionScaleMin,
+                adaptiveResolutionScaleMax: demoMetrics.adaptiveResolutionScaleMax,
+                adaptiveResolutionScaleFinal: demoMetrics.adaptiveResolutionScaleFinal,
+                panoramaFacesPerSliceFinal: demoMetrics.panoramaFacesPerSliceFinal,
+                tileLoad: demoMetrics.tileLoad,
+                preload: demoMetrics.preload,
                 droppedByReason: this._dropReasons,
                 droppedByModeReason: this._dropReasonsByMode,
                 crossSessionPerceptionDropped: this._crossSessionPerceptionDropped,
                 calibrationIds,
             },
             perception: this._perceptionMetrics,
+            collisions: this._collisionEvents,
             frames: this._frames,
         };
         const blob = new Blob([JSON.stringify(log, null, 2)], { type: 'application/json' });

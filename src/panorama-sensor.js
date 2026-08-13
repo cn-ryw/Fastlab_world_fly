@@ -1,4 +1,5 @@
 import { reportUserError } from './error-report.js';
+import { demoPerformance } from './demo-performance.js?v=20260813-panorama-unknown-mask-r7';
 import { PerceptionFrame, normalizePlanningState } from './perception-frame.js';
 import { normalizeDepthPolarScan } from './depth-topdown.js';
 
@@ -86,7 +87,7 @@ const YOPO_APPLY_DEADLINE_RESERVE_MS = 2;
 // still consumes the Flask service thread for color/JPEG encoding, so sample it
 // at only 0.5 Hz: at 15 Hz planning this affects at most one request in ~30 and
 // stays outside the p95 control cadence.
-const PLANNING_PREVIEW_INTERVAL_MS = 2000;
+const PLANNING_PREVIEW_INTERVAL_MS = demoPerformance.planningPreviewIntervalMs(2000);
 const STALE_LOG_SUMMARY_INTERVAL_MS = 2000;
 const IS_CHROMIUM = typeof navigator !== 'undefined'
     && /\bChrom(?:e|ium)\//.test(String(navigator.userAgent || ''));
@@ -583,6 +584,7 @@ export class PanoramaSensor {
         this.depthFarLabelEl = document.getElementById('panorama-depth-far-label');
         this.depthUnitEl = document.getElementById('panorama-depth-unit');
         this.endpoint = getDA360Endpoint();
+        demoPerformance.loadYopoStrategy(this.endpoint);
         this.active = false;
         this.capturing = false;
         this._captureProfile = initialCaptureProfile();
@@ -804,6 +806,7 @@ export class PanoramaSensor {
         const preload = !!options.preload;
         const profile = normalizeCaptureProfile(options.profile, this._captureProfile);
         const calibration = profile === 'calibration';
+        const demoPreload = preload && demoPerformance.config.profile === 'demo30';
         return {
             profile,
             width: PANORAMA_WIDTH,
@@ -820,17 +823,23 @@ export class PanoramaSensor {
             // face and actually let Cesium settle its tile queue. Live flight
             // remains the separate zero-wait/capture-anyway path below.
             frameDelayMs: preload
-                ? PANORAMA_PRELOAD_FRAME_DELAY_MS
+                ? (demoPreload
+                    ? demoPerformance.config.preloadFrameDelayMs
+                    : PANORAMA_PRELOAD_FRAME_DELAY_MS)
                 : calibration
                 ? PANORAMA_FRAME_DELAY_MS
                 : 0,
             tileTimeoutMs: preload
-                ? PANORAMA_PRELOAD_FACE_TILE_TIMEOUT_MS
+                ? (demoPreload
+                    ? demoPerformance.config.preloadFaceTileTimeoutMs
+                    : PANORAMA_PRELOAD_FACE_TILE_TIMEOUT_MS)
                 : calibration
                 ? PANORAMA_FACE_TILE_TIMEOUT_MS
                 : 0,
             tileQuietMs: preload
-                ? PANORAMA_PRELOAD_FACE_TILE_QUIET_MS
+                ? (demoPreload
+                    ? demoPerformance.config.preloadFaceTileQuietMs
+                    : PANORAMA_PRELOAD_FACE_TILE_QUIET_MS)
                 : calibration
                 ? PANORAMA_FACE_TILE_QUIET_MS
                 : 0,
@@ -843,8 +852,15 @@ export class PanoramaSensor {
             // Six synchronous Cesium renders blocked Chrome's main/physics
             // loop for a complete panorama. Keep JPEG/inference pipelined,
             // but yield after two faces so the flight view can present frames.
-            facesPerSlice: IS_CHROMIUM ? 2 : PANORAMA_FACES_PER_SLICE,
-            timeoutMs: preload ? PANORAMA_PRELOAD_TIMEOUT_MS : 0,
+            facesPerSlice: demoPerformance.facesPerSlice(
+                IS_CHROMIUM,
+                PANORAMA_FACES_PER_SLICE,
+            ),
+            timeoutMs: preload
+                ? (demoPerformance.config.profile === 'demo30'
+                    ? Math.min(PANORAMA_PRELOAD_TIMEOUT_MS, demoPerformance.config.preloadTimeoutMs)
+                    : PANORAMA_PRELOAD_TIMEOUT_MS)
+                : 0,
         };
     }
 
@@ -1018,9 +1034,14 @@ export class PanoramaSensor {
         ctx.clearRect(0, 0, this.rgbCanvas.width, this.rgbCanvas.height);
         ctx.drawImage(panoCanvas, 0, 0, this.rgbCanvas.width, this.rgbCanvas.height);
         const now = performance.now();
-        this.lastCaptureStartTime = now;
+        if (!Number.isFinite(this.lastCaptureStartTime) || this.lastCaptureStartTime <= 0) {
+            this.lastCaptureStartTime = now;
+        }
         this.lastCaptureTime = now;
+        const replacedUnrequestedFrame = this._rgbFrameId > this._lastRequestedFrameId;
         this._rgbFrameId++;
+        if (replacedUnrequestedFrame) demoPerformance.recordLatestSlotDrop(now);
+        demoPerformance.recordCapture(this._desiredDepthMode(), now, captureMs);
         this._rgbReadiness = Object.freeze({ frameId: this._rgbFrameId, ...readiness });
         const planningState = context.planningState || this._nextPlanningState;
         this._rgbFrameContext = this._makeRgbFrameContext(
@@ -1064,7 +1085,12 @@ export class PanoramaSensor {
         // produced its frozen RGB. Do not begin the next six-face capture until
         // anchors and raw output have both been bound to that frame.
         if (this._calibrationCapturePending) return;
-        if (now - this.lastCaptureStartTime < CAPTURE_INTERVAL_MS) return;
+        const captureIntervalMs = demoPerformance.captureIntervalMs(
+            this._desiredDepthMode(),
+            this._nextPlanningState || this._yopoPose,
+            CAPTURE_INTERVAL_MS,
+        );
+        if (now - this.lastCaptureStartTime < captureIntervalMs) return;
         this._capture(world, transform);
     }
 
@@ -1263,6 +1289,12 @@ export class PanoramaSensor {
         return Object.freeze({
             rgbFrameId: Number.isSafeInteger(source?.frameId) ? source.frameId : null,
             rgbFrameComplete: source?.rgbFrameComplete === true,
+            rgbCapturedFaces: source?.rgbFrameComplete === true
+                ? Math.max(0, Number(source?.rgbTotalFaces) || PANORAMA_TOTAL_FACES)
+                : Math.min(
+                    Math.max(0, Number(source?.rgbTotalFaces) || PANORAMA_TOTAL_FACES),
+                    source?.faceTileReadiness?.length || 0,
+                ),
             rgbTilesReady: source?.rgbTilesReady === true,
             rgbReadyFaces: Math.max(0, Number(source?.rgbReadyFaces) || 0),
             rgbTotalFaces: Math.max(0, Number(source?.rgbTotalFaces) || PANORAMA_TOTAL_FACES),
@@ -1281,8 +1313,67 @@ export class PanoramaSensor {
         return this._yopoGoal ? 'planning' : 'preview';
     }
 
+    _criticalRgbReadiness(readiness = this._rgbReadiness) {
+        const criticalFaces = ['front', 'right', 'back', 'left'];
+        const faceStates = new Map(
+            (readiness?.faceTileReadiness || []).map(face => [face.face, face]),
+        );
+        const unresolvedFaces = criticalFaces.filter(
+            face => faceStates.get(face)?.readyWhenCopied !== true,
+        );
+        return Object.freeze({
+            ready: readiness?.rgbFrameComplete === true
+                && readiness?.rgbTileError !== true
+                && unresolvedFaces.length === 0,
+            unresolvedFaces: Object.freeze(unresolvedFaces),
+        });
+    }
+
+    _allowPlanningFromCurrentRgb() {
+        if (!this._yopoGoal) {
+            this._planningRgbBlocked = false;
+            this._planningRgbBlockKey = null;
+            return true;
+        }
+
+        const status = this._criticalRgbReadiness();
+        if (status.ready) {
+            this._planningRgbBlocked = false;
+            this._planningRgbBlockKey = null;
+            return true;
+        }
+
+        const unresolved = status.unresolvedFaces.length
+            ? status.unresolvedFaces.join(',')
+            : this._rgbReadiness?.rgbReadinessReason || 'capture-incomplete';
+        const reason = `awaiting-critical-rgb-tiles:${unresolved}`;
+        this._setDepthState('planning', reason, { outcome: 'blocked' });
+        if (!this._planningRgbBlocked || this._planningRgbBlockKey !== reason) {
+            this._planningRgbBlocked = true;
+            this._planningRgbBlockKey = reason;
+            this._abortActiveDepthRequest('rgb-tiles-unresolved');
+            try {
+                this.onPlanningBlocked?.(Object.freeze({
+                    reason: 'rgb-tiles-unresolved',
+                    detail: reason,
+                    frameId: this._rgbFrameId,
+                    goalId: this._goalId,
+                    generation: this._yopoGeneration,
+                    unresolvedFaces: status.unresolvedFaces,
+                }));
+            } catch (error) {
+                reportUserError('Planning RGB hold callback failed', error, {
+                    key: 'planning-rgb-hold-callback',
+                    intervalMs: 3000,
+                });
+            }
+        }
+        return false;
+    }
+
     _shouldRequestDepth(now = performance.now()) {
-        if (!this.hasRgb || this._depthGate || this.depthPending) return false;
+        if (!this.hasRgb) return false;
+        if (this._depthGate || this.depthPending) return false;
         if (this._planningPaused && this._yopoGoal) return false;
         if (this._rgbFrameId <= this._lastRequestedFrameId) return false;
         if (this._rgbFrameId < this._minimumRequestFrameId) return false;
@@ -1608,7 +1699,8 @@ export class PanoramaSensor {
     }
 
     _queueLatestDepthRequest(now = performance.now()) {
-        if (!this.hasRgb || this._depthGate || this.depthPending) return;
+        if (!this.hasRgb) return;
+        if (this._depthGate || this.depthPending) return;
         if (this._planningPaused && this._yopoGoal) return;
         if (this._rgbFrameId <= this._lastRequestedFrameId) return;
         if (this._rgbFrameId < this._minimumRequestFrameId) return;
@@ -2024,6 +2116,11 @@ export class PanoramaSensor {
                     frame_id: String(request.frameId),
                     goal_id: String(request.goalId),
                     generation: String(request.generation),
+                    unknown_faces: frame.faceTileReadiness
+                        .filter(face => face?.readyWhenCopied !== true)
+                        .map(face => String(face.face || ''))
+                        .filter(Boolean)
+                        .join(','),
                     // Control responses are always compact. Operator preview
                     // is fetched later from the exact cached planning depth on
                     // an independent latest-only worker.
@@ -2435,7 +2532,8 @@ export class PanoramaSensor {
                 console.log(
                     `[depth] ${fps.toFixed(1)}Hz mode=${request.mode} goalId=${request.goalId || '-'} `
                     + `frameId=${request.frameId} generation=${request.generation} `
-                    + `rgbTiles=${frameContext.rgbReadyFaces}/${frameContext.rgbTotalFaces} `
+                    + `rgbCaptured=${frameContext.rgbFrameComplete ? frameContext.rgbTotalFaces : 0}/${frameContext.rgbTotalFaces} `
+                    + `rgbSettled=${frameContext.rgbReadyFaces}/${frameContext.rgbTotalFaces} `
                     + `depthLag=${depthPreviewLagFrames}f `
                     + `reason=${finalReason ? `${outcome}:${finalReason}` : 'ok'} `
                     + `capture=${Math.round(frameContext.captureTimings?.total || 0)}ms `

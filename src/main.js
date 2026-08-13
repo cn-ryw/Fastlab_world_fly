@@ -23,20 +23,21 @@
  * from the original simulator.
  */
 
-import { CesiumWorld } from './cesium-world.js?v=20260812-chrome-panorama-init';
-import { TilesCollisionProvider } from './tiles-collision.js?v=20260812-swept-sphere';
+import { CesiumWorld } from './cesium-world.js?v=20260813-panorama-renderable-r8';
+import { TilesCollisionProvider } from './tiles-collision.js?v=20260813-panorama-continuity-r2';
 import { Controller } from './controller.js?v=20260812-shared-controller-config';
-import { Drone } from './drone.js?v=20260812-so3-fixed-world-yaw';
+import { Drone } from './drone.js?v=20260813-panorama-continuity-r2';
 import { HUD } from './hud.js?v=20260811-control-v6';
 import { OSD } from './osd.js?v=20260811-control-v6';
-import { PanoramaSensor } from './panorama-sensor.js?v=20260813-raw-rgba-latest-slot';
-import { FlightLogger } from './flight-logger.js?v=20260812-t8l';
+import { PanoramaSensor } from './panorama-sensor.js?v=20260813-panorama-unknown-mask-r7';
+import { FlightLogger } from './flight-logger.js?v=20260813-panorama-unknown-mask-r7';
 import { reportUserError } from './error-report.js';
 import {
     computeT8LRollingGoal,
     T8L_GOAL_DEADZONE,
 } from './t8l-rolling-goal.js?v=20260813-so3-goal-50m';
 import { FixedStepScheduler } from './fixed-step-scheduler.js?v=20260811';
+import { demoPerformance } from './demo-performance.js?v=20260813-panorama-unknown-mask-r7';
 import {
     drawDepthTopdown,
     depthTopdownLabels,
@@ -83,12 +84,27 @@ let thirdPersonCamera = {
 const SPAWN_ALTITUDE_MIN = 0;
 const SPAWN_ALTITUDE_MAX = 20000;
 const SPAWN_ALTITUDE_SLIDER_DEFAULT_MAX = 1000;
-const SPAWN_PRELOAD_RADIUS_METERS = Math.round(urlNumber('flightPreloadRadius', 500, 120, 2000));
+const SPAWN_PRELOAD_RADIUS_METERS = Math.round(urlNumber(
+    'flightPreloadRadius',
+    demoPerformance.config.preloadRadiusMeters,
+    120,
+    2000,
+));
 const FLIGHT_PRELOAD_MIN_COVERAGE = urlNumber('flightPreloadMinCoverage', 0.95, 0.5, 1);
-const FLIGHT_PRELOAD_VIEW_TIMEOUT_MS = Math.round(urlNumber('flightPreloadViewTimeoutMs', 20000, 3000, 60000));
+const FLIGHT_PRELOAD_VIEW_TIMEOUT_MS = Math.round(urlNumber(
+    'flightPreloadViewTimeoutMs',
+    demoPerformance.config.preloadTimeoutMs,
+    3000,
+    60000,
+));
 const FLIGHT_PRELOAD_VIEW_ATTEMPTS = Math.round(urlNumber('flightPreloadViewAttempts', 2, 1, 5));
 const FLIGHT_PRELOAD_STRICT = urlNumber('flightPreloadStrict', 0, 0, 1) >= 0.5;
-const PANORAMA_PRELOAD_REQUIRED = urlNumber('panoPreloadRequired', 0, 0, 1) >= 0.5;
+const PANORAMA_PRELOAD_REQUIRED = urlNumber(
+    'panoPreloadRequired',
+    demoPerformance.config.preloadRequired ? 1 : 0,
+    0,
+    1,
+) >= 0.5;
 const VIEW_CHOICE_HINT_HTML = '1 / O: First Person &nbsp;|&nbsp; 2: Third Person<br>Easy speed: ↑/↓ forward/back, Shift boost, Tab &gt; Easy Max Speed';
 const MAX_PLACEMENT_FRAME_DT = 0.05;
 const SETTINGS_READ_INTERVAL_MS = 100;
@@ -207,22 +223,25 @@ function updatePanoramaReadinessIndicator() {
     const reason = String(state?.rgbReadinessReason || 'capture-incomplete');
     const tileError = state?.rgbTileError === true || reason === 'tile-error';
     const frameSeen = Number(state?.rgbFrameId) > 0 || state?.rgbFrameComplete === true;
+    const capturedFaces = state?.rgbFrameComplete === true
+        ? totalFaces
+        : Math.min(totalFaces, state?.faceTileReadiness?.length || 0);
 
     let displayState;
     let label;
     let title;
     if (tileError) {
         displayState = 'error';
-        label = `TILE ERROR ${readyFaces}/${totalFaces} \u00b7 AUTO UNVERIFIED`;
-        title = 'Panorama tile requests failed. Automatic testing remains enabled, but obstacle perception is not verified.';
+        label = `CAPTURED ${capturedFaces}/${totalFaces} \u00b7 TILE ERROR`;
+        title = 'The RGB frame was captured, but a panorama tile request failed. Autonomous perception is not verified.';
     } else if (state?.rgbTilesReady === true && readyFaces === totalFaces) {
         displayState = 'ready';
-        label = `RGB READY ${readyFaces}/${totalFaces}`;
-        title = 'All panorama faces reported their scene tiles ready when captured.';
+        label = `CAPTURED ${capturedFaces}/${totalFaces} \u00b7 SETTLED ${readyFaces}/${totalFaces}`;
+        title = 'All six panorama faces were captured and reported settled scene tiles.';
     } else if (frameSeen) {
         displayState = 'partial';
-        label = `RGB PARTIAL ${readyFaces}/${totalFaces} \u00b7 AUTO UNVERIFIED`;
-        title = 'A panorama frame is visible, but not every face confirmed tile readiness. Automatic testing remains enabled.';
+        label = `CAPTURED ${capturedFaces}/${totalFaces} \u00b7 SETTLED ${readyFaces}/${totalFaces} \u00b7 UNVERIFIED`;
+        title = 'Captured faces and settled tile faces are separate diagnostics. YOPO trajectory output is not modified.';
     } else {
         displayState = 'loading';
         label = `RGB LOADING ${readyFaces}/${totalFaces}`;
@@ -305,6 +324,7 @@ function initSubsystems() {
         if (!panoramaSensor) throw new Error('panorama sensor is not ready');
         return panoramaSensor.getCaptureProfile();
     };
+    window.__getDemoPerformance = () => demoPerformance.snapshotSince(0);
     window.__captureMetricCalibration = (locationId, options = {}) => {
         if (!panoramaSensor || !world) throw new Error('flight world is not ready');
         return panoramaSensor.captureCalibrationSample(world, { ...options, locationId });
@@ -337,7 +357,9 @@ export async function startTilesMode() {
         panoramaWarmupPromise = null;
         world = new CesiumWorld('cesium-container');
         await world.init(setProgress);
-        collisionProvider = new TilesCollisionProvider(world);
+        collisionProvider = new TilesCollisionProvider(world, {
+            sweepProbeMode: demoPerformance.config.collisionSweepMode,
+        });
         sceneLoaded = true;
 
         setupCesiumPlacementHandler();
@@ -396,6 +418,15 @@ async function preloadPanoramaBeforeFlight() {
     const preloadController = new AbortController();
     const options = {
         ...panoramaSensor.getCaptureOptions({ preload: true }),
+        timeoutMs: Math.max(
+            Number(panoramaSensor.getCaptureOptions({ preload: true })?.timeoutMs) || 0,
+            Number(demoPerformance.config.preloadTimeoutMs) || 180000,
+        ),
+        areaRadiusMeters: Number(demoPerformance.config.preloadRadiusMeters) || 300,
+        areaSpacingMeters: Number(demoPerformance.config.preloadAreaSpacingMeters) || 150,
+        areaMaxPositions: Number(demoPerformance.config.preloadAreaMaxPositions) || 13,
+        areaFaceTimeoutMs: Number(demoPerformance.config.preloadAreaFaceTimeoutMs) || 1500,
+        areaFaceQuietMs: Number(demoPerformance.config.preloadAreaFaceQuietMs) || 120,
         signal: preloadController.signal,
         progressCb: (message) => setProgress(
             `Preloading 360 panorama sensor · settling tiles (${message})...`,
@@ -423,11 +454,18 @@ async function preloadPanoramaBeforeFlight() {
         updatePanoramaReadinessIndicator();
         const strictPreload = PANORAMA_PRELOAD_REQUIRED || FLIGHT_PRELOAD_STRICT;
         const sceneTilesReady = result?.ready === true && result?.allFacesTileReady === true;
+        demoPerformance.recordPreload('panorama', {
+            ready: sceneTilesReady,
+            readyFaces: Number(result?.readyFaces) || 0,
+            totalFaces: Number(result?.faces) || 6,
+            elapsedMs: performance.now() - started,
+        });
         if (!framePrimed || !sceneTilesReady) {
             const readyFaces = Math.max(0, Number(result?.readyFaces) || 0);
             const totalFaces = Math.max(1, Number(result?.faces) || 6);
             const reason = String(result?.readinessReason || 'capture-incomplete');
-            const message = `panorama preload incomplete: tiles ${readyFaces}/${totalFaces} (${reason})`;
+            const capturedFaces = result?.complete === true ? totalFaces : 0;
+            const message = `panorama preload: captured ${capturedFaces}/${totalFaces}, settled ${readyFaces}/${totalFaces} (${reason})`;
             if (strictPreload) throw new Error(message);
             rememberFlightStartWarning(message);
         }
@@ -471,6 +509,7 @@ async function preloadInitialFlightViewsBeforeControl() {
     const firstReady = await settleFlightView('first-person flight view', () => {
         world.setCameraFromDroneTransform(cameraTransform, getCameraHFov());
     }, settleOptions);
+    demoPerformance.recordPreload('firstPerson', { ready: firstReady });
     if (!firstReady && FLIGHT_PRELOAD_STRICT) {
         throw new Error('First-person flight view tiles did not finish loading before control.');
     }
@@ -487,6 +526,7 @@ async function preloadInitialFlightViewsBeforeControl() {
     } finally {
         world.showAircraft(false);
     }
+    demoPerformance.recordPreload('thirdPerson', { ready: thirdReady });
     if (!thirdReady && FLIGHT_PRELOAD_STRICT) {
         throw new Error('Third-person flight view tiles did not finish loading before control.');
     }
@@ -1106,6 +1146,7 @@ function drawRadar() {
 }
 
 function gameLoop(now) {
+    demoPerformance.recordFrame(now);
     const frameDt = Math.max(0, (now - lastFrameTime) / 1000);
     lastFrameTime = now;
 
