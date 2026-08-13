@@ -20,7 +20,7 @@ assert(html.includes('Level (Self-Level)'), 'Level is labelled as self-level att
 assert(html.includes('value="yup" selected'), 'simulation coordinate display is Y-Up');
 assert(!html.includes('value="zup" selected'), 'UI no longer claims Z-Up');
 assert(html.includes('manual thrust—there is no altitude hold'), 'Level manual-thrust semantics are explained');
-assert(html.includes('connected RC transmitter continuously moves a 30 m rolling goal'),
+assert(html.includes('connected RC transmitter continuously moves a 50 m rolling goal'),
     'SO3 T8L rolling-goal semantics are explained');
 
 for (const obsoleteId of ['so3-kx', 'so3-kv', 'so3-kr', 'so3-komega']) {

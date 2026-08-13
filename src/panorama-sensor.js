@@ -105,6 +105,7 @@ const PANORAMA_HEIGHT = evenNumber(urlNumber('panoHeight', Math.round(PANORAMA_W
 const PANORAMA_FACE_SIZE = Math.round(urlNumber('panoFace', 96, 64, 2048));
 const PANORAMA_VERTICAL_FOV = urlNumber('panoVfov', 180, 30, 180);
 const PANORAMA_JPEG_QUALITY = urlNumber('panoJpeg', 0.74, 0.35, 0.95);
+const RAW_RGBA8_CONTENT_TYPE = 'application/x-mindcloud-rgba8';
 const PANORAMA_FACE_FOV = urlNumber('panoFaceFov', 130, 90, 170);
 const PANORAMA_TOP_POLE_GUARD = urlNumber('panoTopPoleGuard', 10, 0, 45);
 const PANORAMA_BOTTOM_POLE_GUARD = urlNumber('panoBottomPoleGuard', 2, 0, 45);
@@ -875,6 +876,23 @@ export class PanoramaSensor {
             width: snapshot.width,
             height: snapshot.height,
             jpegMs: performance.now() - startedAt,
+            uploadEncoding: 'jpeg',
+        };
+    }
+
+    _snapshotRgbRgba(canvas) {
+        const startedAt = performance.now();
+        const upload = this._depthUploadCanvas(canvas);
+        const ctx = upload.getContext('2d', { alpha: false, willReadFrequently: true });
+        const image = ctx.getImageData(0, 0, upload.width, upload.height);
+        return {
+            // Blob construction freezes this exact typed-array view before the
+            // shared upload canvas can be overwritten by a newer capture.
+            blob: new Blob([image.data], { type: RAW_RGBA8_CONTENT_TYPE }),
+            width: upload.width,
+            height: upload.height,
+            jpegMs: performance.now() - startedAt,
+            uploadEncoding: 'rgba8',
         };
     }
 
@@ -921,6 +939,7 @@ export class PanoramaSensor {
         // reads this getter synchronously before yielding, which freezes the
         // matching canvas once and memoizes that one encode.
         let rgbPromise = null;
+        let rawRgbPayload = null;
         Object.defineProperty(context, 'rgbPromise', {
             enumerable: true,
             get: () => {
@@ -928,12 +947,31 @@ export class PanoramaSensor {
                 return rgbPromise;
             },
         });
+        Object.defineProperty(context, 'rawRgbPayload', {
+            enumerable: true,
+            get: () => {
+                if (!rawRgbPayload) rawRgbPayload = this._snapshotRgbRgba(canvas);
+                return rawRgbPayload;
+            },
+        });
         return Object.freeze(context);
     }
 
-    async _materializePerceptionFrame(context) {
+    async _materializePerceptionFrame(context, requestedEncoding = 'jpeg') {
         if (!context) throw new Error('RGB frame context unavailable');
-        const encoded = await context.rgbPromise;
+        let encoded;
+        if (requestedEncoding === 'rgba8') {
+            try {
+                encoded = context.rawRgbPayload;
+            } catch (error) {
+                reportUserError('Raw planning upload unavailable; using JPEG', error, {
+                    key: 'raw-planning-upload', intervalMs: 3000,
+                });
+                encoded = await context.rgbPromise;
+            }
+        } else {
+            encoded = await context.rgbPromise;
+        }
         if (!encoded?.blob) throw new Error('RGB JPEG encoding failed');
         const planningState = context.planningState;
         const frame = new PerceptionFrame({
@@ -961,7 +999,11 @@ export class PanoramaSensor {
                 uploadScale: encoded.width / context.projectionConfig.width,
             },
         });
-        return { frame, jpegMs: encoded.jpegMs };
+        return {
+            frame,
+            jpegMs: encoded.jpegMs,
+            uploadEncoding: encoded.uploadEncoding || 'jpeg',
+        };
     }
 
     primeFromCaptureResult(result, captureMs = 0, context = {}) {
@@ -1398,6 +1440,7 @@ export class PanoramaSensor {
             da360Ms: finiteNumberOrNull(request?.da360Ms),
             yopoMs: finiteNumberOrNull(request?.yopoMs),
             serverTimings: request?.serverTimings || null,
+            uploadEncoding: request?.uploadEncoding || null,
             ...planningMetadata,
             planningDiagnosticsSchemaVersion: observedSchemaVersion
                 ?? planningMetadata.planningDiagnosticsSchemaVersion,
@@ -1905,6 +1948,7 @@ export class PanoramaSensor {
             parsedEndstate: null,
             planningDiagnosticsSchemaVersionObserved: null,
             planningMetadata: null,
+            uploadEncoding: mode === 'planning' ? 'rgba8' : 'jpeg',
         };
         this._depthReqStart = request.gateAcquiredAt;
         this._lastRequestedFrameId = request.frameId;
@@ -1928,13 +1972,14 @@ export class PanoramaSensor {
                 return false;
             }
             const materialized = await awaitWithAbort(
-                this._materializePerceptionFrame(frameContext),
+                this._materializePerceptionFrame(frameContext, request.uploadEncoding),
                 request.controller.signal,
             );
             const frame = materialized.frame;
             request.perceptionFrame = frame;
             this._perceptionFrame = frame;
             request.jpegMs = finiteNumberOrNull(materialized.jpegMs);
+            request.uploadEncoding = materialized.uploadEncoding;
             const blob = frame.rgb;
             tB = performance.now();
             if (!this._isRequestSourceCurrent(request)) {
@@ -1986,9 +2031,13 @@ export class PanoramaSensor {
                 }).toString();
                 url = `${getYopoEndpoint()}?${qs}`;  // /yopo/plan_full
                 headers = {
-                    'Content-Type': 'image/jpeg',
+                    'Content-Type': blob.type || 'image/jpeg',
                     'X-Projection-Config': projectionHeader,
                 };
+                if (request.uploadEncoding === 'rgba8') {
+                    headers['X-Image-Width'] = String(frame.projectionConfig.rgbWidth);
+                    headers['X-Image-Height'] = String(frame.projectionConfig.rgbHeight);
+                }
                 body = blob;
             } else {
                 url = this.endpoint;  // /depth
@@ -2397,6 +2446,7 @@ export class PanoramaSensor {
                     + `upload=${Math.round(frameContext.captureTimings?.face_upload || 0)}ms `
                     + `project=${Math.round(frameContext.captureTimings?.project || 0)}ms `
                     + `jpeg=${Math.round(materialized.jpegMs || tB - tA)}ms `
+                    + `format=${request.uploadEncoding} `
                     + `headers=${Math.round(responseHeadersAt - fetchStartedAt)}ms `
                     + `body=${Math.round(payloadParsedAt - responseHeadersAt)}ms `
                     + `bytes=${request.responseBytes ?? '-'} `

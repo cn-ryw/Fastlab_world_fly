@@ -28,6 +28,9 @@ class FakeCanvas extends FakeElement {
         this.context = {
             clearRect() {}, drawImage() {}, fillRect() {}, beginPath() {},
             moveTo() {}, lineTo() {}, stroke() {}, fillText() {},
+            getImageData(_x, _y, width, height) {
+                return { data: new Uint8ClampedArray(width * height * 4) };
+            },
             createLinearGradient() { return { addColorStop() {} }; },
         };
     }
@@ -475,7 +478,7 @@ for (const [facesPerSlice, expectedYields] of [[2, 2], [3, 1], [6, 0]]) {
 }
 
 // Chrome planning pipelines the next six-face capture while one immutable
-// JPEG/inference request remains in flight. The capture lock must be released,
+// upload/inference request remains in flight. The capture lock must be released,
 // while the single-request gate prevents a second inference from queuing.
 {
     const originalOffscreenCanvas = globalThis.OffscreenCanvas;
@@ -536,6 +539,18 @@ for (const [facesPerSlice, expectedYields] of [[2, 2], [3, 1], [6, 0]]) {
         if (sensor._rgbFrameId === selectedRequest.frameId
             || !sensor._isRequestSourceCurrent(selectedRequest)) {
             throw new Error('a newer capture invalidated an independently frozen RGB request');
+        }
+        const raw = await sensor._materializePerceptionFrame(
+            selectedRequest.frameContext,
+            'rgba8',
+        );
+        const rawPixels = raw.frame.projectionConfig.rgbWidth
+            * raw.frame.projectionConfig.rgbHeight;
+        if (raw.uploadEncoding !== 'rgba8'
+            || raw.frame.rgb.type !== 'application/x-mindcloud-rgba8'
+            || raw.frame.rgb.size !== rawPixels * 4
+            || encodeCalls !== 1) {
+            throw new Error('planning upload did not use one exact lossless RGBA8 frame');
         }
         sensor._planningEpoch++;
         if (sensor._isRequestSourceCurrent(selectedRequest)) {

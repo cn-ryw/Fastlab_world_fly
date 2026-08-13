@@ -147,6 +147,8 @@ def configure_api_security(app):
         "X-Location-ID",
         "X-Goal-ID",
         "X-Generation",
+        "X-Image-Width",
+        "X-Image-Height",
         PROJECTION_CONFIG_HEADER,
     )
     exposed_headers = identity_headers + (
@@ -236,6 +238,45 @@ def _validate_input_image(image):
         raise ValueError(f"invalid image: {exc}") from exc
 
 
+RAW_RGBA8_CONTENT_TYPE = "application/x-mindcloud-rgba8"
+
+
+def _required_positive_header_int(req, name):
+    raw_value = req.headers.get(name)
+    if raw_value is None:
+        raise ValueError(f"missing raw image header: {name}")
+    try:
+        value = int(raw_value, 10)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"invalid raw image header: {name}") from exc
+    if value <= 0:
+        raise ValueError(f"raw image header must be positive: {name}")
+    return value
+
+
+def _decode_raw_rgba8(req):
+    width = _required_positive_header_int(req, "X-Image-Width")
+    height = _required_positive_header_int(req, "X-Image-Height")
+    maximum_pixels = env_int("DA360_MAX_IMAGE_PIXELS", 16 * 1024 * 1024)
+    pixel_count = width * height
+    if pixel_count > maximum_pixels:
+        raise ValueError(
+            f"decoded image is too large: {width}x{height} > {maximum_pixels} pixels"
+        )
+    expected_bytes = pixel_count * 4
+    raw = req.get_data()
+    if len(raw) != expected_bytes:
+        raise ValueError(
+            "raw RGBA8 body length mismatch: "
+            f"expected {expected_bytes} bytes, received {len(raw)}"
+        )
+    try:
+        image = Image.frombytes("RGBA", (width, height), raw)
+    except Exception as exc:
+        raise ValueError(f"invalid raw RGBA8 image: {exc}") from exc
+    return _validate_input_image(image)
+
+
 def decode_request_image(req):
     if req.files:
         first_file = next(iter(req.files.values()))
@@ -248,6 +289,8 @@ def decode_request_image(req):
             raise ValueError(f"invalid image: {exc}") from exc
 
     content_type = (req.content_type or "").split(";", 1)[0].strip().lower()
+    if content_type == RAW_RGBA8_CONTENT_TYPE:
+        return _decode_raw_rgba8(req)
     if content_type.startswith("image/") or content_type == "application/octet-stream":
         try:
             image = Image.open(io.BytesIO(req.get_data()))

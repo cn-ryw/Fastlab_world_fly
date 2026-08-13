@@ -29,13 +29,13 @@ import { Controller } from './controller.js?v=20260812-shared-controller-config'
 import { Drone } from './drone.js?v=20260812-so3-fixed-world-yaw';
 import { HUD } from './hud.js?v=20260811-control-v6';
 import { OSD } from './osd.js?v=20260811-control-v6';
-import { PanoramaSensor } from './panorama-sensor.js?v=20260813-frozen-source-pipeline';
+import { PanoramaSensor } from './panorama-sensor.js?v=20260813-raw-rgba-latest-slot';
 import { FlightLogger } from './flight-logger.js?v=20260812-t8l';
 import { reportUserError } from './error-report.js';
 import {
     computeT8LRollingGoal,
     T8L_GOAL_DEADZONE,
-} from './t8l-rolling-goal.js?v=20260812-so3-pitch-sign';
+} from './t8l-rolling-goal.js?v=20260813-so3-goal-50m';
 import { FixedStepScheduler } from './fixed-step-scheduler.js?v=20260811';
 import {
     drawDepthTopdown,

@@ -569,7 +569,7 @@ def yopo_plan_full():
         acc_y = query_number("ay", "X-Acc-Y")
         acc_z = query_number("az", "X-Acc-Z")
 
-        # 1. Decode JPEG → DA360 depth
+        # 1. Decode the validated JPEG/RGBA8 upload -> DA360 depth.
         t0 = time.perf_counter()
         image = decode_request_image(request)
         request_metadata = _request_image_metadata(image)

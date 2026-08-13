@@ -1,4 +1,4 @@
-export const T8L_GOAL_RADIUS_M = 30;
+export const T8L_GOAL_RADIUS_M = 50;
 export const T8L_GOAL_DEADZONE = 0.25;
 
 export function applyT8LGoalDeadzone(value, deadzone = T8L_GOAL_DEADZONE) {

@@ -124,6 +124,10 @@ def jpeg_bytes(width=16, height=8):
     return output.getvalue()
 
 
+def rgba8_bytes(width=16, height=8):
+    return bytes((80, 120, 160, 255)) * width * height
+
+
 class BackendContractTests(unittest.TestCase):
     def test_yopo_overlay_is_selected_before_global_config_import(self):
         source = (SCRIPTS_DIR / "yopo_bridge.py").read_text(encoding="utf-8")
@@ -227,6 +231,22 @@ class BackendContractTests(unittest.TestCase):
                     self.assertEqual(scan["unit"], "x-near-reference")
                     self.assertEqual(scan["radius"], 20.0)
                     self.assertEqual(len(scan["values"]), FakeDepthRunner.width)
+
+    def test_raw_rgba8_depth_contract_is_shared(self):
+        with self.clients() as clients:
+            for name, client in clients.items():
+                with self.subTest(app=name):
+                    response = client.post(
+                        "/depth?frame_id=raw-7&goal_id=goal-2&generation=3",
+                        data=rgba8_bytes(16, 8),
+                        content_type="application/x-mindcloud-rgba8",
+                        headers={"X-Image-Width": "16", "X-Image-Height": "8"},
+                    )
+                    self.assertEqual(response.status_code, 200)
+                    payload = response.get_json()
+                    self.assertEqual(payload["request_width"], 16)
+                    self.assertEqual(payload["request_height"], 8)
+                    self.assertEqual(payload["frame_id"], "raw-7")
 
     def test_polar_scan_relative_is_explicitly_non_metric(self):
         depth = np.full((12, 96), 4.0, dtype=np.float32)
@@ -355,6 +375,8 @@ class BackendContractTests(unittest.TestCase):
                             "x-goal-id",
                             "x-generation",
                             "x-projection-config",
+                            "x-image-width",
+                            "x-image-height",
                         },
                         allowed_headers,
                     )
@@ -384,6 +406,21 @@ class BackendContractTests(unittest.TestCase):
             )
         self.assertEqual(oversized.status_code, 400)
         self.assertIn("decoded image is too large", oversized.get_json()["error"])
+        missing_dimensions = client.post(
+            "/depth",
+            data=rgba8_bytes(2, 2),
+            content_type="application/x-mindcloud-rgba8",
+        )
+        self.assertEqual(missing_dimensions.status_code, 400)
+        self.assertIn("X-Image-Width", missing_dimensions.get_json()["error"])
+        wrong_length = client.post(
+            "/depth",
+            data=rgba8_bytes(2, 2)[:-1],
+            content_type="application/x-mindcloud-rgba8",
+            headers={"X-Image-Width": "2", "X-Image-Height": "2"},
+        )
+        self.assertEqual(wrong_length.status_code, 400)
+        self.assertIn("body length mismatch", wrong_length.get_json()["error"])
 
     def test_relative_plan_full_returns_preview_but_no_applicable_trajectory(self):
         with self.clients() as clients:
@@ -571,6 +608,30 @@ class BackendContractTests(unittest.TestCase):
                 "/yopo/preview?frame_id=missing&goal_id=g5&generation=6"
             )
             self.assertEqual(stale_preview.status_code, 409)
+
+    def test_plan_full_accepts_raw_rgba8_without_preview(self):
+        with self.clients() as clients:
+            combined_server.da360_runner.depth_mode = "da360-metric"
+            combined_server.da360_runner.calibration = {
+                "id": "calib-raw-rgba8",
+                "accuracy_accepted": True,
+            }
+            query = (
+                "px=1&py=2&pz=3&rpx=4&rpy=5&rpz=6&"
+                "gx=10&gy=2&gz=4&vx=0&vy=0&vz=0&ax=0&ay=0&az=0&yaw=0"
+                "&frame_id=f-raw&goal_id=g-raw&generation=8&include_preview=0"
+            )
+            response = clients["combined"].post(
+                f"/yopo/plan_full?{query}",
+                data=rgba8_bytes(16, 8),
+                content_type="application/x-mindcloud-rgba8",
+                headers={"X-Image-Width": "16", "X-Image-Height": "8"},
+            )
+            self.assertEqual(response.status_code, 200)
+            payload = response.get_json()
+            self.assertIs(payload["planning_authorized"], True)
+            self.assertIs(payload["preview_included"], False)
+            self.assertEqual(len(payload["endstate"]), 9)
 
     def test_planning_preview_lru_is_identity_keyed_and_bounded(self):
         with self.clients() as clients, patch.dict(
