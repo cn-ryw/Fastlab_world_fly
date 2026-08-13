@@ -155,6 +155,7 @@ def yopo_health():
         "api_version": API_VERSION,
         "device": yopo_runner.device,
         "model": Path(str(getattr(yopo_runner, "model_path", "unknown"))).name,
+        "strategy": os.environ.get("MINDCLOUD_YOPO_STRATEGY", "baseline"),
         "checkpoint_coverage": getattr(yopo_runner, "checkpoint_coverage", None),
         "checkpoint_missing_keys": getattr(yopo_runner, "checkpoint_missing_keys", None),
         "checkpoint_unexpected_keys": getattr(yopo_runner, "checkpoint_unexpected_keys", None),

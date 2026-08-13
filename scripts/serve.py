@@ -49,7 +49,13 @@ CESIUM_DIR = Path(os.environ.get(
 )).resolve()
 MAX_PATH_BODY = 64 * 1024  # 64 KB — tracks are a few hundred bytes each
 SAFE_NAME_RE = re.compile(r'^[A-Za-z0-9._-]{1,200}\.json$')
-ROOT_STATIC_FILES = {'/': 'index.html', '/index.html': 'index.html'}
+ROOT_STATIC_FILES = {
+    '/': 'index.html',
+    '/index.html': 'index.html',
+    # Expose only the reviewed shared controller defaults, not the whole
+    # config directory or any other project-root files.
+    '/config/drone_controller_config.json': 'config/drone_controller_config.json',
+}
 STATIC_MOUNTS = {
     '/src/': PROJECT_ROOT / 'src',
     '/asset/': PROJECT_ROOT / 'asset',

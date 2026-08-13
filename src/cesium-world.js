@@ -430,10 +430,10 @@ export class CesiumWorld {
             height: urlNumber('height', options.height ?? DEFAULT_VIEW.height),
         };
         this.flightResolutionScale = clampNumber(
-            urlNumber('resolutionScale', options.resolutionScale ?? 0.72),
+            urlNumber('resolutionScale', options.resolutionScale ?? 0.80),
             0.45,
             1,
-            0.72
+            0.80
         );
         this.placementResolutionScale = clampNumber(
             urlNumber('placementResolutionScale', options.placementResolutionScale ?? 0.88),
@@ -442,10 +442,10 @@ export class CesiumWorld {
             0.88
         );
         this.flightTileSSE = clampNumber(
-            urlNumber('flightTileSse', options.flightTileSSE ?? 24),
+            urlNumber('flightTileSse', options.flightTileSSE ?? 20),
             8,
             64,
-            24
+            20
         );
         this.placementTileSSE = clampNumber(
             urlNumber('placementTileSse', options.placementTileSSE ?? 16),
@@ -547,8 +547,9 @@ export class CesiumWorld {
             globe: false,
             skyAtmosphere: new Cesium.SkyAtmosphere(),
             requestRenderMode: true,    // Cesium 社区 #1 CPU 优化：空闲时 0% CPU
-            // GPU仅7%，瓶颈在主线程 Cesium 场景遍历。降目标帧率 + 降分辨率双重释压
-            targetFrameRate: 20,
+            // Keep explicit rendering, but do not hard-cap an interactive
+            // flight view at 20 fps when the measured Chrome loop sustains 40+.
+            targetFrameRate: 30,
             // resolutionScale 降低渲染像素数，同时减少 CPU draw-call 准备开销
             resolutionScale: 0.7,
             useBrowserRecommendedResolution: true,
@@ -1765,16 +1766,25 @@ export class CesiumWorld {
         if (!this._panoramaInitPromise) {
             const initTimeoutMs = 20000;
             const initPromise = this._createPanoramaCaptureViewer(faceSize);
-            this._panoramaInitPromise = Promise.race([
-                initPromise,
-                new Promise((_, reject) => setTimeout(() => reject(new Error('Panorama capture viewer init timed out')), initTimeoutMs))
-            ])
-                .finally(() => {
+            const trackedPromise = initPromise.finally(() => {
+                if (this._panoramaInitPromise === trackedPromise) {
                     this._panoramaInitPromise = null;
-                });
+                }
+            });
+            // Keep the real initialization promise authoritative after a
+            // caller times out. Clearing it on Promise.race timeout allowed a
+            // slow Chrome/network startup to create overlapping Cesium/WebGL
+            // panorama viewers, multiplying render and tile-streaming cost.
+            this._panoramaInitPromise = trackedPromise;
         }
 
-        return this._panoramaInitPromise;
+        return Promise.race([
+            this._panoramaInitPromise,
+            new Promise((_, reject) => setTimeout(
+                () => reject(new Error('Panorama capture viewer init timed out')),
+                20000,
+            )),
+        ]);
     }
 
     _getPanoramaProjector() {

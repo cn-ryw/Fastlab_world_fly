@@ -14,9 +14,7 @@ API_CONTAINER="${MINDCLOUD_API_CONTAINER:-mindcloud-da360-yopo}"
 LEGACY_WEB_CONTAINER="google-tiles-flight"
 API_IMAGE="${MINDCLOUD_API_IMAGE:-mindcloud-da360-yopo:latest}"
 DA360_MODEL="${DA360_MODEL_PATH_HOST:-$SCRIPT_DIR/third_party/DA360/checkpoints/DA360_large.pth}"
-YOPO_MODEL="${YOPO_MODEL_PATH_HOST:-/home/ykx/ros1/YOPO_360_v15/YOPO/saved/YOPO_55/epoch10.pth}"
-YOPO_CONFIG_NAME="${YOPO_CONFIG:-x5_cruise15_18m_a12_mask_wc3.yaml}"
-YOPO_CONFIG_PATH="$SCRIPT_DIR/third_party/YOPO/config/$YOPO_CONFIG_NAME"
+YOPO_STRATEGY="${MINDCLOUD_YOPO_STRATEGY:-baseline}"
 YOPO_BASE_CONFIG_PATH="$SCRIPT_DIR/third_party/YOPO/config/traj_opt.yaml"
 DEPENDENCY_MANIFEST="$SCRIPT_DIR/dependencies.versions.json"
 STARTUP_TIMEOUT="${MINDCLOUD_STARTUP_TIMEOUT:-180}"
@@ -36,6 +34,33 @@ die() {
 
 require_command() {
     command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"
+}
+
+resolve_yopo_strategy() {
+    local resolved default_model default_config
+    if ! resolved="$(python3 - "$DEPENDENCY_MANIFEST" "$YOPO_STRATEGY" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as stream:
+    manifest = json.load(stream)
+strategies = manifest.get("yopo_strategies", {})
+strategy = strategies.get(sys.argv[2])
+if strategy is None:
+    available = ", ".join(sorted(strategies))
+    raise SystemExit(f"unknown YOPO strategy {sys.argv[2]!r}; expected one of: {available}")
+print(strategy["default_host_path"] + "\t" + strategy["config"])
+PY
+    )"; then
+        die "failed to resolve YOPO strategy: $YOPO_STRATEGY"
+    fi
+    IFS=$'\t' read -r default_model default_config <<<"$resolved"
+    if [[ "$default_model" != /* ]]; then
+        default_model="$SCRIPT_DIR/$default_model"
+    fi
+    YOPO_MODEL="${YOPO_MODEL_PATH_HOST:-$default_model}"
+    YOPO_CONFIG_NAME="${YOPO_CONFIG:-$default_config}"
+    YOPO_CONFIG_PATH="$SCRIPT_DIR/third_party/YOPO/config/$YOPO_CONFIG_NAME"
 }
 
 is_owned_web_pid() {
@@ -148,11 +173,12 @@ valid = (
     and p.get("model") == sys.argv[1]
     and p.get("config") == sys.argv[2]
     and p.get("base_config") == sys.argv[3]
+    and p.get("strategy") == sys.argv[5]
     and bool(p.get("service_session_id"))
     and p.get("planning_authorized") is (sys.argv[4] == "da360-metric")
 )
 raise SystemExit(0 if valid else 1)
-' "$(basename "$YOPO_MODEL")" "$YOPO_CONFIG_NAME" "$(basename "$YOPO_BASE_CONFIG_PATH")" "$DEPTH_MODE"
+' "$(basename "$YOPO_MODEL")" "$YOPO_CONFIG_NAME" "$(basename "$YOPO_BASE_CONFIG_PATH")" "$DEPTH_MODE" "$YOPO_STRATEGY"
 }
 
 web_health_ok() {
@@ -188,6 +214,7 @@ echo "=== 1/4 预检 ==="
 for command_name in docker curl python3 nvidia-smi readlink nohup setsid; do
     require_command "$command_name"
 done
+resolve_yopo_strategy
 [[ "$WEB_PORT" =~ ^[0-9]+$ ]] || die "invalid web port: $WEB_PORT"
 [[ "$API_PORT" =~ ^[0-9]+$ ]] || die "invalid API port: $API_PORT"
 [[ "$STARTUP_TIMEOUT" =~ ^[0-9]+$ ]] || die "invalid startup timeout: $STARTUP_TIMEOUT"
@@ -230,8 +257,10 @@ DA360_MODEL="$(readlink -f "$DA360_MODEL")"
 YOPO_MODEL="$(readlink -f "$YOPO_MODEL")"
 python3 "$SCRIPT_DIR/scripts/verify_dependencies.py" \
     --da360-model "$DA360_MODEL" --yopo-model "$YOPO_MODEL" \
+    --yopo-strategy "$YOPO_STRATEGY" \
     || die "runtime dependency version verification failed"
 echo "  DA360: $(basename "$DA360_MODEL")"
+echo "  strategy: $YOPO_STRATEGY"
 echo "  YOPO:  $(basename "$YOPO_MODEL")"
 echo "  config: $(basename "$YOPO_BASE_CONFIG_PATH") + $YOPO_CONFIG_NAME"
 echo "  image:  $API_IMAGE"
@@ -275,6 +304,7 @@ fi
 echo ""
 echo "=== 2/4 DA360 + YOPO 推理服务 ==="
 docker rm -f "$API_CONTAINER" >/dev/null 2>&1 || true
+YOPO_CONTAINER_MODEL="/models/$(basename "$YOPO_MODEL")"
 
 run_args=(
     --rm -d --init
@@ -282,11 +312,13 @@ run_args=(
     --gpus all
     -p "127.0.0.1:$API_PORT:5688"
     -v "$DA360_MODEL:/models/DA360_large.pth:ro"
-    -v "$YOPO_MODEL:/models/epoch10.pth:ro"
+    -v "$YOPO_MODEL:$YOPO_CONTAINER_MODEL:ro"
     -v "$SCRIPT_DIR/third_party/DA360:/opt/DA360:ro"
     -v "$SCRIPT_DIR/third_party/YOPO:/opt/YOPO_360/YOPO:ro"
     -v "$SCRIPT_DIR/scripts:/opt/server:ro"
     -e "YOPO_CONFIG=$YOPO_CONFIG_NAME"
+    -e "YOPO_MODEL_PATH=$YOPO_CONTAINER_MODEL"
+    -e "MINDCLOUD_YOPO_STRATEGY=$YOPO_STRATEGY"
     -e "DA360_INPUT_SCALE=$INPUT_SCALE"
     -e "DA360_DEPTH_SCALE=${DA360_DEPTH_SCALE:-2.0}"
     -e "DA360_DEPTH_MODE=$DEPTH_MODE"
@@ -365,6 +397,7 @@ echo " 全部就绪"
 echo "  Web:    http://$WEB_HOST:$WEB_PORT"
 echo "  DA360:  http://127.0.0.1:$API_PORT/health"
 echo "  YOPO:   http://127.0.0.1:$API_PORT/yopo/health"
+echo "  策略:   $YOPO_STRATEGY"
 echo "========================================="
 echo "  启动 Firefox: ./launch-firefox-gpu.sh"
 echo "  停止全部:     ./stop-all.sh"

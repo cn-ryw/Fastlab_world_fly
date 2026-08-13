@@ -31,8 +31,8 @@ const second = provider.queryCollisionResponse(0.1, 0, 0, 0.6, {
     previous: { x: -1, y: 0, z: 0 },
     velocity: { x: 10, y: 0, z: 0 },
 });
-assert(sweptProbeCount === 1, 'swept ray still runs while static cache is reusable');
-assert(second?.source === 'swept', 'wall crossing is returned as a swept collision');
+assert(sweptProbeCount === 5, 'all swept-sphere probes still run while static cache is reusable');
+assert(second?.source === 'swept-center', 'wall crossing is returned as a swept collision');
 
 console.log(`\nCollision sweep cache: ${passed} passed, ${failed} failed`);
 process.exit(failed > 0 ? 1 : 0);

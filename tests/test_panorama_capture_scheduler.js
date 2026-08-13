@@ -474,4 +474,80 @@ for (const [facesPerSlice, expectedYields] of [[2, 2], [3, 1], [6, 0]]) {
     }
 }
 
+// Chrome planning pipelines the next six-face capture while one immutable
+// JPEG/inference request remains in flight. The capture lock must be released,
+// while the single-request gate prevents a second inference from queuing.
+{
+    const originalOffscreenCanvas = globalThis.OffscreenCanvas;
+    let encodeCalls = 0;
+    class FakeOffscreenCanvas extends FakeCanvas {
+        async convertToBlob({ type }) {
+            encodeCalls++;
+            return new Blob(['frozen-rgb'], { type });
+        }
+    }
+    globalThis.OffscreenCanvas = FakeOffscreenCanvas;
+    try {
+        const { PanoramaSensor } = await import('../src/panorama-sensor.js?chrome-pipeline-test');
+        const sensor = new PanoramaSensor();
+        let releaseRequest;
+        let requestCalls = 0;
+        let selectedRequest = null;
+        sensor._shouldRequestDepth = () => !sensor._depthGate;
+        sensor._requestDepth = () => {
+            if (sensor._depthGate) return false;
+            sensor._depthGate = true;
+            requestCalls++;
+            const frameContext = sensor._rgbFrameContext;
+            selectedRequest = {
+                requestId: requestCalls,
+                frameId: frameContext.frameId,
+                generation: sensor._yopoGeneration,
+                planningEpoch: frameContext.planningEpoch,
+                goalId: sensor._goalId,
+                mode: sensor._desiredDepthMode(),
+                frameContext,
+            };
+            sensor._activeDepthRequest = selectedRequest;
+            // Production materialization reads the selected context exactly
+            // once. This must be the only point that starts JPEG encoding.
+            void frameContext.rgbPromise;
+            return new Promise(resolve => { releaseRequest = resolve; })
+                .finally(() => {
+                    sensor._depthGate = false;
+                    sensor._activeDepthRequest = null;
+                });
+        };
+        const world = {
+            async capturePanoramaIncrementalAsync() {
+                return { complete: true, canvas: new FakeCanvas(), timings_ms: { total: 35 } };
+            },
+        };
+        const transform = { position: { x: 0, y: 0, z: 0 } };
+
+        await sensor._capture(world, transform);
+        if (sensor.capturing || requestCalls !== 1 || encodeCalls !== 1 || !sensor._depthGate) {
+            throw new Error('capture did not release independently of the in-flight inference');
+        }
+        await sensor._capture(world, transform);
+        if (requestCalls !== 1 || encodeCalls !== 1) {
+            throw new Error('a busy request gate allowed an intermediate JPEG/inference to queue');
+        }
+        if (sensor._rgbFrameId === selectedRequest.frameId
+            || !sensor._isRequestSourceCurrent(selectedRequest)) {
+            throw new Error('a newer capture invalidated an independently frozen RGB request');
+        }
+        sensor._planningEpoch++;
+        if (sensor._isRequestSourceCurrent(selectedRequest)) {
+            throw new Error('a frozen RGB request survived a real planning-session change');
+        }
+        sensor._planningEpoch--;
+        releaseRequest(true);
+        await Promise.resolve();
+    } finally {
+        if (originalOffscreenCanvas === undefined) delete globalThis.OffscreenCanvas;
+        else globalThis.OffscreenCanvas = originalOffscreenCanvas;
+    }
+}
+
 console.log('\nPanorama scheduler/profile tests: all passed');

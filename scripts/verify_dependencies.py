@@ -18,7 +18,9 @@ def _require_file(path, label, errors):
         errors.append(f"{label} is missing or empty: {path}")
 
 
-def verify(manifest, da360_model=None, yopo_model=None, skip_checkpoints=False):
+def verify(
+        manifest, da360_model=None, yopo_model=None, skip_checkpoints=False,
+        yopo_strategy="baseline"):
     errors = []
     runtime = manifest["runtime_dependencies"]
 
@@ -53,6 +55,19 @@ def verify(manifest, da360_model=None, yopo_model=None, skip_checkpoints=False):
         _require_file(yopo_path / relative, "YOPO source file", errors)
     for field in ("base_config", "profile"):
         _require_file(ROOT / yopo[field], f"YOPO {field}", errors)
+    strategies = manifest.get("yopo_strategies", {})
+    strategy = strategies.get(yopo_strategy)
+    if strategy is None:
+        errors.append(
+            f"unknown YOPO strategy {yopo_strategy!r}; expected one of: "
+            + ", ".join(sorted(strategies))
+        )
+    else:
+        _require_file(
+            yopo_path / "config" / strategy["config"],
+            f"YOPO strategy {yopo_strategy} config",
+            errors,
+        )
     for wheel in runtime["wheels"]:
         _require_file(ROOT / wheel, "Python wheel", errors)
 
@@ -69,12 +84,22 @@ def verify(manifest, da360_model=None, yopo_model=None, skip_checkpoints=False):
         checkpoints = manifest["model_checkpoints"]
         model_paths = {
             "da360": Path(da360_model) if da360_model else ROOT / checkpoints["da360"]["default_host_path"],
-            "yopo": Path(yopo_model) if yopo_model else Path(checkpoints["yopo"]["default_host_path"]),
         }
         for name, path in model_paths.items():
             _require_file(path, f"{name} checkpoint", errors)
             if path.name != checkpoints[name]["name"]:
                 errors.append(f"{name} checkpoint filename must be {checkpoints[name]['name']}")
+        if strategy is not None:
+            strategy_path = Path(strategy["default_host_path"])
+            if not strategy_path.is_absolute():
+                strategy_path = ROOT / strategy_path
+            yopo_path = Path(yopo_model) if yopo_model else strategy_path
+            _require_file(yopo_path, "yopo checkpoint", errors)
+            if yopo_path.name != strategy["checkpoint_name"]:
+                errors.append(
+                    "yopo checkpoint filename for strategy "
+                    f"{yopo_strategy} must be {strategy['checkpoint_name']}"
+                )
     return errors
 
 
@@ -83,11 +108,18 @@ def main(argv=None):
     parser.add_argument("--manifest", type=Path, default=MANIFEST_PATH)
     parser.add_argument("--da360-model", type=Path)
     parser.add_argument("--yopo-model", type=Path)
+    parser.add_argument("--yopo-strategy", default="baseline")
     parser.add_argument("--skip-checkpoints", action="store_true")
     args = parser.parse_args(argv)
     with args.manifest.open(encoding="utf-8") as stream:
         manifest = json.load(stream)
-    errors = verify(manifest, args.da360_model, args.yopo_model, args.skip_checkpoints)
+    errors = verify(
+        manifest,
+        args.da360_model,
+        args.yopo_model,
+        args.skip_checkpoints,
+        args.yopo_strategy,
+    )
     if errors:
         for error in errors:
             print(f"ERROR: {error}", file=sys.stderr)

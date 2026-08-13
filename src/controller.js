@@ -25,6 +25,23 @@ import { formatLap } from './gates.js';
 import { reportUserError } from './error-report.js';
 import { T8LSerialInput } from './t8l-serial-input.js';
 
+const SHARED_DEFAULT_CONFIG_REVISION = 'radiomaster-t8l-20260812-1';
+let SHARED_DEFAULT_CONFIG = null;
+try {
+    const response = await fetch(
+        new URL('../config/drone_controller_config.json', import.meta.url),
+        { cache: 'no-store' },
+    );
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const config = await response.json();
+    if (!config || typeof config !== 'object' || Array.isArray(config)) {
+        throw new TypeError('shared controller config must be a JSON object');
+    }
+    SHARED_DEFAULT_CONFIG = config;
+} catch (error) {
+    console.warn('[Controller] shared default config unavailable; using built-in defaults', error);
+}
+
 const ACTIONS = ['roll', 'pitch', 'throttle', 'yaw', 'cameraTilt'];
 const BUTTON_ACTIONS = ['arm', 'modeSwitch'];
 
@@ -65,11 +82,11 @@ const PER_MODE_SETTINGS_IDS = [
 ];
 
 const DEFAULT_MAPPING = {
-    roll:       { axisIndex: 0, inverted: false, deadzone: 0, rate: 1.0, expo: 0.0 },
-    pitch:      { axisIndex: 1, inverted: false, deadzone: 0, rate: 1.0, expo: 0.0 },
-    throttle:   { axisIndex: 2, inverted: false, deadzone: 0, rate: 1.0, expo: 0.0 },
-    yaw:        { axisIndex: 3, inverted: false, deadzone: 0, rate: 1.0, expo: 0.0 },
-    cameraTilt: { axisIndex: -1, inverted: false, deadzone: 0, rate: 1.0, expo: 0.0 },
+    roll:       { source: 'axis', axisIndex: 0, buttonIndex: -1, inverted: false, deadzone: 0, rate: 1.0, expo: 0.0 },
+    pitch:      { source: 'axis', axisIndex: 1, buttonIndex: -1, inverted: false, deadzone: 0, rate: 1.0, expo: 0.0 },
+    throttle:   { source: 'button', axisIndex: -1, buttonIndex: 6, inverted: false, deadzone: 0, rate: 1.0, expo: 0.0 },
+    yaw:        { source: 'axis', axisIndex: 2, buttonIndex: -1, inverted: false, deadzone: 0, rate: 1.0, expo: 0.0 },
+    cameraTilt: { source: 'axis', axisIndex: -1, buttonIndex: -1, inverted: false, deadzone: 0, rate: 1.0, expo: 0.0 },
 };
 
 const DEFAULT_PID_SETTINGS = Object.freeze({
@@ -113,10 +130,17 @@ function _sanitizeMapping(saved) {
         const axisNumber = candidate.axisIndex === null || typeof candidate.axisIndex === 'boolean'
             ? NaN
             : Number(candidate.axisIndex);
+        const buttonNumber = candidate.buttonIndex === null || typeof candidate.buttonIndex === 'boolean'
+            ? NaN
+            : Number(candidate.buttonIndex);
         result[action] = {
+            source: candidate.source === 'button' ? 'button' : 'axis',
             axisIndex: Number.isInteger(axisNumber) && axisNumber >= -1 && axisNumber <= 63
                 ? axisNumber
                 : defaults.axisIndex,
+            buttonIndex: Number.isInteger(buttonNumber) && buttonNumber >= -1 && buttonNumber <= 255
+                ? buttonNumber
+                : defaults.buttonIndex,
             inverted: typeof candidate.inverted === 'boolean' ? candidate.inverted : defaults.inverted,
             deadzone: _finiteClamped(candidate.deadzone, defaults.deadzone, 0, 0.5),
             rate: _finiteClamped(candidate.rate, defaults.rate, 0, 10),
@@ -295,8 +319,11 @@ const DEFAULT_BUTTON_MAPPING = {
     // the keyboard always use edge-based toggle regardless of this field.
     // Safety-sensitive switches are unassigned by default. The user learns
     // their actual T8L channel/button explicitly in the settings panel.
-    arm:        { source: 'button', buttonIndex: -1, axisIndex: -1, axisThreshold: 0.5, inverted: false, triggerMode: 'toggle' },
-    modeSwitch: { source: 'button', buttonIndex: -1, axisIndex: -1, axisThreshold: 0.5, inverted: false, triggerMode: 'toggle' },
+    // RadioMaster T8L defaults copied from the confirmed Chrome flight
+    // profile. Three-position semantics are handled below: Arm low is locked
+    // and middle/high are armed; Mode low/middle/high select FPV/Easy/SO3.
+    arm:        { source: 'axis', buttonIndex: -1, axisIndex: 6, axisThreshold: 0.5, inverted: true, triggerMode: 'toggle' },
+    modeSwitch: { source: 'axis', buttonIndex: -1, axisIndex: 3, axisThreshold: 0.5, inverted: false, triggerMode: 'level' },
 };
 
 const KEYBOARD_MAP = {
@@ -377,6 +404,8 @@ export class Controller {
         this._gpButtons     = { arm: false, modeSwitch: false };
         this._prevKbButtons = { arm: false, reset: false, modeSwitch: false };
         this._prevGpButtons = { arm: false, modeSwitch: false };
+        this._prevRcArmPosition = null;
+        this._prevRcModePosition = null;
 
         // Keyboard state
         this._keysDown = new Set();
@@ -385,6 +414,7 @@ export class Controller {
         this._listenAction = null;
         this._listenCallback = null;
         this._listenBaseline = null;
+        this._listenAnalogButtonBaseline = null;
 
         // Listen mode (buttons)
         this._listenButtonAction = null;
@@ -481,6 +511,7 @@ export class Controller {
         const t8lWasFresh = this._t8lWasFresh;
         const hidAxes = this._getHIDAxes();
         const gp = this._getGamepad();
+        let activeControlAxes = null;
         const t8lAxes = t8l.connected ? (t8l.fresh ? t8l.axes : new Array(10).fill(0)) : null;
         const deviceAxes = t8lAxes || hidAxes;
         const usingT8l = !!t8lAxes;
@@ -494,6 +525,7 @@ export class Controller {
         this._t8lWasFresh = t8l.fresh;
 
         if (deviceAxes) {
+            activeControlAxes = deviceAxes;
             // Use WebHID input
             this.connected = true;
             this._inputSource = usingT8l ? 't8l-serial' : 'webhid';
@@ -566,14 +598,24 @@ export class Controller {
             if (usingT8l) this._updateT8LDisplay(t8l);
             else this._updateHIDDisplay(hidAxes);
         } else if (gp) {
+            activeControlAxes = gp.axes;
             this.connected = true;
             this._inputSource = 'gamepad';
             this.gamepadName = gp.id;
 
             for (const action of ACTIONS) {
                 const m = this.mapping[action];
-                if (m.axisIndex >= 0 && m.axisIndex < gp.axes.length) {
-                    let val = gp.axes[m.axisIndex];
+                const hasAxis = m.source !== 'button'
+                    && m.axisIndex >= 0 && m.axisIndex < gp.axes.length;
+                const hasButton = m.source === 'button'
+                    && m.buttonIndex >= 0 && m.buttonIndex < gp.buttons.length;
+                if (hasAxis || hasButton) {
+                    // Browsers expose some RC channels (notably throttle on
+                    // RadioMaster SIM) as an analogue GamepadButton. Convert
+                    // its [0, 1] value back to the controller's [-1, 1] range.
+                    let val = hasButton
+                        ? gp.buttons[m.buttonIndex].value * 2 - 1
+                        : gp.axes[m.axisIndex];
                     if (m.inverted) val = -val;
                     this.rawAxes[action] += val;
                     if (Math.abs(val) < m.deadzone) val = 0;
@@ -605,7 +647,9 @@ export class Controller {
                 if (Math.abs(maxDelta) > 0.5) {
                     // Axis detected — update mapping only for stick actions
                     if (this.mapping[this._listenAction]) {
+                        this.mapping[this._listenAction].source = 'axis';
                         this.mapping[this._listenAction].axisIndex = bestAxis;
+                        this.mapping[this._listenAction].buttonIndex = -1;
                         this.mapping[this._listenAction].inverted = bestSign < 0;
                     }
                     const action = this._listenAction;
@@ -620,6 +664,34 @@ export class Controller {
                         this._listenButtonCallback = null;
                     }
                     if (this._listenCallback) this._listenCallback(action, bestAxis, bestSign < 0);
+                    this._saveConfig();
+                    this._buildSettingsUI();
+                }
+            }
+
+            // RC transmitters can expose a proportional channel as an
+            // analogue button after the browser's standard gamepad mapping.
+            // Treat a sufficiently large value change as a channel candidate.
+            if (this._listenAction && this._listenAnalogButtonBaseline) {
+                let maxDelta = 0;
+                let bestButton = -1;
+                for (let i = 0; i < gp.buttons.length; i++) {
+                    const delta = gp.buttons[i].value - this._listenAnalogButtonBaseline[i];
+                    if (Math.abs(delta) > Math.abs(maxDelta)) {
+                        maxDelta = delta;
+                        bestButton = i;
+                    }
+                }
+                if (Math.abs(maxDelta) > 0.25) {
+                    const action = this._listenAction;
+                    this.mapping[action].source = 'button';
+                    this.mapping[action].axisIndex = -1;
+                    this.mapping[action].buttonIndex = bestButton;
+                    this.mapping[action].inverted = maxDelta < 0;
+                    this._listenAction = null;
+                    this._listenBaseline = null;
+                    this._listenAnalogButtonBaseline = null;
+                    if (this._listenCallback) this._listenCallback(action, `B+${bestButton}`, maxDelta < 0);
                     this._saveConfig();
                     this._buildSettingsUI();
                 }
@@ -708,6 +780,18 @@ export class Controller {
         const modeBm = this.buttonMapping.modeSwitch;
         const armAxisLevel  = armBm.source  === 'axis' && armBm.axisIndex  >= 0 && armBm.triggerMode  === 'level';
         const modeAxisLevel = modeBm.source === 'axis' && modeBm.axisIndex >= 0 && modeBm.triggerMode === 'level';
+        const radioTransmitter = usingT8l
+            || /radiomaster|edgetx|opentx/i.test(this.gamepadName);
+        const switchPosition = (binding) => {
+            if (!activeControlAxes || binding.source !== 'axis'
+                || binding.axisIndex < 0 || binding.axisIndex >= activeControlAxes.length) return null;
+            let value = Number(activeControlAxes[binding.axisIndex]);
+            if (!Number.isFinite(value)) return null;
+            if (binding.inverted) value = -value;
+            return value < -0.5 ? 'low' : value > 0.5 ? 'high' : 'middle';
+        };
+        const radioArmPosition = radioTransmitter ? switchPosition(armBm) : null;
+        const radioModePosition = radioTransmitter ? switchPosition(modeBm) : null;
 
         // Keyboard arm / mode-switch are keyboard-exclusive edge-toggles —
         // their behaviour is independent of the settings panel's button
@@ -729,7 +813,12 @@ export class Controller {
         // suppresses the first-frame phantom edge on hot-reconnect so a
         // switch sitting in its active position at connect time doesn't
         // spuriously override the current armed state.
-        if (armAxisLevel && this.connected && deviceControlsFresh) {
+        if (radioArmPosition && this.connected && deviceControlsFresh) {
+            if (!justConnected && radioArmPosition !== this._prevRcArmPosition) {
+                // Three-position arm contract: LOW locks, MIDDLE/HIGH unlock.
+                this.armed = radioArmPosition !== 'low';
+            }
+        } else if (armAxisLevel && this.connected && deviceControlsFresh) {
             const gpArmChanged = this._gpButtons.arm !== this._prevGpButtons.arm;
             if (!justConnected && gpArmChanged) this.armed = this._gpButtons.arm;
         } else if (!justConnected && gpArmRising) {
@@ -737,10 +826,22 @@ export class Controller {
         }
 
         // Gamepad / HID mode switch — same transition semantics as arm above.
-        if (modeAxisLevel && this.connected && deviceControlsFresh) {
+        if (radioModePosition && this.connected && deviceControlsFresh) {
+            if (!justConnected && radioModePosition !== this._prevRcModePosition) {
+                const targetMode = radioModePosition === 'low'
+                    ? 'fpv'
+                    : radioModePosition === 'middle' ? 'drone' : 'so3';
+                if (this._currentMode !== targetMode) {
+                    const ms = document.getElementById('flight-mode-select');
+                    if (ms) ms.value = targetMode;
+                    this._onModeSwitch(targetMode);
+                }
+            }
+        } else if (modeAxisLevel && this.connected && deviceControlsFresh) {
             const gpModeChanged = this._gpButtons.modeSwitch !== this._prevGpButtons.modeSwitch;
             if (!justConnected && gpModeChanged) {
                 const targetMode = usingT8l
+                    || /radiomaster|edgetx|opentx/i.test(this.gamepadName)
                     ? (this._gpButtons.modeSwitch ? 'so3' : 'drone')
                     : (this._gpButtons.modeSwitch ? 'fpv' : 'drone');
                 if (this._currentMode !== targetMode) {
@@ -755,6 +856,8 @@ export class Controller {
 
         this._prevGpButtons.arm        = this._gpButtons.arm;
         this._prevGpButtons.modeSwitch = this._gpButtons.modeSwitch;
+        this._prevRcArmPosition        = radioArmPosition;
+        this._prevRcModePosition       = radioModePosition;
         this._prevKbButtons.arm        = kbArm;
         this._prevKbButtons.reset      = kbReset;
         this._prevKbButtons.modeSwitch = kbModeSwitch;
@@ -835,6 +938,7 @@ export class Controller {
         this._listenAction = action;
         this._listenCallback = callback;
         this._listenBaseline = Array.from(gp.axes);
+        this._listenAnalogButtonBaseline = Array.from(gp.buttons, button => button.value);
         return true;
     }
 
@@ -842,6 +946,7 @@ export class Controller {
         this._listenAction = null;
         this._listenCallback = null;
         this._listenBaseline = null;
+        this._listenAnalogButtonBaseline = null;
     }
 
     startButtonListening(action, callback) {
@@ -1685,7 +1790,9 @@ export class Controller {
             // Axis label
             const axisLabel = document.createElement('span');
             axisLabel.className = 'axis-label';
-            axisLabel.textContent = m.axisIndex >= 0 ? `Axis ${m.axisIndex}` : 'None';
+            axisLabel.textContent = m.source === 'button' && m.buttonIndex >= 0
+                ? `B+${m.buttonIndex}`
+                : (m.axisIndex >= 0 ? `Axis ${m.axisIndex}` : 'None');
             controls.appendChild(axisLabel);
 
             // Invert checkbox
@@ -1745,7 +1852,7 @@ export class Controller {
                 const started = this.startListening(action, (a, axis, inverted) => {
                     assignBtn.classList.remove('listening');
                     assignBtn.textContent = 'Assign';
-                    axisLabel.textContent = `Axis ${axis}`;
+                    axisLabel.textContent = typeof axis === 'string' ? axis : `Axis ${axis}`;
                     invertCb.checked = inverted;
                 });
                 if (started) {
@@ -1847,11 +1954,13 @@ export class Controller {
                     const t8l = this._t8lSerial.snapshot();
                     const viaT8l = t8l.connected && t8l.fresh;
                     const viaHid = this._hidConnected;
+                    const viaRadioGamepad = !viaT8l && !viaHid
+                        && /radiomaster|edgetx|opentx/i.test(this.gamepadName);
                     const onAxis = (a, axisIdx, inverted) => {
                         bm.source = 'axis';
                         bm.axisIndex = axisIdx;
                         bm.inverted = inverted;
-                        if (viaT8l) bm.triggerMode = 'level';
+                        if (viaT8l || viaHid || viaRadioGamepad) bm.triggerMode = 'level';
                         this._saveConfig();
                         this._buildSettingsUI();
                     };
@@ -2570,8 +2679,14 @@ export class Controller {
     _loadConfig() {
         try {
             const saved = localStorage.getItem('drone_sim_controller_config');
-            if (saved) {
-                const config = this._migrateConfig(JSON.parse(saved));
+            const appliedRevision = localStorage.getItem('drone_sim_controller_default_revision');
+            const applySharedDefault = SHARED_DEFAULT_CONFIG
+                && appliedRevision !== SHARED_DEFAULT_CONFIG_REVISION;
+            const sourceConfig = applySharedDefault
+                ? SHARED_DEFAULT_CONFIG
+                : (saved ? JSON.parse(saved) : SHARED_DEFAULT_CONFIG);
+            if (sourceConfig) {
+                const config = this._migrateConfig(sourceConfig);
                 this.mapping = _sanitizeMapping(config.mapping);
                 this.buttonMapping = _sanitizeButtonMapping(config.buttonMapping);
                 this._hidCalibration = _sanitizeHidCalibration(config.hidCalibration);
@@ -2588,6 +2703,14 @@ export class Controller {
                 } else if (config.raceCourseSettings) {
                     // Legacy blob — keep gateSize + clearance, drop everything else.
                     this._mergeGatePathSettings(config.raceCourseSettings);
+                }
+                if (applySharedDefault) {
+                    localStorage.setItem('drone_sim_controller_config', JSON.stringify(config));
+                    localStorage.setItem(
+                        'drone_sim_controller_default_revision',
+                        SHARED_DEFAULT_CONFIG_REVISION,
+                    );
+                    console.info(`[Controller] applied shared default ${SHARED_DEFAULT_CONFIG_REVISION}`);
                 }
             }
         } catch (e) {

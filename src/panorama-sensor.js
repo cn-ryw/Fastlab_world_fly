@@ -88,6 +88,11 @@ const YOPO_APPLY_DEADLINE_RESERVE_MS = 2;
 // stays outside the p95 control cadence.
 const PLANNING_PREVIEW_INTERVAL_MS = 2000;
 const STALE_LOG_SUMMARY_INTERVAL_MS = 2000;
+const IS_CHROMIUM = typeof navigator !== 'undefined'
+    && /\bChrom(?:e|ium)\//.test(String(navigator.userAgent || ''));
+// A live six-face capture should normally finish in under 75 ms. Recover from
+// an asynchronously stalled capture before YOPO's 1.125 s trajectory expires.
+const CAPTURE_STALL_TIMEOUT_MS = 500;
 // DA360 超时：含冷启动首次推理裕度
 const DA360_TIMEOUT_MS = urlNumber('da360TimeoutMs', 20000, 2000, 60000);
 const DA360_UPLOAD_SCALE = urlNumber('da360UploadScale', 0.35, 0.05, 1);
@@ -834,7 +839,10 @@ export class PanoramaSensor {
             // Calibration remains fail-closed and live flight remains the
             // separate zero-wait capture-anyway path.
             continueOnTileTimeout: preload,
-            facesPerSlice: PANORAMA_FACES_PER_SLICE,
+            // Six synchronous Cesium renders blocked Chrome's main/physics
+            // loop for a complete panorama. Keep JPEG/inference pipelined,
+            // but yield after two faces so the flight view can present frames.
+            facesPerSlice: IS_CHROMIUM ? 2 : PANORAMA_FACES_PER_SLICE,
             timeoutMs: preload ? PANORAMA_PRELOAD_TIMEOUT_MS : 0,
         };
     }
@@ -854,7 +862,9 @@ export class PanoramaSensor {
     async _snapshotRgbBlob(canvas) {
         const startedAt = performance.now();
         const upload = this._depthUploadCanvas(canvas);
-        const snapshot = document.createElement('canvas');
+        const snapshot = typeof OffscreenCanvas !== 'undefined'
+            ? new OffscreenCanvas(upload.width, upload.height)
+            : document.createElement('canvas');
         snapshot.width = upload.width;
         snapshot.height = upload.height;
         const ctx = snapshot.getContext('2d', { alpha: false });
@@ -888,7 +898,7 @@ export class PanoramaSensor {
             vy: 0,
             vz: 0,
         }, 0);
-        return Object.freeze({
+        const context = {
             frameId,
             capturedAt,
             transform: cloneCaptureTransform(transform, fallbackPosition),
@@ -904,8 +914,21 @@ export class PanoramaSensor {
             faceTileReadiness: Object.freeze([...(readiness.faceTileReadiness || [])]),
             projectionConfig: Object.freeze(this._projectionConfig()),
             captureTimings: Object.freeze({ ...(captureTimings || {}) }),
-            rgbPromise: this._snapshotRgbBlob(canvas),
+        };
+        // JPEG is a latest-only control product, not a by-product of every
+        // panorama. Starting convertToBlob here queued unbounded encodes while
+        // the single DA360/YOPO request gate was busy. The selected request
+        // reads this getter synchronously before yielding, which freezes the
+        // matching canvas once and memoizes that one encode.
+        let rgbPromise = null;
+        Object.defineProperty(context, 'rgbPromise', {
+            enumerable: true,
+            get: () => {
+                if (!rgbPromise) rgbPromise = this._snapshotRgbBlob(canvas);
+                return rgbPromise;
+            },
         });
+        return Object.freeze(context);
     }
 
     async _materializePerceptionFrame(context) {
@@ -989,7 +1012,8 @@ export class PanoramaSensor {
 
         // 全景采集：catch stuck captures, skip if busy
         if (this.capturing) {
-            if (this._captureProfile === 'flight' && now - this.lastCaptureStartTime > 3000) {
+            if (this._captureProfile === 'flight'
+                && now - this.lastCaptureStartTime > CAPTURE_STALL_TIMEOUT_MS) {
                 this._abortActiveCapture('capture-timeout');
             }
             return;
@@ -1258,7 +1282,12 @@ export class PanoramaSensor {
 
     _isRequestSourceCurrent(request) {
         return this._isRequestSessionCurrent(request)
-            && request.frameId === this._rgbFrameId;
+            // `_materializePerceptionFrame()` synchronously copies the selected
+            // RGB canvas into an independent snapshot before JPEG encoding can
+            // yield. A newer panorama may therefore complete while that frozen
+            // image is encoding without invalidating the selected request.
+            && request.frameId === request.frameContext?.frameId
+            && request.frameId >= this._minimumRequestFrameId;
     }
 
     _canCommitDepthPreview(request) {
@@ -1651,7 +1680,7 @@ export class PanoramaSensor {
             const captureMs = this.lastCaptureTime - this.lastCaptureStartTime;
             this._rgbFrameId++;
             this._rgbReadiness = Object.freeze({ frameId: this._rgbFrameId, ...readiness });
-            this._rgbFrameContext = this._makeRgbFrameContext(
+            const frameContext = this._makeRgbFrameContext(
                 this._rgbFrameId,
                 capturedAt,
                 captureTransform,
@@ -1662,6 +1691,7 @@ export class PanoramaSensor {
                 capturePlanningEpoch,
                 readiness,
             );
+            this._rgbFrameContext = frameContext;
             this.hasRgb = true;
             const rgbStatus = `${Math.round(captureMs)}ms · tiles `
                 + `${readiness.rgbReadyFaces}/${readiness.rgbTotalFaces}`;
@@ -1672,6 +1702,9 @@ export class PanoramaSensor {
             } else {
                 this._queueLatestDepthRequest(this.lastCaptureTime);
             }
+            // Release capture immediately. The request gate selects the latest
+            // context and only then snapshots/encodes it, so intermediate
+            // captures can never create an image-encoder backlog.
         } catch (error) {
             if (error?.name === 'AbortError' || captureController.signal.aborted) {
                 this._setRgbStatus(`stale · ${captureController.signal.reason || 'capture-aborted'}`);
@@ -1735,14 +1768,28 @@ export class PanoramaSensor {
         return this.depthUploadCanvas;
     }
 
-    _canvasToJpegBlob(canvas) {
-        return new Promise(resolve => {
-            if (!canvas || typeof canvas.toBlob !== 'function') {
-                resolve(null);
-                return;
+    async _canvasToJpegBlob(canvas) {
+        if (!canvas || !canvas.width || !canvas.height) return null;
+
+        if (typeof canvas.convertToBlob === 'function') {
+            try {
+                return await canvas.convertToBlob({
+                    type: 'image/jpeg',
+                    quality: PANORAMA_JPEG_QUALITY,
+                });
+            } catch (error) {
+                reportUserError('Offscreen JPEG encoding failed', error, {
+                    key: 'offscreen-jpeg', intervalMs: 3000,
+                });
             }
-            canvas.toBlob(resolve, 'image/jpeg', PANORAMA_JPEG_QUALITY);
-        });
+        }
+
+        if (typeof canvas.toBlob === 'function') {
+            return new Promise(resolve => {
+                canvas.toBlob(resolve, 'image/jpeg', PANORAMA_JPEG_QUALITY);
+            });
+        }
+        return null;
     }
 
     async _decodeAndCommitDepthImage(

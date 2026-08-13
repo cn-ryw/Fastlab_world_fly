@@ -1,0 +1,54 @@
+# YOPO_70/epoch30：70 m感知、30 m最大轨迹距离的宽楼恢复策略。
+# 训练数据路径仅作为checkpoint来源记录；浏览器推理不会访问训练集。
+dataset_path: "../dataset_d70_recovery/train_view"
+leveled_depth: true
+depth_max_m: 70.0
+depth_min_m: 0.04
+depth_mask_threshold: 127
+
+velocity: 16.0
+cruise_target_mps: 15.0
+vel_max_train: 16.0
+acc_max_train: 12.0
+
+# 最大轨迹距离=2*radio_range=30 m；轨迹时长=30/16=1.875 s。
+radio_range: 15.0
+radio_num: 1
+safety_loss_eval_points: 100
+
+# 以下两项只描述该checkpoint的训练期Guidance契约，在线推理不读取。
+guidance_reachable_progress_enabled: true
+guidance_reachable_accel_fraction: 0.70
+
+speed_mixture:
+  - [14.0, 16.0, 0.50]
+  - [10.0, 14.0, 0.20]
+  - [5.0, 10.0, 0.20]
+  - [0.0, 5.0, 0.10]
+vz_fraction_std: 0.12
+vz_fraction_max: 0.30
+validation_map_index: 15
+
+mask_augment_enabled: true
+mask_augment_probability: 0.75
+mask_hole_count: [1, 4]
+mask_hole_width_fraction: [0.02, 0.12]
+mask_hole_height_fraction: [0.03, 0.20]
+mask_band_probability: 0.35
+mask_dropout_ratio: [0.05, 0.35]
+mask_min_valid_ratio: 0.60
+mask_fill_mode: "valid_mean"
+
+# 与YOPO_55基线相同的loss权重与安全距离契约。
+wg: 0.13
+ws: 10.0
+wa: 1.0
+wc: 3.0
+wh: 20.0
+vehicle_radius_m: 0.60
+safety_margin_m: 0.60
+d0: 1.20
+r: 0.60
+safety_far_weight: 0.0
+safety_far_r: 1.20
+controller_accel_hard_cap_mps2: 25.0

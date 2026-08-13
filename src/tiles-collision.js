@@ -49,6 +49,9 @@ export class TilesCollisionProvider {
         this.horizontalSkin = Number.isFinite(options.horizontalSkin) ? options.horizontalSkin : 0.07;
         this.rayExtra = Number.isFinite(options.rayExtra) ? options.rayExtra : 0.45;
         this.sweptExtra = Number.isFinite(options.sweptExtra) ? options.sweptExtra : 0.35;
+        this.sweepRadiusFactor = Number.isFinite(options.sweepRadiusFactor)
+            ? Math.max(0.35, Math.min(0.95, options.sweepRadiusFactor))
+            : 0.72;
         this.heightProbeWidth = Number.isFinite(options.heightProbeWidth) ? options.heightProbeWidth : 0.35;
         this.minPenetration = Number.isFinite(options.minPenetration) ? options.minPenetration : 0.015;
         this.minRayDistance = Number.isFinite(options.minRayDistance) ? options.minRayDistance : 0.04;
@@ -139,22 +142,59 @@ export class TilesCollisionProvider {
         if (!Number.isFinite(motionDistance) || motionDistance < 0.03) return;
 
         const dir = normalize(motion, { x: 0, y: 0, z: -1 });
-        const maxDistance = motionDistance + radius + this.sweptExtra;
-        const hit = this.world.pickLocalRay(prev, dir, maxDistance);
-        if (!this._validRayHit(prev, hit, maxDistance)) return;
-
-        const penetration = motionDistance + radius + this.horizontalSkin - hit.distance;
-        if (penetration <= this.minPenetration) return;
-
         const fallback = Math.abs(dir.y) < 0.7
             ? normalize({ x: -dir.x, y: 0, z: -dir.z }, { x: 0, y: 0, z: 1 })
             : normalize({ x: -dir.x, y: -dir.y, z: -dir.z }, { x: 0, y: 1, z: 0 });
-        hits.push({
-            normal: Math.abs(dir.y) < 0.7 ? fallback : hitNormalFromPoint(center.x, center.y, center.z, hit.position, fallback),
-            penetration,
-            source: 'swept',
-            pointCount: 1,
-        });
+
+        // Approximate a swept sphere rather than ray-casting only its centre.
+        // The four offset probes catch wall corners, roof edges and thin meshes
+        // touched by the vehicle radius between two physics frames.
+        const reference = Math.abs(dir.y) < 0.9
+            ? { x: 0, y: 1, z: 0 }
+            : { x: 1, y: 0, z: 0 };
+        const side = normalize({
+            x: dir.y * reference.z - dir.z * reference.y,
+            y: dir.z * reference.x - dir.x * reference.z,
+            z: dir.x * reference.y - dir.y * reference.x,
+        }, { x: 1, y: 0, z: 0 });
+        const up = normalize({
+            x: side.y * dir.z - side.z * dir.y,
+            y: side.z * dir.x - side.x * dir.z,
+            z: side.x * dir.y - side.y * dir.x,
+        }, { x: 0, y: 1, z: 0 });
+        const offsetRadius = radius * this.sweepRadiusFactor;
+        const probes = [
+            { x: 0, y: 0, z: 0, center: true },
+            { x: side.x * offsetRadius, y: side.y * offsetRadius, z: side.z * offsetRadius },
+            { x: -side.x * offsetRadius, y: -side.y * offsetRadius, z: -side.z * offsetRadius },
+            { x: up.x * offsetRadius, y: up.y * offsetRadius, z: up.z * offsetRadius },
+            { x: -up.x * offsetRadius, y: -up.y * offsetRadius, z: -up.z * offsetRadius },
+        ];
+
+        for (let probeIndex = 0; probeIndex < probes.length; probeIndex++) {
+            const probe = probes[probeIndex];
+            const origin = {
+                x: prev.x + probe.x,
+                y: prev.y + probe.y,
+                z: prev.z + probe.z,
+            };
+            const contactAllowance = probe.center ? radius : this.horizontalSkin;
+            const maxDistance = motionDistance + contactAllowance + this.sweptExtra;
+            const hit = this.world.pickLocalRay(origin, dir, maxDistance);
+            if (!this._validRayHit(origin, hit, maxDistance)) continue;
+
+            const penetration = motionDistance + contactAllowance - hit.distance;
+            if (penetration <= this.minPenetration) continue;
+            hits.push({
+                normal: Math.abs(dir.y) < 0.7
+                    ? fallback
+                    : hitNormalFromPoint(center.x, center.y, center.z, hit.position, fallback),
+                penetration,
+                source: probe.center ? 'swept-center' : 'swept-radius',
+                pointCount: probes.length,
+                probeIndex,
+            });
+        }
     }
 
     _queryNeighborhood(center, radius, hits, state = {}) {

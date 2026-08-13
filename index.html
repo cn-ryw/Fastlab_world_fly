@@ -880,7 +880,7 @@
             </div>
         </div>
         <div style="font-size:12px;color:#8aa;margin:-2px 0 8px;line-height:1.4;">
-            Easy: sticks command velocity and release into brake/hold. FPV: manual body rates and motor thrust. Level: self-level roll/pitch with manual thrust—there is no altitude hold. SO3: YOPO waypoint auto-flight; a connected T8L continuously moves an 8 m rolling goal, while other inputs use G+scene click or the depth circle. C cancels a fixed goal. In relative-depth mode, a circle click is a nominal 20 m interaction test only and cannot authorize a YOPO trajectory.
+            Easy: sticks command velocity and release into brake/hold. FPV: manual body rates and motor thrust. Level: self-level roll/pitch with manual thrust—there is no altitude hold. SO3: YOPO waypoint auto-flight; a connected RC transmitter continuously moves a 30 m rolling goal, while other inputs use G+scene click or the depth circle. C cancels a fixed goal. In relative-depth mode, a circle click is a nominal 20 m interaction test only and cannot authorize a YOPO trajectory.
         </div>
         <div class="setting-row">
             <label>Easy Max Speed (m/s; 83.3 = 300 km/h)</label>
@@ -1102,7 +1102,7 @@
                         window.googleTilesFlightStart();
                         return;
                     }
-                    import('./src/main.js?v=20260812-t8l')
+                    import('./src/main.js?v=20260813-frozen-source-pipeline')
                         .then(function (mod) {
                             var start = window.googleTilesFlightStart || mod.startTilesMode;
                             if (typeof start === 'function') start();
@@ -1113,6 +1113,6 @@
             });
         }());
     </script>
-    <script type="module" src="src/main.js?v=20260812-t8l"></script>
+    <script type="module" src="src/main.js?v=20260813-frozen-source-pipeline"></script>
 </body>
 </html>

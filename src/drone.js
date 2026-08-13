@@ -84,8 +84,6 @@ export const TERMINAL_DECELERATION_DESIGN_ACCELERATION_MPS2 = 12.0;
 export const TERMINAL_DECELERATION_TIMEOUT_S = 2.5;
 export const YOPO_MAX_APPLY_AGE_S = 0.25;
 export const YOPO_MAX_APPLY_AGE_FRACTION = 0.25;
-export const YOPO_MAX_SUFFIX_POSITION_ERROR_M = 1.2;
-export const YOPO_MAX_SUFFIX_VELOCITY_ERROR_MPS = 3.0;
 const TERMINAL_TRACK_MAX_ACCELERATION_MPS2 = 25.0;
 const TERMINAL_DECELERATION_COMMAND_LIMIT_MPS2 = 25.0;
 const TERMINAL_DECELERATION_MAX_TILT_DEG = 60.0;
@@ -442,8 +440,11 @@ export class Drone {
     }
 
     _latchSo3Hold(reason = 'hold', commandType = null) {
-        this._so3Hold = { x: this.x, y: this.y, z: this.z, yawDeg: this.yaw };
-        this._so3YawSetpointDeg = this.yaw;
+        const yawDeg = this.flightMode === 'so3' && this._so3FixedYaw != null
+            ? this._so3FixedYaw
+            : this._decomposeOrientation().yawDeg;
+        this._so3Hold = { x: this.x, y: this.y, z: this.z, yawDeg };
+        this._so3YawSetpointDeg = yawDeg;
         this._so3HoldCommandType = commandType || (FAILSAFE_HOLD_REASONS.has(reason)
             ? ControlCommandType.FAILSAFE_HOLD
             : ControlCommandType.POSITION_VELOCITY_HOLD);
@@ -637,8 +638,12 @@ export class Drone {
         this._idealGoal = goal ? { x: goal.x, y: goal.y, z: goal.z, yaw: goal.yaw } : null;
         this._navigationKind = goal ? 'fixed' : null;
         this._resetTerminalNavigation(goal ? 'approach' : 'idle');
-        this._so3FixedYaw = goal ? this.yaw : null;
-        this._so3YawSetpointDeg = this.yaw;
+        // Match YOPO_360_X5 lock_yaw: capture once for the SO3 session. A new
+        // goal or a cancelled goal must not rotate the world-frame heading.
+        if (goal && this.flightMode === 'so3' && this._so3FixedYaw == null) {
+            this._so3FixedYaw = this._decomposeOrientation().yawDeg;
+        }
+        this._so3YawSetpointDeg = this._so3FixedYaw ?? this._decomposeOrientation().yawDeg;
         this._latchSo3Hold(goal ? 'awaiting-trajectory' : 'goal-cleared');
         this._navigationState = goal ? 'active' : 'idle';
         this._navigationTransitionReason = goal ? 'goal-set' : 'goal-cleared';
@@ -798,14 +803,26 @@ export class Drone {
             initialTimeS = Math.max(0, initialTimeS);
         }
 
+        const planningAgeS = initialTimeS;
+        // Match upstream YOPO's default plan_from_reference=False handoff:
+        // every accepted response starts a fresh full-duration Poly5 from the
+        // measured state at apply time. Capture age remains an independent
+        // freshness gate; it is not consumed as a trajectory suffix.
+        startState = {
+            x: this.x, y: this.y, z: this.z,
+            vx: this.vx, vy: this.vy, vz: this.vz,
+            ax: previousReference?.ax ?? 0,
+            ay: previousReference?.ay ?? 0,
+            az: previousReference?.az ?? 0,
+        };
         const commandContext = Object.freeze({
             ...providedContext,
             source: typeof providedContext.source === 'string' ? providedContext.source : 'yopo',
             frame: 'sim-world-y-up',
             generation: providedContext.generation ?? null,
-            planningAgeS: initialTimeS,
-            createdSimTime,
-            expirySimTime: createdSimTime + (Number.isFinite(duration) ? duration : 0),
+            planningAgeS,
+            createdSimTime: this._simTimeS,
+            expirySimTime: this._simTimeS + (Number.isFinite(duration) ? duration : 0),
         });
         // Build into a private candidate tracker. A stale or dynamically
         // inconsistent response must never destroy an older trajectory that is
@@ -816,7 +833,7 @@ export class Drone {
             trajTime,
             startState,
             commandContext,
-            { initialTimeS },
+            { initialTimeS: 0 },
         );
         if (!checked.valid) {
             return this._rejectYopoTrajectory(checked.reason);
@@ -825,9 +842,9 @@ export class Drone {
             YOPO_MAX_APPLY_AGE_S,
             checked.trajTime * YOPO_MAX_APPLY_AGE_FRACTION,
         );
-        if (initialTimeS > maximumApplyAgeS + 1e-12) {
+        if (planningAgeS > maximumApplyAgeS + 1e-12) {
             return this._rejectYopoTrajectory(
-                `trajectory age ${initialTimeS.toFixed(3)}s exceeds apply limit ${maximumApplyAgeS.toFixed(3)}s`,
+                `trajectory age ${planningAgeS.toFixed(3)}s exceeds apply limit ${maximumApplyAgeS.toFixed(3)}s`,
             );
         }
 
@@ -845,17 +862,6 @@ export class Drone {
         if (!Number.isFinite(applyPositionErrorM) || !Number.isFinite(applyVelocityErrorMps)) {
             return this._rejectYopoTrajectory('trajectory suffix consistency error is non-finite');
         }
-        if (applyPositionErrorM > YOPO_MAX_SUFFIX_POSITION_ERROR_M + 1e-12) {
-            return this._rejectYopoTrajectory(
-                `trajectory suffix position error ${applyPositionErrorM.toFixed(2)}m exceeds ${YOPO_MAX_SUFFIX_POSITION_ERROR_M}m`,
-            );
-        }
-        if (applyVelocityErrorMps > YOPO_MAX_SUFFIX_VELOCITY_ERROR_MPS + 1e-12) {
-            return this._rejectYopoTrajectory(
-                `trajectory suffix velocity error ${applyVelocityErrorMps.toFixed(2)}m/s exceeds ${YOPO_MAX_SUFFIX_VELOCITY_ERROR_MPS}m/s`,
-            );
-        }
-
         candidate.context = Object.freeze({
             ...commandContext,
             maximumApplyAgeS,
@@ -1199,9 +1205,7 @@ export class Drone {
                 && Number(this._trajectory.maxAcceleration)
                     <= TERMINAL_TRACK_MAX_ACCELERATION_MPS2 + 1e-9
                 && Number.isFinite(suffixPositionErrorM)
-                && suffixPositionErrorM <= YOPO_MAX_SUFFIX_POSITION_ERROR_M + 1e-9
-                && Number.isFinite(suffixVelocityErrorMps)
-                && suffixVelocityErrorMps <= YOPO_MAX_SUFFIX_VELOCITY_ERROR_MPS + 1e-9;
+                && Number.isFinite(suffixVelocityErrorMps);
             if (this._terminalTrajectoryEligible) {
                 this._terminalPhase = 'terminal-track';
                 this._terminalSettledTimeS = 0;
@@ -1473,12 +1477,24 @@ export class Drone {
      *  pitch/roll 组合都能给出正确的水平朝向。
      *  位置也基于 yaw-only 朝向计算，roll 时相机位置不左右摆动。 */
     getLeveledPanoramaTransform() {
-        // 从完整四元数提取 body forward 在水平面上的投影
-        _mat4.setTRS(pc.Vec3.ZERO, this.orientation, pc.Vec3.ONE);
-        _mat4.getZ(_v3);  // body Z (backward) 在世界系中的方向
-        const bx = _v3.x, bz = _v3.z;  // backward 的水平分量
-        // leveled forward = -backward 的水平归一化方向
-        const { fwdX, fwdZ, yawRad } = leveledYawFromBackward(bx, bz);
+        let yawRad;
+        let fwdX;
+        let fwdZ;
+        if (this.flightMode === 'so3' && this._so3FixedYaw != null) {
+            // ERP/YOPO is world-yaw locked. Roll/pitch tilt must not rotate
+            // the horizontal panorama heading through Euler coupling.
+            yawRad = this._so3FixedYaw * DEG2RAD;
+            fwdX = -Math.sin(yawRad);
+            fwdZ = -Math.cos(yawRad);
+        } else {
+            // 从完整四元数提取 body forward 在水平面上的投影
+            _mat4.setTRS(pc.Vec3.ZERO, this.orientation, pc.Vec3.ONE);
+            _mat4.getZ(_v3);  // body Z (backward) 在世界系中的方向
+            const leveled = leveledYawFromBackward(_v3.x, _v3.z);
+            fwdX = leveled.fwdX;
+            fwdZ = leveled.fwdZ;
+            yawRad = leveled.yawRad;
+        }
         const halfYaw = yawRad * 0.5;
         const noseOffset = this.droneSize * 0.5;
 
@@ -1493,11 +1509,11 @@ export class Drone {
         };
     }
 
-    /** Return fixed yaw if SO3 yaw-lock is active, else current yaw. */
+    /** Return the SO3 session's initial world heading, else current heading. */
     getFixedYaw() {
-        const yawLockEl = globalThis.document?.getElementById?.('yaw-lock-toggle');
-        const lockEnabled = yawLockEl ? yawLockEl.checked : true;
-        return (lockEnabled && this._so3FixedYaw != null) ? this._so3FixedYaw : this.yaw;
+        return (this.flightMode === 'so3' && this._so3FixedYaw != null)
+            ? this._so3FixedYaw
+            : this.yaw;
     }
 
     getBodyTransform() {
@@ -1613,12 +1629,14 @@ export class Drone {
     _updateEulerFromQuat() {
         const e = new pc.Vec3();
         this.orientation.getEulerAngles(e);
+        const dec = this._decomposeOrientation();
         this.pitch = e.x;
-        this.yaw   = e.y;
+        // Report horizontal nose heading instead of the Euler Y component,
+        // which changes when roll and pitch are combined.
+        this.yaw   = dec.yawDeg;
         this.roll  = e.z;
 
         // Yaw-independent body tilt for OSD artificial horizon
-        const dec = this._decomposeOrientation();
         this.bodyPitch = dec.bodyPitchDeg;
         this.bodyRoll  = dec.bodyRollDeg;
     }
@@ -1665,8 +1683,9 @@ export class Drone {
         }
         // Lock yaw on entering SO3 mode (like YOPO lock_yaw=True)
         if (newMode === 'so3') {
-            this._so3FixedYaw = this.yaw;
-            this._so3YawSetpointDeg = this.yaw;
+            const initialHeading = this._decomposeOrientation().yawDeg;
+            this._so3FixedYaw = initialHeading;
+            this._so3YawSetpointDeg = initialHeading;
             this._so3YawRateSetpointDeg = 0;
             this._latchSo3Hold('mode-enter');
         } else {
@@ -1862,6 +1881,8 @@ export class Drone {
     }
 
     _isYawLockEnabled() {
+        // YOPO_360_X5 ERP mode always publishes initial_yaw with yaw_dot=0.
+        if (this.flightMode === 'so3') return true;
         const element = globalThis.document?.getElementById?.('yaw-lock-toggle');
         return element ? !!element.checked : true;
     }
@@ -2353,29 +2374,10 @@ export class Drone {
     }
 
     _updateSo3Yaw(dt, reference) {
-        if (this._isYawLockEnabled()) {
-            this._so3YawSetpointDeg = this._so3FixedYaw ?? this._so3Hold?.yawDeg ?? this.yaw;
-            this._so3YawRateSetpointDeg = 0;
-            return this._so3YawSetpointDeg;
-        }
-        const horizontalSpeed = Math.hypot(reference?.vx || 0, reference?.vz || 0);
-        if (horizontalSpeed <= 0.2) return this._so3YawSetpointDeg;
-
-        const desiredYaw = Math.atan2(-reference.vx, -reference.vz) * RAD2DEG;
-        const yawError = this._wrapDegrees(desiredYaw - this._so3YawSetpointDeg);
-        const desiredRate = Math.max(-60, Math.min(60, yawError * 3));
-        const rateStep = 20 * dt;
-        this._so3YawRateSetpointDeg += Math.max(-rateStep, Math.min(
-            rateStep,
-            desiredRate - this._so3YawRateSetpointDeg,
-        ));
-        const yawStep = this._so3YawRateSetpointDeg * dt;
-        if (Math.abs(yawStep) >= Math.abs(yawError)) {
-            this._so3YawSetpointDeg = desiredYaw;
-            this._so3YawRateSetpointDeg = 0;
-        } else {
-            this._so3YawSetpointDeg = this._wrapDegrees(this._so3YawSetpointDeg + yawStep);
-        }
+        this._so3YawSetpointDeg = this._so3FixedYaw
+            ?? this._so3Hold?.yawDeg
+            ?? this._decomposeOrientation().yawDeg;
+        this._so3YawRateSetpointDeg = 0;
         return this._so3YawSetpointDeg;
     }
 

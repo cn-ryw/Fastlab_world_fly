@@ -123,6 +123,7 @@ def health():
     return jsonify({
         "ok": True,
         "model": Path(str(runner.model_path)).name,
+        "strategy": os.environ.get("MINDCLOUD_YOPO_STRATEGY", "baseline"),
         "device": runner.device,
         "checkpoint_coverage": runner.checkpoint_coverage,
         "checkpoint_missing_keys": runner.checkpoint_missing_keys,

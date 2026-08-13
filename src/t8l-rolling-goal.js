@@ -1,4 +1,4 @@
-export const T8L_GOAL_RADIUS_M = 8;
+export const T8L_GOAL_RADIUS_M = 30;
 export const T8L_GOAL_DEADZONE = 0.25;
 
 export function applyT8LGoalDeadzone(value, deadzone = T8L_GOAL_DEADZONE) {
@@ -8,17 +8,34 @@ export function applyT8LGoalDeadzone(value, deadzone = T8L_GOAL_DEADZONE) {
     return 0;
 }
 
-/** ROS start_rc_goal.sh semantics adapted from ROS XY-up to Cesium XZ-horizontal. */
-export function computeT8LRollingGoal(position, channels, radius = T8L_GOAL_RADIUS_M) {
+/**
+ * Build a body-heading-relative rolling goal in the simulator's XZ plane.
+ * yaw=0 faces -Z; positive yaw turns the nose toward -X.
+ * Channel inversion belongs to Controller mapping, not this transform.
+ */
+export function computeT8LRollingGoal(
+    position,
+    channels,
+    yawDeg = 0,
+    radius = T8L_GOAL_RADIUS_M,
+) {
     if (!position || !Array.isArray(channels) || channels.length < 2) return null;
     const origin = [position.x, position.y, position.z].map(Number);
-    if (!origin.every(Number.isFinite)) return null;
-    // CH1 roll and CH2 pitch are both inverted; swap_xy maps pitch to world X
-    // and roll to the other horizontal world axis (Cesium Z).
-    const roll = -applyT8LGoalDeadzone(channels[0]);
+    const heading = Number(yawDeg);
+    if (!origin.every(Number.isFinite) || !Number.isFinite(heading)) return null;
+    const roll = applyT8LGoalDeadzone(channels[0]);
+    // The transmitter's globally calibrated pitch sign is correct for direct
+    // flight modes, while the rolling-goal convention defines stick-forward
+    // as a positive body-forward displacement. Convert only at this SO3
+    // navigation boundary so FPV/Easy pitch remain unchanged.
     const pitch = -applyT8LGoalDeadzone(channels[1]);
-    let dx = pitch * radius;
-    let dz = roll * radius;
+    const yawRad = heading * Math.PI / 180;
+    const forwardX = -Math.sin(yawRad);
+    const forwardZ = -Math.cos(yawRad);
+    const rightX = -Math.cos(yawRad);
+    const rightZ = Math.sin(yawRad);
+    let dx = (forwardX * pitch + rightX * roll) * radius;
+    let dz = (forwardZ * pitch + rightZ * roll) * radius;
     const magnitude = Math.hypot(dx, dz);
     if (magnitude > radius) {
         dx *= radius / magnitude;

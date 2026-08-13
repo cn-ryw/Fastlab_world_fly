@@ -23,16 +23,19 @@
  * from the original simulator.
  */
 
-import { CesiumWorld } from './cesium-world.js?v=20260703-panorama-tile-idle';
-import { TilesCollisionProvider } from './tiles-collision.js';
-import { Controller } from './controller.js?v=20260812-t8l';
-import { Drone } from './drone.js?v=20260812-t8l';
+import { CesiumWorld } from './cesium-world.js?v=20260812-chrome-panorama-init';
+import { TilesCollisionProvider } from './tiles-collision.js?v=20260812-swept-sphere';
+import { Controller } from './controller.js?v=20260812-shared-controller-config';
+import { Drone } from './drone.js?v=20260812-so3-fixed-world-yaw';
 import { HUD } from './hud.js?v=20260811-control-v6';
 import { OSD } from './osd.js?v=20260811-control-v6';
-import { PanoramaSensor } from './panorama-sensor.js?v=20260812-t8l';
+import { PanoramaSensor } from './panorama-sensor.js?v=20260813-frozen-source-pipeline';
 import { FlightLogger } from './flight-logger.js?v=20260812-t8l';
 import { reportUserError } from './error-report.js';
-import { computeT8LRollingGoal } from './t8l-rolling-goal.js?v=20260812';
+import {
+    computeT8LRollingGoal,
+    T8L_GOAL_DEADZONE,
+} from './t8l-rolling-goal.js?v=20260812-so3-pitch-sign';
 import { FixedStepScheduler } from './fixed-step-scheduler.js?v=20260811';
 import {
     drawDepthTopdown,
@@ -90,11 +93,17 @@ const VIEW_CHOICE_HINT_HTML = '1 / O: First Person &nbsp;|&nbsp; 2: Third Person
 const MAX_PLACEMENT_FRAME_DT = 0.05;
 const SETTINGS_READ_INTERVAL_MS = 100;
 const DEPTH_TOPDOWN_MAX_AGE_MS = 250;
-const T8L_ROLLING_GOAL_INTERVAL_MS = 50;
+const RC_ROLLING_GOAL_INTERVAL_MS = 50;
+// Cesium panorama rendering routinely makes a frame exceed the scheduler's
+// 100 ms catch-up budget. Discarding excess wall time is safe; destroying the
+// active trajectory on every such frame caused a replan storm. Reserve the
+// controller fail-safe for a genuine quarter-second control blackout.
+const CONTROL_FAULT_FRAME_SECONDS = 0.25;
 
-const t8lRollingNavigation = {
+const rcRollingNavigation = {
     active: false,
     lastUpdateAt: -Infinity,
+    source: null,
 };
 
 const flightControlScheduler = new FixedStepScheduler();
@@ -687,30 +696,58 @@ function beginNavigationSession(goal, navigationKind = 'fixed') {
     return goalId;
 }
 
-function stopT8LRollingNavigation(reason) {
-    if (!t8lRollingNavigation.active) return;
-    t8lRollingNavigation.active = false;
-    t8lRollingNavigation.lastUpdateAt = -Infinity;
+function stopRcRollingNavigation(reason) {
+    if (!rcRollingNavigation.active) return;
+    rcRollingNavigation.active = false;
+    rcRollingNavigation.lastUpdateAt = -Infinity;
+    rcRollingNavigation.source = null;
+    rcRollingNavigation.targetYawDeg = null;
+    rcRollingNavigation.lastYawUpdateAt = null;
     finishNavigationSession(reason, { cancelDrone: true, arrived: false });
 }
 
-function updateT8LRollingNavigation(input, now) {
-    const eligible = input?.t8l?.connected && input.t8l.fresh && input.armed
+function rcRollingChannels(input) {
+    const supported = input?.inputSource === 't8l-serial'
+        || input?.inputSource === 'gamepad'
+        || input?.inputSource === 'webhid';
+    if (!supported) return null;
+    if (input.inputSource === 't8l-serial'
+        && (!input.t8l?.connected || !input.t8l.fresh)) return null;
+    const channels = ['roll', 'pitch', 'yaw'].map(action => Number(input.rawAxes?.[action]));
+    return channels.every(Number.isFinite) ? channels : null;
+}
+
+function updateRcRollingNavigation(input, now) {
+    const channels = rcRollingChannels(input);
+    const eligible = channels && input.armed
         && drone?.flightMode === 'so3' && mode === 'flight';
     if (!eligible) {
-        stopT8LRollingNavigation(input?.t8l?.fresh ? 't8l-inactive' : 't8l-link-lost');
+        const linkLost = rcRollingNavigation.source === 't8l-serial' && !input?.t8l?.fresh;
+        stopRcRollingNavigation(linkLost ? 't8l-link-lost' : 'rc-inactive');
         return;
     }
-    if (now - t8lRollingNavigation.lastUpdateAt < T8L_ROLLING_GOAL_INTERVAL_MS) return;
-    t8lRollingNavigation.lastUpdateAt = now;
+    const stickDeflected = channels.slice(0, 2)
+        .some(value => Math.abs(Number(value) || 0) > T8L_GOAL_DEADZONE);
+    // A centred connected controller must not replace a fixed G+click goal.
+    // The first deliberate stick movement transfers navigation ownership to
+    // rolling RC control; after that, returning to centre commands a hold at
+    // the current position, matching the original T8L algorithm.
+    if (!rcRollingNavigation.active && !stickDeflected) return;
+    if (rcRollingNavigation.active && rcRollingNavigation.source !== input.inputSource) {
+        stopRcRollingNavigation('rc-source-changed');
+    }
+    if (now - rcRollingNavigation.lastUpdateAt < RC_ROLLING_GOAL_INTERVAL_MS) return;
+    rcRollingNavigation.lastUpdateAt = now;
     const goal = computeT8LRollingGoal(
         { x: drone.x, y: drone.y, z: drone.z },
-        input.t8l.axes,
+        channels,
+        drone.getFixedYaw(),
     );
     if (!goal) return;
-    if (!t8lRollingNavigation.active) {
+    if (!rcRollingNavigation.active) {
         beginNavigationSession(goal, 't8l-rolling');
-        t8lRollingNavigation.active = true;
+        rcRollingNavigation.active = true;
+        rcRollingNavigation.source = input.inputSource;
     } else {
         drone.updateRollingGoal(goal);
         panoramaSensor.updateYopoGoal(goal, 't8l-rolling');
@@ -1098,7 +1135,8 @@ function updateFlight(dt) {
     if (input.t8l?.failsafeTriggered) {
         controller.setFlightMode('so3');
         drone.readSettings();
-        t8lRollingNavigation.active = false;
+        rcRollingNavigation.active = false;
+        rcRollingNavigation.source = null;
         finishNavigationSession('t8l-link-lost', { cancelDrone: true, arrived: false });
     }
     const modeSelect = document.getElementById('flight-mode-select');
@@ -1109,7 +1147,7 @@ function updateFlight(dt) {
         drone.readSettings();
         lastSettingsReadTime = now;
     }
-    updateT8LRollingNavigation(input, now);
+    updateRcRollingNavigation(input, now);
     if (input.resetTriggered) {
         finishNavigationSession('reset', { cancelDrone: true, arrived: false });
         resetFlightControlClock();
@@ -1120,7 +1158,11 @@ function updateFlight(dt) {
     const schedule = flightControlScheduler.advance(input.resetTriggered ? 0 : dt, (stepDt) => {
         drone.update(stepDt, input, collisionProvider);
     }, {
-        onOverrun: (overrun) => drone.handleControlOverrun?.(overrun),
+        onOverrun: (overrun) => {
+            if (overrun.frameSeconds >= CONTROL_FAULT_FRAME_SECONDS) {
+                drone.handleControlOverrun?.(overrun);
+            }
+        },
     });
 
     if (drone.flightMode === 'drone') {
@@ -1460,8 +1502,9 @@ function setupThirdPersonPointerControls() {
 }
 
 function finishNavigationSession(reason, { cancelDrone = false, arrived = false } = {}) {
-    t8lRollingNavigation.active = false;
-    t8lRollingNavigation.lastUpdateAt = -Infinity;
+    rcRollingNavigation.active = false;
+    rcRollingNavigation.lastUpdateAt = -Infinity;
+    rcRollingNavigation.source = null;
     flightLogger?.stop(arrived);
     if (cancelDrone) drone?.cancelWaypoint();
     panoramaSensor?.resetYopoGoal(reason);

@@ -26,9 +26,14 @@ docker build -f Dockerfile.da360-yopo -t mindcloud-da360-yopo:latest .
 # 打开启用 NVIDIA offload 的 Firefox
 ./launch-firefox-gpu.sh
 
+# 遥控器 Gamepad/Web Serial 测试可使用持久、非隐私的专用 Chrome 配置
+./launch-chrome-gpu.sh
+
 # 停止本项目服务
 ./stop-all.sh
 ```
+
+Chrome 启动器固定使用 X11 + ANGLE OpenGL；页面按 `panoFacesPerSlice=2` 在每两面后让出主线程。
 
 `start-all.sh` 的实际拓扑只有两个本机监听端点：
 
@@ -46,7 +51,7 @@ Firefox ── http://127.0.0.1:8080 ── scripts/serve.py（直接读取工�
 - `launch-firefox-gpu.sh` 保留系统/环境代理、本机地址走 `NO_PROXY`，并用不含凭据的 Google Tiles 根地址做连通性预检。Google API key 通过官方支持的 `X-Goog-Api-Key` 请求头传递，不再进入浏览器请求 URL；应用错误输出还会删除 URL 的 userinfo、query 与 fragment，并对 tile 错误指数节流。
 - Clash 配置不会再被默认修改；只有设置 `MINDCLOUD_FIX_CLASH=1` 才执行修复脚本。
 
-默认 checkpoint 路径：
+默认YOPO策略保持为`baseline`，checkpoint路径为：
 
 ```text
 third_party/DA360/checkpoints/DA360_large.pth
@@ -54,6 +59,14 @@ third_party/DA360/checkpoints/DA360_large.pth
 ```
 
 可分别用 `DA360_MODEL_PATH_HOST` 和 `YOPO_MODEL_PATH_HOST` 覆盖。
+
+另提供可选的70 m感知/30 m轨迹`YOPO_70/epoch30`策略：
+
+```bash
+MINDCLOUD_YOPO_STRATEGY=d70_h30_epoch30 ./start-all.sh
+```
+
+不设置该变量或显式设置`baseline`都会继续使用原策略。策略详情、运行身份核对和回退方法见[`docs/yopo-strategy-selection.md`](docs/yopo-strategy-selection.md)。
 
 ## 使用方式
 
@@ -70,8 +83,9 @@ RadioMaster T8L 以 VCP 模式接入后，先运行 `./launch.sh --input-status`
 `127.0.0.1` 页面，在 Settings 中点击 **Connect T8L** 并在浏览器设备选择器中选中 RadioMaster。
 
 - 默认 CH1/CH2/CH3/CH4 为 Roll/Pitch/Throttle/Yaw；通道映射、反向、死区、Rate/Expo 继续在 Settings 中配置。
-- Arm 和 Mode 默认不绑定。点击对应的 Assign 后拨动开关完成学习；T8L 开关自动使用 level 模式，避免首帧误触。
-- Mode 低位为 Easy，高位为 SO3。SO3 中 CH1/CH2 按 YOPO 遥控算法持续移动黄色 8 m 航点，高度保持为无人机当前高度。
+- Arm 和 Mode 默认不绑定。点击对应的 Assign 后拨动开关完成学习；RadioMaster/T8L 三挡 Arm 为低挡锁定、中高挡解锁，首次连接只同步档位基线以避免误解锁。
+- RadioMaster/T8L 三挡 Mode 为低挡 FPV、中挡 Easy、高挡 SO3。SO3 中 CH1/CH2 按 YOPO 遥控算法持续移动黄色 30 m 航点，高度保持为无人机当前高度。
+- Gamepad/WebHID 在 Arm + SO3 后，Roll/Pitch 首次越过 0.25 死区时接入同一套 30 m 滚动航点算法；设备断开或退出 SO3 会取消活动航点。
 - 250 ms 未收到合法串口帧会清除活动航点和旧轨迹、强制 SO3 原地悬停，但保留当前解锁状态；物理断开后需要再次点击 Connect T8L。
 
 串口参数固定为 460800 baud，识别 VID/PID `19f5:5740`；当前稳定设备名通常为
