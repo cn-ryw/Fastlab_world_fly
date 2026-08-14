@@ -7,6 +7,9 @@ third_party/DA360/
 .dev-web.pid
 .dev-web.log
 .dev-firefox.log
+.dev-chrome.log
+.chrome-mindcloud-flight/
+.chrome-mindcloud-profile/
 
 # Reproducible third-party web builds are fetched from versions.lock.json.
 third_party/Cesium/
