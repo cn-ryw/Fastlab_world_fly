@@ -23,21 +23,21 @@
  * from the original simulator.
  */
 
-import { CesiumWorld } from './cesium-world.js?v=20260813-perf-singleton-r13';
+import { CesiumWorld } from './cesium-world.js?v=20260813-render-clock-r14';
 import { TilesCollisionProvider } from './tiles-collision.js?v=20260813-panorama-continuity-r2';
 import { Controller } from './controller.js?v=20260812-shared-controller-config';
 import { Drone } from './drone.js?v=20260813-panorama-continuity-r2';
 import { HUD } from './hud.js?v=20260811-control-v6';
 import { OSD } from './osd.js?v=20260811-control-v6';
-import { PanoramaSensor } from './panorama-sensor.js?v=20260813-perf-singleton-r13';
-import { FlightLogger } from './flight-logger.js?v=20260813-perf-singleton-r13';
+import { PanoramaSensor } from './panorama-sensor.js?v=20260813-render-clock-r14';
+import { FlightLogger } from './flight-logger.js?v=20260813-render-clock-r14';
 import { reportUserError } from './error-report.js';
 import {
     computeT8LRollingGoal,
     T8L_GOAL_DEADZONE,
 } from './t8l-rolling-goal.js?v=20260813-so3-goal-50m';
 import { FixedStepScheduler } from './fixed-step-scheduler.js?v=20260811';
-import { demoPerformance } from './demo-performance.js?v=20260813-perf-singleton-r13';
+import { demoPerformance } from './demo-performance.js?v=20260813-render-clock-r14';
 import {
     drawDepthTopdown,
     depthTopdownLabels,
@@ -1155,7 +1155,6 @@ function drawRadar() {
 }
 
 function gameLoop(now) {
-    demoPerformance.recordFrame(now);
     const frameDt = Math.max(0, (now - lastFrameTime) / 1000);
     lastFrameTime = now;
 

@@ -30,7 +30,7 @@
 
 import { formatError, reportUserError } from './error-report.js';
 import { erpDirectionToComponent, sampleAnchorDirections } from './erp-geometry.js';
-import { demoPerformance } from './demo-performance.js?v=20260813-perf-singleton-r13';
+import { demoPerformance } from './demo-performance.js?v=20260813-render-clock-r14';
 
 const DEFAULT_ION_TOKEN = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJqdGkiOiJlMTg2MGFhOS02YTdhLTQ1NWMtYjkzMi05YjQ2ODRlZjI5YTgiLCJpZCI6MjUxNzM1LCJpYXQiOjE3MzAyODI0ODN9.prWAxx4RB8teelutQQbVqdxhgRZpZ4zjw8wzM-8k1Ug';
 const DEFAULT_ASSET_ID = 2275207;
@@ -1874,10 +1874,11 @@ export class CesiumWorld {
         ));
         const progressCb = typeof options.progressCb === 'function' ? options.progressCb : null;
         const sleep = (ms) => new Promise(resolve => window.setTimeout(resolve, ms));
-        const yieldFrame = () => new Promise(resolve => {
-            if (typeof window.requestAnimationFrame === 'function') window.requestAnimationFrame(() => resolve());
-            else window.setTimeout(resolve, 0);
-        });
+        // Yield to the browser task queue between face batches without waiting
+        // for the next visible animation frame. Waiting on requestAnimationFrame
+        // coupled perception latency to main-view tile stalls (up to hundreds
+        // of milliseconds) even though the six actual renders took ~30 ms.
+        const yieldFrame = () => new Promise(resolve => window.setTimeout(resolve, 0));
         const throwIfAborted = () => {
             if (!signal?.aborted) return;
             const error = new Error(String(signal.reason || 'panorama capture aborted'));

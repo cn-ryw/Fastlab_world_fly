@@ -97,6 +97,7 @@ export class DemoPerformanceController {
     constructor(config = resolvePerformanceConfig()) {
         this.config = config;
         this._viewer = null;
+        this._removePostRenderListener = null;
         this._lastFrameAt = null;
         this._frames = [];
         this._captures = [];
@@ -112,6 +113,7 @@ export class DemoPerformanceController {
         this._preload = {};
         this._yopoStrategy = null;
         this._identityPromise = null;
+        this._recordedCaptureKeys = new Map();
     }
 
     configureCesium(Cesium) {
@@ -123,7 +125,17 @@ export class DemoPerformanceController {
 
     attachViewer(viewer, tileStatusProvider = null) {
         if (viewer && this._viewer !== viewer) {
+            if (typeof this._removePostRenderListener === 'function') {
+                this._removePostRenderListener();
+            }
             this._viewer = viewer;
+            if (this.config.profile === 'demo30' && 'targetFrameRate' in viewer) {
+                viewer.targetFrameRate = this.config.targetFps;
+            }
+            const postRender = viewer.scene?.postRender;
+            this._removePostRenderListener = postRender?.addEventListener
+                ? postRender.addEventListener(() => this.recordFrame(performance.now()))
+                : null;
             this._applyResolutionScale();
             this._resolutionEvents.push({
                 recordedAtMs: performance.now(),
@@ -245,6 +257,25 @@ export class DemoPerformanceController {
 
     recordLatestSlotDrop(recordedAtMs = performance.now()) {
         this._latestSlotDrops.push(recordedAtMs);
+    }
+
+    recordPerceptionCapture(metrics = {}) {
+        const mode = metrics.mode;
+        if (mode !== 'planning' && mode !== 'preview') return;
+        const frameId = Number(metrics.frameId ?? metrics.rgbFrameId);
+        if (!Number.isFinite(frameId)) return;
+
+        const recordedAtMs = performance.now();
+        const key = `${mode}:${frameId}`;
+        if (this._recordedCaptureKeys.has(key)) return;
+        this._recordedCaptureKeys.set(key, recordedAtMs);
+        this._captures.push({ mode, frameId, recordedAtMs });
+
+        const cutoff = recordedAtMs - 120000;
+        for (const [captureKey, capturedAt] of this._recordedCaptureKeys) {
+            if (capturedAt >= cutoff) break;
+            this._recordedCaptureKeys.delete(captureKey);
+        }
     }
 
     recordPreload(kind, status) {

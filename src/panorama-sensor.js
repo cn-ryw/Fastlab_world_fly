@@ -1,5 +1,5 @@
 import { reportUserError } from './error-report.js';
-import { demoPerformance } from './demo-performance.js?v=20260813-perf-singleton-r13';
+import { demoPerformance } from './demo-performance.js?v=20260813-render-clock-r14';
 import { PerceptionFrame, normalizePlanningState } from './perception-frame.js';
 import { normalizeDepthPolarScan } from './depth-topdown.js';
 
@@ -1397,6 +1397,7 @@ export class PanoramaSensor {
     }
 
     _emitPerceptionMetrics(metrics) {
+        demoPerformance.recordPerceptionCapture(metrics);
         return this._invokeObserver(
             'Perception metrics',
             this.onPerceptionMetrics,
