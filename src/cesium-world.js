@@ -509,6 +509,10 @@ export class CesiumWorld {
         this.fixedToEnu = null;
         this.spawnMarker = null;
         this._goalMarker = null;
+        this._flightPathEntity = null;
+        this._flightPathPositions = [];
+        this._flightPathLastLocal = null;
+        this._flightPathVisible = true;
         this.aircraftEntities = [];
         this.aircraftModelEntity = null;
         this._aircraftModelPosition = null;
@@ -1446,30 +1450,114 @@ export class CesiumWorld {
         if (this.spawnMarker) this.spawnMarker.show = false;
     }
 
+    validateGoalPlacement(clickedLocal, goalLocal, options = {}) {
+        const x = Number(clickedLocal?.x);
+        const clickedY = Number(clickedLocal?.y);
+        const z = Number(clickedLocal?.z);
+        const goalY = Number(goalLocal?.y);
+        if (![x, clickedY, z, goalY].every(Number.isFinite)) {
+            return {
+                valid: false,
+                reason: 'invalid-position',
+                message: 'Goal rejected: invalid map position.'
+            };
+        }
+
+        const collisionRadius = Math.max(0.1, Number(options.collisionRadius) || 0.6);
+        const centerSurfaceY = this.sampleHeightAtLocal(x, z, Math.max(0.5, collisionRadius));
+        if (!Number.isFinite(centerSurfaceY)) {
+            return {
+                valid: false,
+                reason: 'surface-unresolved',
+                message: 'Goal rejected: the clicked map surface has not loaded yet.'
+            };
+        }
+
+        // Google photorealistic tiles do not expose dependable building labels.
+        // A click-only sparse height ring distinguishes elevated roofs/facades
+        // without adding any work to the flight render or planning loops.
+        const offsets = [];
+        for (const distance of [12, 30, 60]) {
+            offsets.push(
+                [distance, 0], [-distance, 0],
+                [0, distance], [0, -distance]
+            );
+        }
+        const nearbyHeights = offsets
+            .map(([dx, dz]) => this.sampleHeightAtLocal(x + dx, z + dz, 1.0))
+            .filter(Number.isFinite)
+            .sort((a, b) => a - b);
+        if (nearbyHeights.length >= 4) {
+            const lowerQuartile = nearbyHeights[Math.floor((nearbyHeights.length - 1) * 0.25)];
+            const surfaceRelief = Math.max(clickedY, centerSurfaceY) - lowerQuartile;
+            if (surfaceRelief > 4.5) {
+                return {
+                    valid: false,
+                    reason: 'building-surface',
+                    message: 'Goal rejected: click on visible ground, not on a building.',
+                    surfaceRelief
+                };
+            }
+        }
+
+        const requiredClearance = collisionRadius + 0.2;
+        if (goalY <= centerSurfaceY + requiredClearance) {
+            return {
+                valid: false,
+                reason: 'goal-inside-surface',
+                message: 'Goal rejected: the requested flight height is inside a building or the ground.',
+                surfaceY: centerSurfaceY,
+                requiredClearance
+            };
+        }
+
+        return { valid: true, surfaceY: centerSurfaceY };
+    }
+
     showGoalMarker(local) {
         const Cesium = this.Cesium;
         if (this._goalMarker) this.viewer.entities.remove(this._goalMarker);
         const pos = this.localToCartesian(local);
         const groundPos = this.localToCartesian({ x: local.x, y: 0, z: local.z });
+        const goalColor = Cesium.Color.LIME;
+        const goalDash = new Cesium.PolylineDashMaterialProperty({
+            color: goalColor.withAlpha(0.9),
+            dashLength: 10,
+        });
         this._goalMarker = this.viewer.entities.add({
             position: pos,
-            point: { pixelSize: 10, color: Cesium.Color.LIME, outlineColor: Cesium.Color.BLACK, outlineWidth: 2 },
+            point: {
+                pixelSize: 15,
+                color: goalColor,
+                outlineColor: Cesium.Color.BLACK,
+                outlineWidth: 3,
+                disableDepthTestDistance: Number.POSITIVE_INFINITY,
+            },
             label: {
-                text: `${Math.round(local.y)}m`,
+                text: `GOAL  ${Math.round(local.y)}m`,
                 font: `${(typeof window !== 'undefined' && window._goalFontSize) || 18}px Chakra Petch, monospace`,
-                fillColor: Cesium.Color.LIME,
+                fillColor: goalColor,
                 outlineColor: Cesium.Color.BLACK,
                 outlineWidth: 3,
                 style: Cesium.LabelStyle.FILL_AND_OUTLINE,
                 verticalOrigin: Cesium.VerticalOrigin.BOTTOM,
-                pixelOffset: new Cesium.Cartesian2(0, -14),
+                pixelOffset: new Cesium.Cartesian2(0, -18),
+                disableDepthTestDistance: Number.POSITIVE_INFINITY,
             },
             polyline: {
                 positions: [groundPos, pos],
-                material: new Cesium.PolylineDashMaterialProperty({ color: Cesium.Color.LIME.withAlpha(0.6), dashLength: 8 }),
-                width: 2,
+                material: goalDash,
+                depthFailMaterial: new Cesium.PolylineDashMaterialProperty({
+                    color: goalColor.withAlpha(0.55),
+                    dashLength: 10,
+                }),
+                width: 3,
             },
         });
+        this._goalMarker.point.disableDepthTestDistance = 0;
+        this._goalMarker.label.disableDepthTestDistance = 0;
+        this._goalMarker.polyline.depthFailMaterial = undefined;
+        this.viewer.scene.requestRender();
     }
 
     clearGoalMarker() {
@@ -1479,9 +1567,65 @@ export class CesiumWorld {
         }
     }
 
+    setFlightPathVisible(visible) {
+        this._flightPathVisible = !!visible;
+        if (this._flightPathEntity) this._flightPathEntity.show = this._flightPathVisible;
+        this.viewer?.scene?.requestRender?.();
+    }
+
+    resetFlightPath(local = null) {
+        this._flightPathPositions = [];
+        this._flightPathLastLocal = null;
+        if (local) this.updateFlightPath(local, true);
+        this.viewer?.scene?.requestRender?.();
+    }
+
+    updateFlightPath(local, force = false) {
+        if (!this.viewer || !this.ready || !local) return;
+        const values = [local.x, local.y, local.z].map(Number);
+        if (!values.every(Number.isFinite)) return;
+        const point = { x: values[0], y: values[1], z: values[2] };
+        if (!force && this._flightPathLastLocal) {
+            const distance = Math.hypot(
+                point.x - this._flightPathLastLocal.x,
+                point.y - this._flightPathLastLocal.y,
+                point.z - this._flightPathLastLocal.z,
+            );
+            if (distance < 0.5) return;
+        }
+
+        this._flightPathLastLocal = point;
+        this._flightPathPositions.push(this.localToCartesian(point));
+        if (this._flightPathPositions.length > 6000) this._flightPathPositions.shift();
+
+        if (!this._flightPathEntity) {
+            const Cesium = this.Cesium;
+            this._flightPathEntity = this.viewer.entities.add({
+                name: 'Flight Path History',
+                show: this._flightPathVisible,
+                polyline: {
+                    positions: new Cesium.CallbackProperty(
+                        () => this._flightPathPositions,
+                        false,
+                    ),
+                    width: 4,
+                    material: new Cesium.PolylineGlowMaterialProperty({
+                        glowPower: 0.18,
+                        color: Cesium.Color.CYAN.withAlpha(0.92),
+                    }),
+                    depthFailMaterial: Cesium.Color.CYAN.withAlpha(0.32),
+                    arcType: Cesium.ArcType.NONE,
+                },
+            });
+        }
+        this.viewer.scene.requestRender();
+    }
+
     _collisionExclusions() {
         const excluded = [];
         if (this.spawnMarker) excluded.push(this.spawnMarker);
+        if (this._goalMarker) excluded.push(this._goalMarker);
+        if (this._flightPathEntity) excluded.push(this._flightPathEntity);
         for (const entity of this.aircraftEntities) {
             if (entity) excluded.push(entity);
         }

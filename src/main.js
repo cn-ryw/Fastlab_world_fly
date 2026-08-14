@@ -23,21 +23,21 @@
  * from the original simulator.
  */
 
-import { CesiumWorld } from './cesium-world.js?v=20260814-adaptive-a1';
-import { TilesCollisionProvider } from './tiles-collision.js?v=20260813-panorama-continuity-r2';
+import { CesiumWorld } from './cesium-world.js?v=20260814-path-collision-a3';
+import { TilesCollisionProvider } from './tiles-collision.js?v=20260814-path-collision-a2';
 import { Controller } from './controller.js?v=20260812-shared-controller-config';
-import { Drone } from './drone.js?v=20260813-panorama-continuity-r2';
+import { Drone } from './drone.js?v=20260814-path-collision-a2';
 import { HUD } from './hud.js?v=20260811-control-v6';
 import { OSD } from './osd.js?v=20260811-control-v6';
 import { PanoramaSensor } from './panorama-sensor.js?v=20260814-adaptive-a1';
-import { FlightLogger } from './flight-logger.js?v=20260814-adaptive-a1';
+import { FlightLogger } from './flight-logger.js?v=20260814-path-collision-a2';
 import { reportUserError } from './error-report.js';
 import {
     computeT8LRollingGoal,
     T8L_GOAL_DEADZONE,
 } from './t8l-rolling-goal.js?v=20260813-so3-goal-50m';
 import { FixedStepScheduler } from './fixed-step-scheduler.js?v=20260811';
-import { demoPerformance } from './demo-performance.js?v=20260814-adaptive-a1';
+import { demoPerformance } from './demo-performance.js?v=20260814-path-collision-a2';
 import {
     drawDepthTopdown,
     depthTopdownLabels,
@@ -672,9 +672,21 @@ function setupFlightGoalClickHandler() {
 
         const local = world.cartesianToLocal(cartesian);
         const altY = goalAltitudeOverride != null ? goalAltitudeOverride : drone.y;
+        const goal = { x: local.x, y: altY, z: local.z };
+        const placement = world.validateGoalPlacement(local, goal, {
+            collisionRadius: drone.collisionRadius
+        });
+        if (!placement.valid) {
+            console.warn(`[goal] REJECTED: ${placement.reason}`, placement);
+            reportUserError('Goal rejected', new Error(placement.message), {
+                key: 'goal-placement-rejected',
+                intervalMs: 500
+            });
+            return;
+        }
         console.log('[goal] SET:', local.x.toFixed(1), altY.toFixed(1), local.z.toFixed(1),
             goalAltitudeOverride != null ? '(高度已手动指定)' : '(沿用当前高度)');
-        beginNavigationSession({ x: local.x, y: altY, z: local.z });
+        beginNavigationSession(goal);
     };
 
     // Track G key state
@@ -936,6 +948,7 @@ async function confirmSpawnAndFly() {
         drone.setSpawnPoint(spawnPoint.x, spawnPoint.y, spawnPoint.z);
         resetFlightControlClock();
         drone.reset();
+        world.resetFlightPath?.({ x: drone.x, y: drone.y, z: drone.z });
         controller.armed = true;
         panoramaSensor?.reset();
 
@@ -1276,6 +1289,13 @@ function updateFlight(dt) {
     const collisionDurationStart = Number(collisionProvider?.totalQueryDurationMs) || 0;
     const collisionQueryStart = Number(collisionProvider?.totalQueryCount) || 0;
     const collisionRayStart = Number(collisionProvider?.totalRayPicks) || 0;
+    const collisionSweepDurationStart =
+        Number(collisionProvider?.totalSweepRayDurationMs) || 0;
+    const collisionNeighborhoodDurationStart =
+        Number(collisionProvider?.totalNeighborhoodRayDurationMs) || 0;
+    const collisionSweepRayStart = Number(collisionProvider?.totalSweepRayPicks) || 0;
+    const collisionNeighborhoodRayStart =
+        Number(collisionProvider?.totalNeighborhoodRayPicks) || 0;
 
     const schedule = flightControlScheduler.advance(input.resetTriggered ? 0 : dt, (stepDt) => {
         drone.update(stepDt, input, collisionProvider, frameCollisionCadence);
@@ -1294,13 +1314,27 @@ function updateFlight(dt) {
             schedule.simulatedThisFrameSeconds,
         );
     }
-    demoPerformance.recordCollisionCheck?.(
-        (Number(collisionProvider?.totalQueryDurationMs) || 0) - collisionDurationStart,
-        (Number(collisionProvider?.totalRayPicks) || 0) - collisionRayStart,
-        (Number(collisionProvider?.totalQueryCount) || 0) - collisionQueryStart,
-        demoPerformance.config.collisionCadence,
-        performance.now(),
-    );
+    demoPerformance.recordCollisionCheck?.({
+        durationMs:
+            (Number(collisionProvider?.totalQueryDurationMs) || 0) - collisionDurationStart,
+        rayCount: (Number(collisionProvider?.totalRayPicks) || 0) - collisionRayStart,
+        queryCount:
+            (Number(collisionProvider?.totalQueryCount) || 0) - collisionQueryStart,
+        sweepDurationMs:
+            (Number(collisionProvider?.totalSweepRayDurationMs) || 0)
+                - collisionSweepDurationStart,
+        neighborhoodDurationMs:
+            (Number(collisionProvider?.totalNeighborhoodRayDurationMs) || 0)
+                - collisionNeighborhoodDurationStart,
+        sweepRayCount:
+            (Number(collisionProvider?.totalSweepRayPicks) || 0) - collisionSweepRayStart,
+        neighborhoodRayCount:
+            (Number(collisionProvider?.totalNeighborhoodRayPicks) || 0)
+                - collisionNeighborhoodRayStart,
+        cadence: demoPerformance.config.collisionCadence,
+    }, performance.now());
+
+    world.updateFlightPath?.({ x: drone.x, y: drone.y, z: drone.z });
 
     if (drone.flightMode === 'drone') {
         if (Math.abs(input.cameraTiltKeyboard) > 0.05) {
@@ -1389,7 +1423,9 @@ function applyDisplaySettings() {
     const osdEnabled = !cleanMode && (osdToggle ? osdToggle.checked : true) && mode === 'flight' && cameraMode === 'first';
     const panoToggle = document.getElementById('panorama-toggle');
     const panoEnabled = panoToggle ? panoToggle.checked : true;
-    const state = `${mode}|${cameraMode}|${cleanMode ? 1 : 0}|${osdEnabled ? 1 : 0}|${panoEnabled ? 1 : 0}`;
+    const pathToggle = document.getElementById('flight-path-toggle');
+    const pathEnabled = !cleanMode && (pathToggle ? pathToggle.checked : true);
+    const state = `${mode}|${cameraMode}|${cleanMode ? 1 : 0}|${osdEnabled ? 1 : 0}|${panoEnabled ? 1 : 0}|${pathEnabled ? 1 : 0}`;
     if (state === lastDisplaySettingsState) return;
     lastDisplaySettingsState = state;
 
@@ -1397,6 +1433,7 @@ function applyDisplaySettings() {
         osd.setEnabled(osdEnabled);
     }
     panoramaSensor?.setActive(mode === 'flight');
+    world?.setFlightPathVisible?.(pathEnabled && mode === 'flight');
 
     const logo = document.getElementById('game-logo');
     const keyGuide = document.getElementById('key-guide');
@@ -1415,7 +1452,7 @@ function applyDisplaySettings() {
 }
 
 function setupDisplaySettingsListeners() {
-    for (const id of ['clean-mode-toggle', 'osd-toggle', 'panorama-toggle']) {
+    for (const id of ['clean-mode-toggle', 'osd-toggle', 'panorama-toggle', 'flight-path-toggle']) {
         const el = document.getElementById(id);
         if (!el || el._tilesDisplayBound) continue;
         el._tilesDisplayBound = true;

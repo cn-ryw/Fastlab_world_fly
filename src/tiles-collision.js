@@ -62,6 +62,18 @@ export class TilesCollisionProvider {
         this.maxNeighborhoodRays = Math.max(3, Math.round(
             Number.isFinite(options.maxNeighborhoodRays) ? options.maxNeighborhoodRays : 6
         ));
+        this.neighborhoodRaysPerQuery = Math.max(1, Math.min(
+            this.maxNeighborhoodRays,
+            Math.round(Number.isFinite(options.neighborhoodRaysPerQuery)
+                ? options.neighborhoodRaysPerQuery
+                : this.sweepProbeMode === 'cross' ? 2 : this.maxNeighborhoodRays),
+        ));
+        this.stationaryQueryIntervalMs = Math.max(
+            this.queryIntervalMs,
+            Number.isFinite(options.stationaryQueryIntervalMs)
+                ? options.stationaryQueryIntervalMs
+                : this.sweepProbeMode === 'cross' ? 250 : 84,
+        );
         this.lastDebug = null;
         this.lastQueryMetrics = null;
         this._lastNoHit = null;
@@ -69,6 +81,10 @@ export class TilesCollisionProvider {
         this._rayPickCount = 0;
         this._queryCount = 0;
         this._totalQueryDurationMs = 0;
+        this._sweepRayPickCount = 0;
+        this._neighborhoodRayPickCount = 0;
+        this._totalSweepRayDurationMs = 0;
+        this._totalNeighborhoodRayDurationMs = 0;
 
         this._rayDirs = [
             { x: 1, y: 0, z: 0 },
@@ -139,10 +155,23 @@ export class TilesCollisionProvider {
     get totalRayPicks() { return this._rayPickCount; }
     get totalQueryCount() { return this._queryCount; }
     get totalQueryDurationMs() { return this._totalQueryDurationMs; }
+    get totalSweepRayPicks() { return this._sweepRayPickCount; }
+    get totalNeighborhoodRayPicks() { return this._neighborhoodRayPickCount; }
+    get totalSweepRayDurationMs() { return this._totalSweepRayDurationMs; }
+    get totalNeighborhoodRayDurationMs() { return this._totalNeighborhoodRayDurationMs; }
 
-    _pickLocalRay(origin, direction, maxDistance) {
+    _pickLocalRay(kind, origin, direction, maxDistance) {
+        const startedAt = performance.now();
         this._rayPickCount++;
-        return this.world.pickLocalRay(origin, direction, maxDistance);
+        if (kind === 'sweep') this._sweepRayPickCount++;
+        else this._neighborhoodRayPickCount++;
+        try {
+            return this.world.pickLocalRay(origin, direction, maxDistance);
+        } finally {
+            const durationMs = performance.now() - startedAt;
+            if (kind === 'sweep') this._totalSweepRayDurationMs += durationMs;
+            else this._totalNeighborhoodRayDurationMs += durationMs;
+        }
     }
 
     _queryHeight(center, radius, hits) {
@@ -183,7 +212,7 @@ export class TilesCollisionProvider {
         // to the baseline profile for controlled A/B comparison.
         if (this.sweepProbeMode === 'center') {
             const maxDistance = motionDistance + radius + this.sweptExtra;
-            const hit = this._pickLocalRay(prev, dir, maxDistance);
+            const hit = this._pickLocalRay('sweep', prev, dir, maxDistance);
             if (!this._validRayHit(prev, hit, maxDistance)) return;
 
             const penetration = motionDistance + radius + this.horizontalSkin - hit.distance;
@@ -238,7 +267,7 @@ export class TilesCollisionProvider {
             };
             const contactAllowance = probe.center ? radius : this.horizontalSkin;
             const maxDistance = motionDistance + contactAllowance + this.sweptExtra;
-            const hit = this._pickLocalRay(origin, dir, maxDistance);
+            const hit = this._pickLocalRay('sweep', origin, dir, maxDistance);
             if (!this._validRayHit(origin, hit, maxDistance)) continue;
 
             const penetration = motionDistance + contactAllowance - hit.distance;
@@ -264,7 +293,7 @@ export class TilesCollisionProvider {
         for (const dy of verticalOffsets) {
             const origin = { x: center.x, y: center.y + dy, z: center.z };
             for (const dir of dirs) {
-                const hit = this._pickLocalRay(origin, dir, maxDistance);
+                const hit = this._pickLocalRay('neighborhood', origin, dir, maxDistance);
                 if (!this._validRayHit(origin, hit, maxDistance)) continue;
 
                 const penetration = radius + this.horizontalSkin - hit.distance;
@@ -296,7 +325,9 @@ export class TilesCollisionProvider {
             ? Math.min(this.queryIntervalMs, 34)
             : speed > 10
                 ? this.queryIntervalMs
-                : Math.max(this.queryIntervalMs, 84);
+                : speed > 0.7
+                    ? Math.max(this.queryIntervalMs, 84)
+                    : this.stationaryQueryIntervalMs;
         if (elapsed > interval) return false;
 
         const moved = Math.hypot(center.x - last.x, center.y - last.y, center.z - last.z);
@@ -306,22 +337,25 @@ export class TilesCollisionProvider {
 
     _selectRayDirs(state = {}) {
         const dirs = [];
+        const targetCount = this.neighborhoodRaysPerQuery;
         const velocity = state && state.velocity ? state.velocity : null;
         const speedH = velocity ? Math.hypot(velocity.x || 0, velocity.z || 0) : 0;
 
         if (speedH > 0.15) {
             const fwd = normalize({ x: velocity.x, y: 0, z: velocity.z }, { x: 0, y: 0, z: -1 });
             dirs.push(fwd);
-            dirs.push(normalize({ x: fwd.x * 0.866 - fwd.z * 0.5, y: 0, z: fwd.x * 0.5 + fwd.z * 0.866 }, fwd));
-            dirs.push(normalize({ x: fwd.x * 0.866 + fwd.z * 0.5, y: 0, z: -fwd.x * 0.5 + fwd.z * 0.866 }, fwd));
+            if (targetCount >= 3) {
+                dirs.push(normalize({ x: fwd.x * 0.866 - fwd.z * 0.5, y: 0, z: fwd.x * 0.5 + fwd.z * 0.866 }, fwd));
+                dirs.push(normalize({ x: fwd.x * 0.866 + fwd.z * 0.5, y: 0, z: -fwd.x * 0.5 + fwd.z * 0.866 }, fwd));
+            }
         }
 
-        while (dirs.length < this.maxNeighborhoodRays) {
+        while (dirs.length < targetCount) {
             dirs.push(this._rayDirs[this._rayCursor % this._rayDirs.length]);
             this._rayCursor++;
         }
 
-        return dirs.slice(0, this.maxNeighborhoodRays);
+        return dirs.slice(0, targetCount);
     }
 
     _validRayHit(origin, hit, maxDistance) {

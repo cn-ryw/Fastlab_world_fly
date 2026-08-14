@@ -300,19 +300,17 @@ export class DemoPerformanceController {
         this._latestSlotDrops.push(recordedAtMs);
     }
 
-    recordCollisionCheck(
-        durationMs,
-        rayCount,
-        queryCount,
-        cadence = this.config.collisionCadence,
-        recordedAtMs = performance.now(),
-    ) {
+    recordCollisionCheck(metrics = {}, recordedAtMs = performance.now()) {
         this._collisionChecks.push({
             recordedAtMs,
-            durationMs: Math.max(0, Number(durationMs) || 0),
-            rayCount: Math.max(0, Math.round(Number(rayCount) || 0)),
-            queryCount: Math.max(0, Math.round(Number(queryCount) || 0)),
-            cadence,
+            durationMs: Math.max(0, Number(metrics.durationMs) || 0),
+            rayCount: Math.max(0, Math.round(Number(metrics.rayCount) || 0)),
+            queryCount: Math.max(0, Math.round(Number(metrics.queryCount) || 0)),
+            sweepDurationMs: Math.max(0, Number(metrics.sweepDurationMs) || 0),
+            neighborhoodDurationMs: Math.max(0, Number(metrics.neighborhoodDurationMs) || 0),
+            sweepRayCount: Math.max(0, Math.round(Number(metrics.sweepRayCount) || 0)),
+            neighborhoodRayCount: Math.max(0, Math.round(Number(metrics.neighborhoodRayCount) || 0)),
+            cadence: metrics.cadence || this.config.collisionCadence,
         });
     }
 
@@ -385,6 +383,9 @@ export class DemoPerformanceController {
             .filter(event => event.recordedAtMs >= startedAtMs);
         const collisionDurations = collisionChecks.map(event => event.durationMs);
         const collisionRayCounts = collisionChecks.map(event => event.rayCount);
+        const collisionSweepDurations = collisionChecks.map(event => event.sweepDurationMs);
+        const collisionNeighborhoodDurations = collisionChecks
+            .map(event => event.neighborhoodDurationMs);
         const collisionDurationS = Math.max(
             0.001,
             (performance.now() - startedAtMs) / 1000,
@@ -397,6 +398,14 @@ export class DemoPerformanceController {
             (total, event) => total + event.rayCount,
             0,
         );
+        const collisionSweepRayCount = collisionChecks.reduce(
+            (total, event) => total + event.sweepRayCount,
+            0,
+        );
+        const collisionNeighborhoodRayCount = collisionChecks.reduce(
+            (total, event) => total + event.neighborhoodRayCount,
+            0,
+        );
         return Object.freeze({
             performanceProfile: this.config.profile,
             tileRequestsPerServer: this.config.tileRequestsPerServer,
@@ -407,6 +416,19 @@ export class DemoPerformanceController {
             collisionQueryP95Ms: rounded(percentile(collisionDurations, 0.95), 2),
             collisionRaysPerFrameP95: rounded(percentile(collisionRayCounts, 0.95), 1),
             collisionRaysPerSecond: rounded(collisionRayCount / collisionDurationS, 1),
+            collisionSweepP95Ms: rounded(percentile(collisionSweepDurations, 0.95), 2),
+            collisionNeighborhoodP95Ms: rounded(
+                percentile(collisionNeighborhoodDurations, 0.95),
+                2,
+            ),
+            collisionSweepRaysPerSecond: rounded(
+                collisionSweepRayCount / collisionDurationS,
+                1,
+            ),
+            collisionNeighborhoodRaysPerSecond: rounded(
+                collisionNeighborhoodRayCount / collisionDurationS,
+                1,
+            ),
             yopoStrategy: this._yopoStrategy,
             mainMedianFps: p50 ? rounded(1000 / p50, 1) : null,
             mainFrameIntervalP50Ms: rounded(p50, 1),

@@ -680,6 +680,11 @@ export class FlightLogger {
                 collisionQueryP95Ms: demoMetrics.collisionQueryP95Ms,
                 collisionRaysPerFrameP95: demoMetrics.collisionRaysPerFrameP95,
                 collisionRaysPerSecond: demoMetrics.collisionRaysPerSecond,
+                collisionSweepP95Ms: demoMetrics.collisionSweepP95Ms,
+                collisionNeighborhoodP95Ms: demoMetrics.collisionNeighborhoodP95Ms,
+                collisionSweepRaysPerSecond: demoMetrics.collisionSweepRaysPerSecond,
+                collisionNeighborhoodRaysPerSecond:
+                    demoMetrics.collisionNeighborhoodRaysPerSecond,
                 planningCaptureHz: demoMetrics.planningCaptureHz,
                 previewCaptureHz: demoMetrics.previewCaptureHz,
                 latestSlotDroppedFrames: demoMetrics.latestSlotDroppedFrames,

@@ -837,6 +837,12 @@
                 <input type="checkbox" id="panorama-toggle" checked>
             </div>
         </div>
+        <div class="setting-row">
+            <label for="flight-path-toggle">Flight Path History</label>
+            <div class="controls">
+                <input type="checkbox" id="flight-path-toggle" checked>
+            </div>
+        </div>
 
         <h3>Race Course</h3>
         <div style="font-size:12px;color:#777;margin:-4px 0 8px;">Gate rendering is disabled in Google Tiles mode for this migration step.</div>
@@ -1102,7 +1108,7 @@
                         window.googleTilesFlightStart();
                         return;
                     }
-                    import('./src/main.js?v=20260814-adaptive-a1')
+                    import('./src/main.js?v=20260814-path-collision-a3')
                         .then(function (mod) {
                             var start = window.googleTilesFlightStart || mod.startTilesMode;
                             if (typeof start === 'function') start();
@@ -1113,6 +1119,6 @@
             });
         }());
     </script>
-    <script type="module" src="src/main.js?v=20260814-adaptive-a1"></script>
+    <script type="module" src="src/main.js?v=20260814-path-collision-a3"></script>
 </body>
 </html>
