@@ -30,6 +30,11 @@ export function resolvePerformanceConfig(search = currentSearch()) {
         ? requestedTileLimit
         : defaultTileLimit;
     const dynamicSse = params.get('dynamicSse') === 'off' ? 'off' : 'current';
+    const requestedCollisionCadence = params.get('collisionCadence');
+    const collisionCadence = requestedCollisionCadence === 'frame'
+        || requestedCollisionCadence === 'substep'
+        ? requestedCollisionCadence
+        : profile === 'demo30' ? 'frame' : 'substep';
 
     if (profile === 'baseline') {
         return Object.freeze({
@@ -45,6 +50,7 @@ export function resolvePerformanceConfig(search = currentSearch()) {
             movingPreviewIntervalMs: null,
             planningPreviewIntervalMs: 2000,
             collisionSweepMode: 'sphere',
+            collisionCadence,
             tileRequestsPerServer,
             preloadRadiusMeters: 500,
             preloadTimeoutMs: 20000,
@@ -64,13 +70,14 @@ export function resolvePerformanceConfig(search = currentSearch()) {
         initialResolutionScale: 0.7,
         minimumResolutionScale: 0.55,
         maximumResolutionScale: 0.8,
-        normalFacesPerSlice: 2,
+        normalFacesPerSlice: 3,
         constrainedFacesPerSlice: 2,
         planningCaptureIntervalMs: 1000 / 15,
         idlePreviewIntervalMs: 1000 / 8,
         movingPreviewIntervalMs: 1000 / 2,
         planningPreviewIntervalMs: 500,
         collisionSweepMode: 'cross',
+        collisionCadence,
         tileRequestsPerServer,
         preloadRadiusMeters: 400,
         preloadTimeoutMs: 60000,
@@ -106,6 +113,8 @@ export class DemoPerformanceController {
         this._captures = [];
         this._latestSlotDrops = [];
         this._resolutionEvents = [];
+        this._faceSliceEvents = [];
+        this._collisionChecks = [];
         this._resolutionScale = config.initialResolutionScale;
         this._facesPerSlice = config.normalFacesPerSlice;
         this._moving = false;
@@ -185,7 +194,28 @@ export class DemoPerformanceController {
         while (this._resolutionEvents[1]?.recordedAtMs < retentionBoundary) {
             this._resolutionEvents.shift();
         }
+        while (this._faceSliceEvents[0]?.recordedAtMs < retentionBoundary) {
+            this._faceSliceEvents.shift();
+        }
+        while (this._collisionChecks[0]?.recordedAtMs < retentionBoundary) {
+            this._collisionChecks.shift();
+        }
         this._adjust(now);
+    }
+
+    _setFacesPerSlice(value, now, reason) {
+        const next = Number.isFinite(value) ? Math.max(1, Math.round(value)) : value;
+        if (next === this._facesPerSlice) return false;
+        const previous = this._facesPerSlice;
+        this._facesPerSlice = next;
+        this._faceSliceEvents.push({
+            recordedAtMs: now,
+            from: previous,
+            to: next,
+            reason,
+        });
+        console.info(`[pano-adaptive] facesPerSlice ${previous} -> ${next} reason=${reason}`);
+        return true;
     }
 
     _adjust(now) {
@@ -199,10 +229,14 @@ export class DemoPerformanceController {
         if (p95 > 40) {
             this._underBudgetSince = null;
             if (this._overBudgetSince === null) this._overBudgetSince = now;
-            if (now - this._overBudgetSince >= 2000 && now - this._lastAdjustmentAt >= 2000) {
-                const scaled = this._setResolutionScale(this._resolutionScale - 0.05, now);
-                if (!scaled && this._resolutionScale <= this.config.minimumResolutionScale) {
-                    this._facesPerSlice = this.config.constrainedFacesPerSlice;
+            if (now - this._overBudgetSince >= 2000 && now - this._lastAdjustmentAt >= 3000) {
+                const constrained = this._setFacesPerSlice(
+                    this.config.constrainedFacesPerSlice,
+                    now,
+                    'main-p95-over-40ms',
+                );
+                if (!constrained) {
+                    this._setResolutionScale(this._resolutionScale - 0.05, now);
                 }
                 this._lastAdjustmentAt = now;
                 this._overBudgetSince = now;
@@ -215,7 +249,11 @@ export class DemoPerformanceController {
             if (this._underBudgetSince === null) this._underBudgetSince = now;
             if (now - this._underBudgetSince >= 5000 && now - this._lastAdjustmentAt >= 5000) {
                 if (this._facesPerSlice !== this.config.normalFacesPerSlice) {
-                    this._facesPerSlice = this.config.normalFacesPerSlice;
+                    this._setFacesPerSlice(
+                        this.config.normalFacesPerSlice,
+                        now,
+                        'main-p95-under-35ms',
+                    );
                 } else {
                     this._setResolutionScale(this._resolutionScale + 0.025, now);
                 }
@@ -260,6 +298,22 @@ export class DemoPerformanceController {
 
     recordLatestSlotDrop(recordedAtMs = performance.now()) {
         this._latestSlotDrops.push(recordedAtMs);
+    }
+
+    recordCollisionCheck(
+        durationMs,
+        rayCount,
+        queryCount,
+        cadence = this.config.collisionCadence,
+        recordedAtMs = performance.now(),
+    ) {
+        this._collisionChecks.push({
+            recordedAtMs,
+            durationMs: Math.max(0, Number(durationMs) || 0),
+            rayCount: Math.max(0, Math.round(Number(rayCount) || 0)),
+            queryCount: Math.max(0, Math.round(Number(queryCount) || 0)),
+            cadence,
+        });
     }
 
     recordPerceptionCapture(metrics = {}) {
@@ -327,10 +381,32 @@ export class DemoPerformanceController {
             .map(event => event.scale);
         if (!scales.length) scales.push(this._resolutionScale);
         const p50 = percentile(intervals, 0.5);
+        const collisionChecks = this._collisionChecks
+            .filter(event => event.recordedAtMs >= startedAtMs);
+        const collisionDurations = collisionChecks.map(event => event.durationMs);
+        const collisionRayCounts = collisionChecks.map(event => event.rayCount);
+        const collisionDurationS = Math.max(
+            0.001,
+            (performance.now() - startedAtMs) / 1000,
+        );
+        const collisionQueryCount = collisionChecks.reduce(
+            (total, event) => total + event.queryCount,
+            0,
+        );
+        const collisionRayCount = collisionChecks.reduce(
+            (total, event) => total + event.rayCount,
+            0,
+        );
         return Object.freeze({
             performanceProfile: this.config.profile,
             tileRequestsPerServer: this.config.tileRequestsPerServer,
             dynamicSse: this.config.dynamicSse,
+            collisionCadence: this.config.collisionCadence,
+            collisionCheckHz: rounded(collisionQueryCount / collisionDurationS, 1),
+            collisionQueryP50Ms: rounded(percentile(collisionDurations, 0.5), 2),
+            collisionQueryP95Ms: rounded(percentile(collisionDurations, 0.95), 2),
+            collisionRaysPerFrameP95: rounded(percentile(collisionRayCounts, 0.95), 1),
+            collisionRaysPerSecond: rounded(collisionRayCount / collisionDurationS, 1),
             yopoStrategy: this._yopoStrategy,
             mainMedianFps: p50 ? rounded(1000 / p50, 1) : null,
             mainFrameIntervalP50Ms: rounded(p50, 1),
@@ -345,6 +421,9 @@ export class DemoPerformanceController {
             adaptiveResolutionScaleMax: Math.max(...scales),
             adaptiveResolutionScaleFinal: this._resolutionScale,
             panoramaFacesPerSliceFinal: this._facesPerSlice,
+            panoramaFacesPerSliceEvents: this._faceSliceEvents
+                .filter(event => event.recordedAtMs >= startedAtMs)
+                .map(event => ({ ...event })),
             tileLoad: tileStatus,
             preload: { ...this._preload },
         });

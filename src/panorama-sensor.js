@@ -1,5 +1,5 @@
 import { reportUserError } from './error-report.js';
-import { demoPerformance } from './demo-performance.js?v=20260813-render-clock-r14';
+import { demoPerformance } from './demo-performance.js?v=20260814-adaptive-a1';
 import { PerceptionFrame, normalizePlanningState } from './perception-frame.js';
 import { normalizeDepthPolarScan } from './depth-topdown.js';
 
@@ -83,10 +83,9 @@ const YOPO_MIN_FETCH_REMAINING_MS = 55;
 // Reserve callback/accounting headroom so a trajectory accepted just under the
 // hard observation limit cannot be logged/applied just over it.
 const YOPO_APPLY_DEADLINE_RESERVE_MS = 2;
-// Planning needs the compact control response at full rate. A cached preview
-// still consumes the Flask service thread for color/JPEG encoding, so sample it
-// at only 0.5 Hz: at 15 Hz planning this affects at most one request in ~30 and
-// stays outside the p95 control cadence.
+// Planning needs the compact control response at full rate. Preview rendering
+// is requested at no more than 2 Hz and is prepared by the server's latest-only
+// CPU worker; the control response never carries preview bytes.
 const PLANNING_PREVIEW_INTERVAL_MS = demoPerformance.planningPreviewIntervalMs(2000);
 const STALE_LOG_SUMMARY_INTERVAL_MS = 2000;
 const IS_CHROMIUM = typeof navigator !== 'undefined'
@@ -113,9 +112,8 @@ const PANORAMA_BOTTOM_POLE_GUARD = urlNumber('panoBottomPoleGuard', 2, 0, 45);
 const PANORAMA_FRAME_DELAY_MS = urlNumber('panoFrameDelayMs', 0, 0, 1000);
 const PANORAMA_FACE_TILE_TIMEOUT_MS = urlNumber('panoFaceTileTimeoutMs', 6000, 0, 10000);
 const PANORAMA_FACE_TILE_QUIET_MS = urlNumber('panoFaceTileQuietMs', 650, 0, 5000);
-// Two faces per slice bounds each synchronous Cesium burst. The previous
-// three-face experiment roughly doubled the measured Firefox physics p95, so
-// keep it available only as an explicit A/B override.
+// Baseline fallback stays at two faces. demo30 starts at three faces (six faces
+// in two 30 FPS slices) and falls back to two when main-view p95 is over budget.
 const PANORAMA_FACES_PER_SLICE = Math.round(urlNumber('panoFacesPerSlice', 2, 1, 6));
 const PANORAMA_PRELOAD_FRAME_DELAY_MS = urlNumber(
     'panoPreloadFrameDelayMs',
@@ -2059,6 +2057,7 @@ export class PanoramaSensor {
                     // is fetched later from the exact cached planning depth on
                     // an independent latest-only worker.
                     include_preview: '0',
+                    prepare_preview: request.previewRequested ? '1' : '0',
                 }).toString();
                 url = `${getYopoEndpoint()}?${qs}`;  // /yopo/plan_full
                 headers = {

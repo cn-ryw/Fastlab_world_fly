@@ -1114,19 +1114,23 @@ export class Drone {
 
     }
 
-    /** 到达后保持终端 Poly5 结束时锁定的实际位姿，不修改物理状态。 */
+    /** 到达后保持最后一段 Poly5 结束时的实际位姿，不修改物理状态。 */
     _onArrival() {
         this._trajectory.clear('arrival');
-        if (!this._so3Hold) this._latchTerminalCurrentHold('arrival-settled');
+        // The hold target must be the measured position at mission completion,
+        // never an older awaiting-trajectory or failsafe anchor.  Physical
+        // velocity is intentionally left untouched so the SO3 hold controller
+        // brakes and settles the vehicle normally.
+        this._latchTerminalCurrentHold('arrival');
         this._terminalArrivalPending = false;
         this._replanRequested = false;
         this._yopoPlanTriggered = false;
         this._idealGoal = null;
         this._navigationKind = null;
         this._terminalPhase = 'arrived';
-        this._terminalSettledTimeS = ARRIVAL_SETTLE_TIME_S;
+        this._terminalSettledTimeS = 0;
         this._navigationState = 'arrived';
-        this._navigationTransitionReason = 'arrival-settled';
+        this._navigationTransitionReason = 'arrival-radius-complete';
     }
 
     _updateTerminalNavigation(dt, armed) {
@@ -1144,126 +1148,44 @@ export class Drone {
             goalY - this.y,
             this._idealGoal.z - this.z,
         );
-        const speedMps = Math.hypot(this.vx, this.vy, this.vz);
-        if (!this._goalReached && !this.isColliding && distanceM <= this._arrivalDistanceM) {
-            // `goalReached` is an observation event only. It deliberately does
-            // not clear the goal or truncate the active path: settled arrival
-            // remains a separate low-speed, collision-free terminal state.
-            this._goalReached = true;
-            this._goalReachedSimTimeS = this._simTimeS;
-        }
-        const terminalOwnsMotion = this._terminalPhase === 'terminal-track'
-            || this._terminalPhase === 'terminal-decelerating'
-            || this._terminalPhase === 'settling';
-        if (terminalOwnsMotion && ![
+        if (![
             this.x, this.y, this.z,
             this.vx, this.vy, this.vz,
-            distanceM, speedMps,
+            distanceM,
         ].every(Number.isFinite)) {
-            this._abortTerminalNavigation('non-finite-state');
+            if (this._terminalPhase === 'terminal-track') {
+                this._abortTerminalNavigation('non-finite-state');
+            }
             return;
         }
 
-        if (terminalOwnsMotion
-            && this.isColliding) {
+        if (this._terminalPhase === 'terminal-track' && this.isColliding) {
             this._abortTerminalNavigation('collision');
             return;
         }
 
-        if (this._terminalPhase === 'approach') {
-            const endpoint = this._trajectory.active ? this._trajectory.endpointState : null;
-            this._terminalEndpointGoalDistanceM = endpoint
-                ? Math.hypot(
-                    endpoint.x - this._idealGoal.x,
-                    endpoint.y - goalY,
-                    endpoint.z - this._idealGoal.z,
-                )
-                : null;
-            const endpointSpeedMps = endpoint
-                ? Math.hypot(endpoint.vx, endpoint.vy, endpoint.vz)
-                : Infinity;
-            const endpointStoppingEnvelope = endpoint
-                ? this._terminalStoppingEnvelope(
-                    { x: endpoint.x, y: endpoint.y, z: endpoint.z },
-                    { x: endpoint.vx, y: endpoint.vy, z: endpoint.vz },
-                )
-                : null;
-            this._terminalBrakeDistanceM = endpointStoppingEnvelope?.brakeDistanceM ?? null;
-            this._terminalPredictedStopGoalDistanceM =
-                endpointStoppingEnvelope?.predictedStopGoalDistanceM ?? null;
-            const suffixPositionErrorM = Number(
-                this._trajectory.context?.suffixPositionErrorM,
-            );
-            const suffixVelocityErrorMps = Number(
-                this._trajectory.context?.suffixVelocityErrorMps,
-            );
-            this._terminalTrajectoryEligible = !!endpoint
-                && !this.isColliding
-                && this._terminalEndpointGoalDistanceM <= this._arrivalDistanceM
-                && endpointSpeedMps <= TERMINAL_DECELERATION_MAX_ENTRY_SPEED_MPS
-                && endpointStoppingEnvelope
-                && endpointStoppingEnvelope.predictedStopGoalDistanceM
-                    <= TERMINAL_ABORT_DISTANCE_M
-                && Number(this._trajectory.maxAcceleration)
-                    <= TERMINAL_TRACK_MAX_ACCELERATION_MPS2 + 1e-9
-                && Number.isFinite(suffixPositionErrorM)
-                && Number.isFinite(suffixVelocityErrorMps);
-            if (this._terminalTrajectoryEligible) {
-                this._terminalPhase = 'terminal-track';
-                this._terminalSettledTimeS = 0;
-                this._terminalCandidate = Object.freeze({
-                    context: this._trajectory.context,
-                    endpointState: this._trajectory.endpointState,
-                    endpointGoalDistanceM: this._terminalEndpointGoalDistanceM,
-                    maxSpeedMps: this._trajectory.maxSpeed,
-                    maxAccelerationMps2: this._trajectory.maxAcceleration,
-                    terminalSpeedMps: endpointSpeedMps,
-                    brakeDistanceM: endpointStoppingEnvelope.brakeDistanceM,
-                    predictedStop: endpointStoppingEnvelope.predictedStop,
-                    predictedStopGoalDistanceM:
-                        endpointStoppingEnvelope.predictedStopGoalDistanceM,
-                    suffixPositionErrorM,
-                    suffixVelocityErrorMps,
-                });
-                this._replanRequested = false;
-            }
-        }
+        if (this._terminalPhase !== 'approach'
+            || this._goalReached
+            || distanceM > this._arrivalDistanceM) return;
 
-        if (this._terminalPhase === 'terminal-decelerating') {
-            this._terminalDecelerationElapsedS += dt;
-            if (distanceM > TERMINAL_ABORT_DISTANCE_M) {
-                this._abortTerminalNavigation('terminal-deceleration-outside-envelope');
-                return;
-            }
-            if (this._terminalDecelerationElapsedS
-                > TERMINAL_DECELERATION_TIMEOUT_S + 1e-12) {
-                this._abortTerminalNavigation('terminal-deceleration-timeout');
-                return;
-            }
-            if (speedMps <= TERMINAL_TRACK_MAX_SPEED_MPS
-                && distanceM <= this._arrivalDistanceM) {
-                this._enterTerminalSettling();
-            }
-            return;
-        }
+        // Mission completion is deliberately a simple product-level radius
+        // event.  It does not require a low-speed dwell, endpoint eligibility,
+        // a predicted stopping envelope, or a second distance check.  Once the
+        // measured vehicle position enters the radius, stop accepting replans
+        // and let only the already-installed short Poly5 finish, matching the
+        // reference trajectory-server relationship TRAJ -> HOVER.
+        this._goalReached = true;
+        this._goalReachedSimTimeS = this._simTimeS;
+        this._terminalPhase = 'terminal-track';
+        this._terminalSettledTimeS = 0;
+        this._terminalArrivalPending = false;
+        this._terminalCandidate = this._trajectory.active
+            ? Object.freeze({ context: this._trajectory.context })
+            : null;
+        this._terminalTrajectoryEligible = this._trajectory.active;
+        this._replanRequested = false;
 
-        if (this._terminalPhase !== 'settling') return;
-
-        if (distanceM > TERMINAL_ABORT_DISTANCE_M) {
-            this._abortTerminalNavigation('terminal-settling-outside-envelope');
-            return;
-        }
-        if (!this.isColliding
-            && distanceM <= this._arrivalDistanceM
-            && speedMps <= ARRIVAL_SETTLE_SPEED_MPS) {
-            this._terminalSettledTimeS += dt;
-            if (this._terminalSettledTimeS + 1e-12 >= ARRIVAL_SETTLE_TIME_S) {
-                this._terminalArrivalPending = true;
-            }
-        } else {
-            this._terminalSettledTimeS = 0;
-            this._terminalArrivalPending = false;
-        }
+        if (!this._trajectory.active) this._onArrival();
     }
 
     _finalizeTerminalArrivalAfterPhysics() {
@@ -1287,7 +1209,7 @@ export class Drone {
         }
     }
 
-    update(dt, input, collisionProvider) {
+    update(dt, input, collisionProvider, deferCollision = false) {
         dt = Math.min(Math.max(Number(dt) || 0, 0), 0.05);
         if (dt <= 0) return;
         const suppliedInput = input || { armed: false };
@@ -1395,9 +1317,13 @@ export class Drone {
             return;
         }
 
-        // 5. Collisions
-        this._handleCollisions(collisionProvider, previousPosition, dt);
-        this._finalizeTerminalArrivalAfterPhysics();
+        // 5. Collisions. demo30 resolves one continuous segment after all
+        // fixed steps in the display frame; do not clear persistent contact
+        // state while those substeps are being accumulated.
+        if (!deferCollision) {
+            this._handleCollisions(collisionProvider, previousPosition, dt);
+            this._finalizeTerminalArrivalAfterPhysics();
+        }
 
         this._measuredAcceleration = {
             x: (this.vx - velocityBeforeStep.x) / dt,
@@ -2620,28 +2546,15 @@ export class Drone {
 
     _handleExpiredYopoTrajectory(dt) {
         if (this._terminalPhase === 'terminal-track') {
-            const speedMps = Math.hypot(this.vx, this.vy, this.vz);
-            if (Number.isFinite(speedMps) && speedMps <= TERMINAL_TRACK_MAX_SPEED_MPS) {
-                const settled = this._enterTerminalSettling();
-                this._controlPositionHold(
-                    dt,
-                    settled
-                        ? ControlCommandType.POSITION_VELOCITY_HOLD
-                        : ControlCommandType.FAILSAFE_HOLD,
-                    settled ? 'terminal-settling' : 'terminal-track-missed',
-                );
-                return;
-            }
-            const decelerating = this._enterTerminalDeceleration();
-            if (decelerating) {
-                this._controlTerminalDeceleration(dt);
-            } else {
-                this._controlPositionHold(
-                    dt,
-                    ControlCommandType.FAILSAFE_HOLD,
-                    'terminal-deceleration-envelope-rejected',
-                );
-            }
+            // Entering the arrival radius already completed the mission.  The
+            // installed short segment has now finished, so hold the measured
+            // endpoint and stop planning without any extra terminal gate.
+            this._onArrival();
+            this._controlPositionHold(
+                dt,
+                ControlCommandType.POSITION_VELOCITY_HOLD,
+                'arrival-hold',
+            );
             return;
         }
         this._latchSo3Hold('trajectory-expired');
@@ -2807,6 +2720,13 @@ export class Drone {
     }
 
     // ---- Collision ----
+
+    /** Resolve one continuous collision segment after all fixed physics steps in a display frame. */
+    resolveFrameCollision(collisionProvider, previousPosition, dt = 0.016) {
+        if (!collisionProvider || !previousPosition) return;
+        this._handleCollisions(collisionProvider, previousPosition, dt);
+        this._finalizeTerminalArrivalAfterPhysics();
+    }
 
     _handleCollisions(collisionProvider, previousPosition = null, dt = 0.016) {
         const wasColliding = this.isColliding;

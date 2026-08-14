@@ -72,6 +72,10 @@ _depth_cache = {
 }
 _depth_cache_lock = threading.Lock()
 _planning_preview_cache = OrderedDict()
+_planning_preview_render_cache = OrderedDict()
+_planning_preview_worker_condition = threading.Condition()
+_planning_preview_worker_thread = None
+_planning_preview_pending = None
 
 
 def _depth_cache_entry(pred_depth, request_metadata):
@@ -100,7 +104,8 @@ def _cache_depth(pred_depth, request_metadata):
     return entry
 
 
-def _cache_planning_depth(pred_depth, request_metadata, identity):
+def _cache_planning_depth(
+        pred_depth, request_metadata, identity, *, prepare_preview=False):
     """Publish latest legacy depth plus an identity-keyed bounded preview LRU."""
     metadata = {**request_metadata, **identity}
     entry = _depth_cache_entry(pred_depth, metadata)
@@ -114,8 +119,94 @@ def _cache_planning_depth(pred_depth, request_metadata, identity):
         _planning_preview_cache[key] = entry
         _planning_preview_cache.move_to_end(key)
         while len(_planning_preview_cache) > max_entries:
-            _planning_preview_cache.popitem(last=False)
+            evicted_key, _ = _planning_preview_cache.popitem(last=False)
+            _planning_preview_render_cache.pop(evicted_key, None)
+    if prepare_preview:
+        _queue_planning_preview_render(key, entry)
     return key
+
+
+def _planning_preview_worker_loop():
+    """Colorize only the latest requested preview outside Flask's GPU thread."""
+    global _planning_preview_pending
+    while True:
+        with _planning_preview_worker_condition:
+            while _planning_preview_pending is None:
+                _planning_preview_worker_condition.wait()
+            key, entry = _planning_preview_pending
+            _planning_preview_pending = None
+
+        started = time.perf_counter()
+        try:
+            projection_config = entry.get("projection_config") or {}
+            depth_mode = entry["depth_mode"]
+            t0 = time.perf_counter()
+            polar_scan = depth_to_polar_scan(
+                entry["data"],
+                depth_mode,
+                vertical_fov_deg=projection_config.get("verticalFovDeg", 180.0),
+            )
+            t_polar = time.perf_counter()
+            colored, depth_scale = depth_to_color(entry["data"])
+            if depth_mode == "da360-metric":
+                depth_scale["unit"] = "metres"
+            depth_jpeg = encode_image(
+                colored, "jpeg", env_int("DA360_JPEG_QUALITY", 72)
+            )
+            completed = time.perf_counter()
+            payload = {
+                "api_version": API_VERSION,
+                "preview_included": True,
+                "preview_source": "planning-cache-worker",
+                "depth_mode": depth_mode,
+                "calibration_id": entry["calibration_id"],
+                "depth_image": depth_jpeg,
+                "depth_scale": depth_scale,
+                "polar_scan": polar_scan,
+                "latency_ms": (completed - started) * 1000.0,
+                "timings_ms": {
+                    "polar_ms": (t_polar - t0) * 1000.0,
+                    "color_encode_ms": (completed - t_polar) * 1000.0,
+                    "preview_ms": (completed - t0) * 1000.0,
+                },
+            }
+            max_entries = max(1, min(16, env_int("YOPO_PREVIEW_CACHE_ENTRIES", 4)))
+            with _depth_cache_lock:
+                _planning_preview_render_cache[key] = {
+                    "payload": payload,
+                    "ts": time.monotonic(),
+                    "depth_mode": depth_mode,
+                    "calibration_id": entry["calibration_id"],
+                }
+                _planning_preview_render_cache.move_to_end(key)
+                while len(_planning_preview_render_cache) > max_entries:
+                    _planning_preview_render_cache.popitem(last=False)
+        except Exception as exc:  # pylint: disable=broad-except
+            print(f"[YOPO preview worker] failed: {exc}", file=sys.stderr)
+
+
+def _ensure_planning_preview_worker():
+    global _planning_preview_worker_thread
+    with _planning_preview_worker_condition:
+        if (_planning_preview_worker_thread is not None
+                and _planning_preview_worker_thread.is_alive()):
+            return
+        _planning_preview_worker_thread = threading.Thread(
+            target=_planning_preview_worker_loop,
+            name="yopo-preview-worker",
+            daemon=True,
+        )
+        _planning_preview_worker_thread.start()
+
+
+def _queue_planning_preview_render(key, entry):
+    global _planning_preview_pending
+    _ensure_planning_preview_worker()
+    with _planning_preview_worker_condition:
+        # Latest-only slot: a stale diagnostic preview may be replaced, while
+        # every control inference remains untouched.
+        _planning_preview_pending = (key, entry)
+        _planning_preview_worker_condition.notify()
 
 
 register_depth_routes(
@@ -458,13 +549,12 @@ def yopo_plan():
 
 @app.route("/yopo/preview", methods=["GET", "OPTIONS"])
 def yopo_cached_preview():
-    """Colorize the exact cached planning depth outside the control response."""
+    """Return an already encoded preview without doing work on Flask's thread."""
     if request.method == "OPTIONS":
         return ("", 204)
     if da360_runner is None:
         return jsonify({"error": "DA360 not initialized"}), 503
     try:
-        started = time.perf_counter()
         identity = _response_identity(required=True)
         current_depth_mode = getattr(
             da360_runner, "depth_mode", "da360-relative"
@@ -475,53 +565,23 @@ def yopo_cached_preview():
             "frame_id", "goal_id", "generation"
         ))
         with _depth_cache_lock:
-            cache_entry = _planning_preview_cache.get(cache_key)
-            if cache_entry is None:
+            raw_entry = _planning_preview_cache.get(cache_key)
+            if raw_entry is None:
                 return jsonify({"error": "planning preview identity is not cached"}), 409
-            cache_age = time.monotonic() - cache_entry["ts"]
+            rendered = _planning_preview_render_cache.get(cache_key)
+            if rendered is None:
+                return jsonify({"error": "planning preview is not encoded yet"}), 409
+            cache_age = time.monotonic() - rendered["ts"]
             if cache_age > env_float("YOPO_PREVIEW_CACHE_MAX_AGE", 1.0):
-                del _planning_preview_cache[cache_key]
+                _planning_preview_render_cache.pop(cache_key, None)
                 return jsonify({"error": "cached planning preview is stale"}), 409
-            if cache_entry["depth_mode"] != current_depth_mode:
+            if rendered["depth_mode"] != current_depth_mode:
                 return jsonify({"error": "cached depth mode mismatch"}), 409
-            if cache_entry["calibration_id"] != current_calibration_id:
+            if rendered["calibration_id"] != current_calibration_id:
                 return jsonify({"error": "cached depth calibration mismatch"}), 409
             _planning_preview_cache.move_to_end(cache_key)
-            # Entries are immutable after publication; retaining this reference
-            # avoids a second multi-megabyte copy while N+1 updates latest.
-            pred_depth = cache_entry["data"]
-            projection_config = cache_entry["projection_config"] or {}
-
-        t0 = time.perf_counter()
-        polar_scan = depth_to_polar_scan(
-            pred_depth,
-            current_depth_mode,
-            vertical_fov_deg=projection_config.get("verticalFovDeg", 180.0),
-        )
-        t_polar = time.perf_counter()
-        colored, depth_scale = depth_to_color(pred_depth)
-        if current_depth_mode == "da360-metric":
-            depth_scale["unit"] = "metres"
-        depth_jpeg = encode_image(
-            colored, "jpeg", env_int("DA360_JPEG_QUALITY", 72)
-        )
-        completed = time.perf_counter()
-        payload = {
-            "api_version": API_VERSION,
-            "preview_included": True,
-            "preview_source": "planning-cache",
-            "depth_mode": current_depth_mode,
-            "calibration_id": current_calibration_id,
-            "depth_image": depth_jpeg,
-            "depth_scale": depth_scale,
-            "polar_scan": polar_scan,
-            "latency_ms": (completed - started) * 1000.0,
-            "timings_ms": {
-                "polar_ms": (t_polar - t0) * 1000.0,
-                "color_encode_ms": (completed - t_polar) * 1000.0,
-                "preview_ms": (completed - t0) * 1000.0,
-            },
-        }
+            _planning_preview_render_cache.move_to_end(cache_key)
+            payload = dict(rendered["payload"])
         payload.update(identity)
         return jsonify(payload)
     except (KeyError, TypeError, ValueError) as exc:
@@ -544,6 +604,7 @@ def yopo_plan_full():
         started = time.perf_counter()
         identity = _response_identity(required=True)
         include_preview = _request_flag("include_preview", default=True)
+        prepare_preview = _request_flag("prepare_preview", default=False)
 
         # Validate all state before spending GPU time on the image.
         def query_number(name, header):
@@ -576,7 +637,12 @@ def yopo_plan_full():
         t_decode = time.perf_counter()
         pred_depth = _infer_configured_depth(da360_runner, image, request_metadata)
         t1 = time.perf_counter()
-        _cache_planning_depth(pred_depth, request_metadata, identity)
+        _cache_planning_depth(
+            pred_depth,
+            request_metadata,
+            identity,
+            prepare_preview=prepare_preview,
+        )
 
         # The planning path only needs pred_depth. Most frames can omit the UI
         # preview and avoid polar reduction, colorization, JPEG/base64 work and
@@ -640,7 +706,7 @@ def yopo_plan_full():
         resp_payload = {
             "api_version": API_VERSION,
             "preview_included": include_preview,
-            "preview_available": True,
+            "preview_available": prepare_preview,
             "preview_endpoint": "/yopo/preview",
             "depth_mode": getattr(da360_runner, "depth_mode", "da360-relative"),
             "calibration_id": calibration.get("id") if calibration else None,
@@ -693,6 +759,7 @@ def yopo_plan_full():
             f"color+jpeg={1000*(t_color-t_polar):.0f}ms "
             f"yopo={1000*(t2-t_color):.0f}ms "
             f"preview={include_preview} "
+            f"prepare_preview={prepare_preview} "
             f"authorized={planning_authorized} reason={planning_reason} "
             f"json={1000*(t3-t2):.0f}ms total={1000*(t3-started):.0f}ms",
             flush=True,

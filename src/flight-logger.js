@@ -1,5 +1,3 @@
-import { demoPerformance } from './demo-performance.js?v=20260813-render-clock-r14';
-
 /**
  * Flight data logger — records pose, velocity, goal, and controller state
  * during goal-based autonomous navigation.  Auto-starts on goal set,
@@ -74,6 +72,7 @@ const SAFE_URL_ENUM_VALUES = Object.freeze({
     panoCaptureProfile: new Set(['flight', 'calibration']),
     perfProfile: new Set(['demo30', 'baseline']),
     dynamicSse: new Set(['current', 'off']),
+    collisionCadence: new Set(['frame', 'substep']),
 });
 
 function isSafeResolvedUrlParam(key, values) {
@@ -220,7 +219,10 @@ function compactControlDiagnostics(drone) {
 }
 
 export class FlightLogger {
-    constructor() {
+    constructor(options = {}) {
+        this._performanceProvider = typeof options.performanceProvider === 'function'
+            ? options.performanceProvider
+            : null;
         this._recording = false;
         this._frames = [];
         this._startTime = null;
@@ -527,7 +529,12 @@ export class FlightLogger {
         const calibrationIds = [...new Set(
             this._perceptionMetrics.map(item => item.calibrationId).filter(Boolean)
         )];
-        const demoMetrics = demoPerformance.snapshotSince(this._startTime);
+        let demoMetrics = {};
+        try {
+            demoMetrics = this._performanceProvider?.(this._startTime) || {};
+        } catch (error) {
+            console.warn('[FlightLog] performance snapshot unavailable', error);
+        }
 
         const log = {
             schemaVersion: 2,
@@ -554,6 +561,7 @@ export class FlightLogger {
                 depthPreviewHz: Math.round(this._depthCount / duration * 10) / 10,
                 depthPreviewCount: this._depthCount,
                 depthPreviewLatencyAvgMs: avgDepthLatency,
+                previewDisplayHz: Math.round(this._depthCount / duration * 10) / 10,
                 // Compatibility aliases retained for existing log readers.
                 depthHz: Math.round(this._depthCount / duration * 10) / 10,
                 depthCount: this._depthCount,
@@ -561,9 +569,11 @@ export class FlightLogger {
                 yopoHz: Math.round(this._yopoCount / duration * 10) / 10,
                 yopoCount: this._yopoCount,
                 yopoLatencyAvgMs: avgYopoLatency,
+                planningResponseHz: Math.round(this._yopoCount / duration * 10) / 10,
                 yopoTrackerFraction: this._frames.length > 0
                     ? Math.round(this._yopoTrackerCount / this._frames.length * 100) : 0,
                 uniquePlanningHz: Math.round(this._appliedPlanningFrames.size / duration * 10) / 10,
+                trajectoryInstallHz: Math.round(this._appliedPlanningFrames.size / duration * 10) / 10,
                 uniquePlanningFrames: this._appliedPlanningFrames.size,
                 planningIgnoredFrames,
                 planningRejectedFrames,
@@ -664,6 +674,12 @@ export class FlightLogger {
                 mainFrameIntervalP99Ms: demoMetrics.mainFrameIntervalP99Ms,
                 mainLongFrame100MsCount: demoMetrics.mainLongFrame100MsCount,
                 mainLongFrame250MsCount: demoMetrics.mainLongFrame250MsCount,
+                collisionCadence: demoMetrics.collisionCadence,
+                collisionCheckHz: demoMetrics.collisionCheckHz,
+                collisionQueryP50Ms: demoMetrics.collisionQueryP50Ms,
+                collisionQueryP95Ms: demoMetrics.collisionQueryP95Ms,
+                collisionRaysPerFrameP95: demoMetrics.collisionRaysPerFrameP95,
+                collisionRaysPerSecond: demoMetrics.collisionRaysPerSecond,
                 planningCaptureHz: demoMetrics.planningCaptureHz,
                 previewCaptureHz: demoMetrics.previewCaptureHz,
                 latestSlotDroppedFrames: demoMetrics.latestSlotDroppedFrames,

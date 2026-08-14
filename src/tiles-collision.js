@@ -63,8 +63,12 @@ export class TilesCollisionProvider {
             Number.isFinite(options.maxNeighborhoodRays) ? options.maxNeighborhoodRays : 6
         ));
         this.lastDebug = null;
+        this.lastQueryMetrics = null;
         this._lastNoHit = null;
         this._rayCursor = 0;
+        this._rayPickCount = 0;
+        this._queryCount = 0;
+        this._totalQueryDurationMs = 0;
 
         this._rayDirs = [
             { x: 1, y: 0, z: 0 },
@@ -80,6 +84,21 @@ export class TilesCollisionProvider {
 
     queryCollisionResponse(x, y, z, radius, state = {}) {
         if (!this.enabled || !this.world || !this.world.ready) return null;
+
+        const startedAt = performance.now();
+        const raysBefore = this._rayPickCount;
+        try {
+            return this._queryCollisionResponse(x, y, z, radius, state);
+        } finally {
+            const durationMs = performance.now() - startedAt;
+            const rayCount = this._rayPickCount - raysBefore;
+            this._queryCount++;
+            this._totalQueryDurationMs += durationMs;
+            this.lastQueryMetrics = Object.freeze({ durationMs, rayCount });
+        }
+    }
+
+    _queryCollisionResponse(x, y, z, radius, state = {}) {
 
         const now = performance.now();
         const hits = [];
@@ -115,6 +134,15 @@ export class TilesCollisionProvider {
             normal: hit.normal,
         };
         return hit;
+    }
+
+    get totalRayPicks() { return this._rayPickCount; }
+    get totalQueryCount() { return this._queryCount; }
+    get totalQueryDurationMs() { return this._totalQueryDurationMs; }
+
+    _pickLocalRay(origin, direction, maxDistance) {
+        this._rayPickCount++;
+        return this.world.pickLocalRay(origin, direction, maxDistance);
     }
 
     _queryHeight(center, radius, hits) {
@@ -155,7 +183,7 @@ export class TilesCollisionProvider {
         // to the baseline profile for controlled A/B comparison.
         if (this.sweepProbeMode === 'center') {
             const maxDistance = motionDistance + radius + this.sweptExtra;
-            const hit = this.world.pickLocalRay(prev, dir, maxDistance);
+            const hit = this._pickLocalRay(prev, dir, maxDistance);
             if (!this._validRayHit(prev, hit, maxDistance)) return;
 
             const penetration = motionDistance + radius + this.horizontalSkin - hit.distance;
@@ -210,7 +238,7 @@ export class TilesCollisionProvider {
             };
             const contactAllowance = probe.center ? radius : this.horizontalSkin;
             const maxDistance = motionDistance + contactAllowance + this.sweptExtra;
-            const hit = this.world.pickLocalRay(origin, dir, maxDistance);
+            const hit = this._pickLocalRay(origin, dir, maxDistance);
             if (!this._validRayHit(origin, hit, maxDistance)) continue;
 
             const penetration = motionDistance + contactAllowance - hit.distance;
@@ -236,7 +264,7 @@ export class TilesCollisionProvider {
         for (const dy of verticalOffsets) {
             const origin = { x: center.x, y: center.y + dy, z: center.z };
             for (const dir of dirs) {
-                const hit = this.world.pickLocalRay(origin, dir, maxDistance);
+                const hit = this._pickLocalRay(origin, dir, maxDistance);
                 if (!this._validRayHit(origin, hit, maxDistance)) continue;
 
                 const penetration = radius + this.horizontalSkin - hit.distance;

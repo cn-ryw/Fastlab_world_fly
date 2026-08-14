@@ -23,21 +23,21 @@
  * from the original simulator.
  */
 
-import { CesiumWorld } from './cesium-world.js?v=20260814-route-corridor-r15';
+import { CesiumWorld } from './cesium-world.js?v=20260814-adaptive-a1';
 import { TilesCollisionProvider } from './tiles-collision.js?v=20260813-panorama-continuity-r2';
 import { Controller } from './controller.js?v=20260812-shared-controller-config';
 import { Drone } from './drone.js?v=20260813-panorama-continuity-r2';
 import { HUD } from './hud.js?v=20260811-control-v6';
 import { OSD } from './osd.js?v=20260811-control-v6';
-import { PanoramaSensor } from './panorama-sensor.js?v=20260813-render-clock-r14';
-import { FlightLogger } from './flight-logger.js?v=20260813-render-clock-r14';
+import { PanoramaSensor } from './panorama-sensor.js?v=20260814-adaptive-a1';
+import { FlightLogger } from './flight-logger.js?v=20260814-adaptive-a1';
 import { reportUserError } from './error-report.js';
 import {
     computeT8LRollingGoal,
     T8L_GOAL_DEADZONE,
 } from './t8l-rolling-goal.js?v=20260813-so3-goal-50m';
 import { FixedStepScheduler } from './fixed-step-scheduler.js?v=20260811';
-import { demoPerformance } from './demo-performance.js?v=20260814-route-corridor-r15';
+import { demoPerformance } from './demo-performance.js?v=20260814-adaptive-a1';
 import {
     drawDepthTopdown,
     depthTopdownLabels,
@@ -365,7 +365,11 @@ function initSubsystems() {
         if (!panoramaSensor || !world) throw new Error('flight world is not ready');
         return panoramaSensor.captureCalibrationSample(world, { ...options, locationId });
     };
-    if (!flightLogger) flightLogger = new FlightLogger();
+    if (!flightLogger) {
+        flightLogger = new FlightLogger({
+            performanceProvider: startedAtMs => demoPerformance.snapshotSince(startedAtMs),
+        });
+    }
 
     setupDisplaySettingsListeners();
 }
@@ -632,84 +636,6 @@ function setupCesiumPlacementHandler() {
 // 里"目标落在当前 fixed_height 平面"的行为）；用户按住 G 滚滚轮后变为显式高度，
 // 等价于 callback_set_goal_3d 移动整个高度平面。按 C 取消航点时复位。
 let goalAltitudeOverride = null;
-let fixedGoalPreloadInProgress = false;
-let fixedGoalPreloadGeneration = 0;
-
-async function beginFixedNavigationAfterCorridorPreload(goal) {
-    if (!goal || !world || !drone || !panoramaSensor) return null;
-    if (fixedGoalPreloadInProgress) {
-        console.warn('[goal] corridor preload already in progress; click ignored');
-        return null;
-    }
-
-    fixedGoalPreloadInProgress = true;
-    const generation = ++fixedGoalPreloadGeneration;
-    const start = { x: drone.x, y: drone.y, z: drone.z };
-    const navState = panoramaSensor.getDepthState?.();
-    if (rcRollingNavigation.active) {
-        stopRcRollingNavigation('goal-preload');
-    } else if (flightLogger?.recording || navState?.goalId) {
-        finishNavigationSession('goal-preload', { cancelDrone: true, arrived: false });
-    }
-    world.showGoalMarker(goal);
-
-    const loadingOverlay = document.getElementById('loading-overlay');
-    loadingOverlay?.classList.add('visible');
-    setProgress('Preloading and verifying fixed-goal collision corridor...');
-
-    try {
-        if (typeof world.preloadCollisionCorridor !== 'function') {
-            throw new Error('collision corridor preload API unavailable');
-        }
-        const preload = await world.preloadCollisionCorridor(start, goal, {
-            halfWidth: FIXED_GOAL_CORRIDOR_HALF_WIDTH_METERS,
-            spacing: FIXED_GOAL_CORRIDOR_SAMPLE_SPACING_METERS,
-            maxRadius: SPAWN_PRELOAD_RADIUS_METERS,
-            attempts: FLIGHT_PRELOAD_VIEW_ATTEMPTS,
-            totalTimeoutMs: FLIGHT_PRELOAD_VIEW_TIMEOUT_MS,
-            progressCb: setProgress,
-        });
-        if (generation !== fixedGoalPreloadGeneration
-            || mode !== 'flight'
-            || drone.flightMode !== 'so3') return null;
-
-        const coverage = preload?.coverage || null;
-        const detail = describeCoverageGaps(coverage, start);
-        const ready = coverage
-            && coverage.total > 0
-            && coverage.loaded === coverage.total
-            && coverage.missing.length === 0;
-        if (!ready) {
-            const deadline = preload?.deadlineExceeded ? '; preload time budget exhausted' : '';
-            const error = new Error(`${detail}${deadline}`);
-            console.warn(`[goal] planning blocked: unresolved collision corridor; ${error.message}`);
-            setProgress(`Planning held: ${detail}`, true);
-            reportUserError('Planning held: collision corridor unresolved', error, {
-                key: 'fixed-goal-corridor-unresolved',
-                intervalMs: 2000,
-            });
-            return null;
-        }
-
-        console.log(`[goal] collision corridor READY: ${detail}`);
-        setProgress(`Collision corridor ready: ${detail}`);
-        return beginNavigationSession(goal);
-    } catch (error) {
-        if (generation === fixedGoalPreloadGeneration) {
-            console.warn('[goal] planning blocked: corridor preload failed', error);
-            reportUserError('Planning held: collision corridor preload failed', error, {
-                key: 'fixed-goal-corridor-preload-failed',
-                intervalMs: 2000,
-            });
-        }
-        return null;
-    } finally {
-        if (generation === fixedGoalPreloadGeneration) {
-            fixedGoalPreloadInProgress = false;
-            loadingOverlay?.classList.remove('visible');
-        }
-    }
-}
 
 function setupFlightGoalClickHandler() {
     if (!world || !world.viewer || flightGoalHandler) return;
@@ -748,7 +674,7 @@ function setupFlightGoalClickHandler() {
         const altY = goalAltitudeOverride != null ? goalAltitudeOverride : drone.y;
         console.log('[goal] SET:', local.x.toFixed(1), altY.toFixed(1), local.z.toFixed(1),
             goalAltitudeOverride != null ? '(高度已手动指定)' : '(沿用当前高度)');
-        void beginFixedNavigationAfterCorridorPreload({ x: local.x, y: altY, z: local.z });
+        beginNavigationSession({ x: local.x, y: altY, z: local.z });
     };
 
     // Track G key state
@@ -806,7 +732,7 @@ function setupFlightGoalClickHandler() {
             goalX.toFixed(1), altY.toFixed(1), goalZ.toFixed(1),
             clickGoal.mapping === 'relative-test' ? '(relative test mapping)' : '(metric)',
         );
-        void beginFixedNavigationAfterCorridorPreload({ x: goalX, y: altY, z: goalZ });
+        beginNavigationSession({ x: goalX, y: altY, z: goalZ });
     };
     if (radarCanvas) radarCanvas.addEventListener('mousedown', onRadarMouseDown);
 
@@ -890,7 +816,6 @@ function rcRollingChannels(input) {
 }
 
 function updateRcRollingNavigation(input, now) {
-    if (fixedGoalPreloadInProgress) return;
     const channels = rcRollingChannels(input);
     const eligible = channels && input.armed
         && drone?.flightMode === 'so3' && mode === 'flight';
@@ -1344,8 +1269,16 @@ function updateFlight(dt) {
         controller.armed = true;
     }
 
+    const frameCollisionCadence = demoPerformance.config.collisionCadence === 'frame';
+    const collisionFrameStart = frameCollisionCadence
+        ? { x: drone.x, y: drone.y, z: drone.z }
+        : null;
+    const collisionDurationStart = Number(collisionProvider?.totalQueryDurationMs) || 0;
+    const collisionQueryStart = Number(collisionProvider?.totalQueryCount) || 0;
+    const collisionRayStart = Number(collisionProvider?.totalRayPicks) || 0;
+
     const schedule = flightControlScheduler.advance(input.resetTriggered ? 0 : dt, (stepDt) => {
-        drone.update(stepDt, input, collisionProvider);
+        drone.update(stepDt, input, collisionProvider, frameCollisionCadence);
     }, {
         onOverrun: (overrun) => {
             if (overrun.frameSeconds >= CONTROL_FAULT_FRAME_SECONDS) {
@@ -1353,6 +1286,21 @@ function updateFlight(dt) {
             }
         },
     });
+
+    if (frameCollisionCadence && schedule.simulatedThisFrameSeconds > 0) {
+        drone.resolveFrameCollision?.(
+            collisionProvider,
+            collisionFrameStart,
+            schedule.simulatedThisFrameSeconds,
+        );
+    }
+    demoPerformance.recordCollisionCheck?.(
+        (Number(collisionProvider?.totalQueryDurationMs) || 0) - collisionDurationStart,
+        (Number(collisionProvider?.totalRayPicks) || 0) - collisionRayStart,
+        (Number(collisionProvider?.totalQueryCount) || 0) - collisionQueryStart,
+        demoPerformance.config.collisionCadence,
+        performance.now(),
+    );
 
     if (drone.flightMode === 'drone') {
         if (Math.abs(input.cameraTiltKeyboard) > 0.05) {
