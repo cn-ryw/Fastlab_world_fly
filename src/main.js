@@ -23,7 +23,7 @@
  * from the original simulator.
  */
 
-import { CesiumWorld } from './cesium-world.js?v=20260813-render-clock-r14';
+import { CesiumWorld } from './cesium-world.js?v=20260814-route-corridor-r15';
 import { TilesCollisionProvider } from './tiles-collision.js?v=20260813-panorama-continuity-r2';
 import { Controller } from './controller.js?v=20260812-shared-controller-config';
 import { Drone } from './drone.js?v=20260813-panorama-continuity-r2';
@@ -37,7 +37,7 @@ import {
     T8L_GOAL_DEADZONE,
 } from './t8l-rolling-goal.js?v=20260813-so3-goal-50m';
 import { FixedStepScheduler } from './fixed-step-scheduler.js?v=20260811';
-import { demoPerformance } from './demo-performance.js?v=20260813-render-clock-r14';
+import { demoPerformance } from './demo-performance.js?v=20260814-route-corridor-r15';
 import {
     drawDepthTopdown,
     depthTopdownLabels,
@@ -97,7 +97,12 @@ const FLIGHT_PRELOAD_VIEW_TIMEOUT_MS = Math.round(urlNumber(
     3000,
     60000,
 ));
-const FLIGHT_PRELOAD_VIEW_ATTEMPTS = Math.round(urlNumber('flightPreloadViewAttempts', 2, 1, 5));
+const FLIGHT_PRELOAD_VIEW_ATTEMPTS = Math.round(urlNumber(
+    'flightPreloadViewAttempts',
+    demoPerformance.config.preloadViewAttempts || 2,
+    1,
+    5,
+));
 const FLIGHT_PRELOAD_STRICT = urlNumber('flightPreloadStrict', 0, 0, 1) >= 0.5;
 const PANORAMA_PRELOAD_REQUIRED = urlNumber(
     'panoPreloadRequired',
@@ -110,6 +115,8 @@ const MAX_PLACEMENT_FRAME_DT = 0.05;
 const SETTINGS_READ_INTERVAL_MS = 100;
 const DEPTH_TOPDOWN_MAX_AGE_MS = 250;
 const RC_ROLLING_GOAL_INTERVAL_MS = 50;
+const FIXED_GOAL_CORRIDOR_HALF_WIDTH_METERS = 35;
+const FIXED_GOAL_CORRIDOR_SAMPLE_SPACING_METERS = 30;
 // Cesium panorama rendering routinely makes a frame exceed the scheduler's
 // 100 ms catch-up budget. Discarding excess wall time is safe; destroying the
 // active trajectory on every such frame caused a replan storm. Reserve the
@@ -207,6 +214,44 @@ function rememberFlightStartWarning(message) {
     const text = String(message || '').trim();
     if (!text || flightStartWarnings.includes(text)) return;
     flightStartWarnings.push(text);
+}
+
+function localCompassDirection(dx, dz) {
+    if (Math.hypot(dx, dz) < 1) return '中心';
+    const directions = ['北', '东北', '东', '东南', '南', '西南', '西', '西北'];
+    const index = (Math.round(Math.atan2(dx, dz) / (Math.PI / 4)) + 8) % 8;
+    return directions[index];
+}
+
+function describeCoverageGaps(coverage, referenceLocal = { x: 0, z: 0 }) {
+    if (!coverage) return 'coverage unavailable';
+    const loaded = Number(coverage.loaded) || 0;
+    const total = Number(coverage.total) || 0;
+    const pct = total > 0 ? Math.round((loaded / total) * 100) : 0;
+    const referenceX = Number(referenceLocal?.x) || 0;
+    const referenceZ = Number(referenceLocal?.z) || 0;
+    const missing = Array.isArray(coverage.missing) ? coverage.missing : [];
+    if (!missing.length) return `coverage ${loaded}/${total} (${pct}%); no unresolved samples`;
+
+    const nearest = missing
+        .map((gap) => {
+            const localX = Number.isFinite(Number(gap.localX))
+                ? Number(gap.localX)
+                : referenceX + (Number(gap.x) || 0);
+            const localZ = Number.isFinite(Number(gap.localZ))
+                ? Number(gap.localZ)
+                : referenceZ + (Number(gap.z) || 0);
+            const dx = localX - referenceX;
+            const dz = localZ - referenceZ;
+            return { localX, localZ, dx, dz, distance: Math.hypot(dx, dz) };
+        })
+        .sort((a, b) => a.distance - b.distance)
+        .slice(0, 3)
+        .map(gap => (
+            `${localCompassDirection(gap.dx, gap.dz)} ${gap.distance.toFixed(0)}m `
+            + `(x=${gap.localX.toFixed(1)}, z=${gap.localZ.toFixed(1)})`
+        ));
+    return `coverage ${loaded}/${total} (${pct}%); unresolved ${missing.length}; nearest ${nearest.join(', ')}`;
 }
 
 function updatePanoramaReadinessIndicator() {
@@ -587,6 +632,84 @@ function setupCesiumPlacementHandler() {
 // 里"目标落在当前 fixed_height 平面"的行为）；用户按住 G 滚滚轮后变为显式高度，
 // 等价于 callback_set_goal_3d 移动整个高度平面。按 C 取消航点时复位。
 let goalAltitudeOverride = null;
+let fixedGoalPreloadInProgress = false;
+let fixedGoalPreloadGeneration = 0;
+
+async function beginFixedNavigationAfterCorridorPreload(goal) {
+    if (!goal || !world || !drone || !panoramaSensor) return null;
+    if (fixedGoalPreloadInProgress) {
+        console.warn('[goal] corridor preload already in progress; click ignored');
+        return null;
+    }
+
+    fixedGoalPreloadInProgress = true;
+    const generation = ++fixedGoalPreloadGeneration;
+    const start = { x: drone.x, y: drone.y, z: drone.z };
+    const navState = panoramaSensor.getDepthState?.();
+    if (rcRollingNavigation.active) {
+        stopRcRollingNavigation('goal-preload');
+    } else if (flightLogger?.recording || navState?.goalId) {
+        finishNavigationSession('goal-preload', { cancelDrone: true, arrived: false });
+    }
+    world.showGoalMarker(goal);
+
+    const loadingOverlay = document.getElementById('loading-overlay');
+    loadingOverlay?.classList.add('visible');
+    setProgress('Preloading and verifying fixed-goal collision corridor...');
+
+    try {
+        if (typeof world.preloadCollisionCorridor !== 'function') {
+            throw new Error('collision corridor preload API unavailable');
+        }
+        const preload = await world.preloadCollisionCorridor(start, goal, {
+            halfWidth: FIXED_GOAL_CORRIDOR_HALF_WIDTH_METERS,
+            spacing: FIXED_GOAL_CORRIDOR_SAMPLE_SPACING_METERS,
+            maxRadius: SPAWN_PRELOAD_RADIUS_METERS,
+            attempts: FLIGHT_PRELOAD_VIEW_ATTEMPTS,
+            totalTimeoutMs: FLIGHT_PRELOAD_VIEW_TIMEOUT_MS,
+            progressCb: setProgress,
+        });
+        if (generation !== fixedGoalPreloadGeneration
+            || mode !== 'flight'
+            || drone.flightMode !== 'so3') return null;
+
+        const coverage = preload?.coverage || null;
+        const detail = describeCoverageGaps(coverage, start);
+        const ready = coverage
+            && coverage.total > 0
+            && coverage.loaded === coverage.total
+            && coverage.missing.length === 0;
+        if (!ready) {
+            const deadline = preload?.deadlineExceeded ? '; preload time budget exhausted' : '';
+            const error = new Error(`${detail}${deadline}`);
+            console.warn(`[goal] planning blocked: unresolved collision corridor; ${error.message}`);
+            setProgress(`Planning held: ${detail}`, true);
+            reportUserError('Planning held: collision corridor unresolved', error, {
+                key: 'fixed-goal-corridor-unresolved',
+                intervalMs: 2000,
+            });
+            return null;
+        }
+
+        console.log(`[goal] collision corridor READY: ${detail}`);
+        setProgress(`Collision corridor ready: ${detail}`);
+        return beginNavigationSession(goal);
+    } catch (error) {
+        if (generation === fixedGoalPreloadGeneration) {
+            console.warn('[goal] planning blocked: corridor preload failed', error);
+            reportUserError('Planning held: collision corridor preload failed', error, {
+                key: 'fixed-goal-corridor-preload-failed',
+                intervalMs: 2000,
+            });
+        }
+        return null;
+    } finally {
+        if (generation === fixedGoalPreloadGeneration) {
+            fixedGoalPreloadInProgress = false;
+            loadingOverlay?.classList.remove('visible');
+        }
+    }
+}
 
 function setupFlightGoalClickHandler() {
     if (!world || !world.viewer || flightGoalHandler) return;
@@ -625,7 +748,7 @@ function setupFlightGoalClickHandler() {
         const altY = goalAltitudeOverride != null ? goalAltitudeOverride : drone.y;
         console.log('[goal] SET:', local.x.toFixed(1), altY.toFixed(1), local.z.toFixed(1),
             goalAltitudeOverride != null ? '(高度已手动指定)' : '(沿用当前高度)');
-        beginNavigationSession({ x: local.x, y: altY, z: local.z });
+        void beginFixedNavigationAfterCorridorPreload({ x: local.x, y: altY, z: local.z });
     };
 
     // Track G key state
@@ -683,7 +806,7 @@ function setupFlightGoalClickHandler() {
             goalX.toFixed(1), altY.toFixed(1), goalZ.toFixed(1),
             clickGoal.mapping === 'relative-test' ? '(relative test mapping)' : '(metric)',
         );
-        beginNavigationSession({ x: goalX, y: altY, z: goalZ });
+        void beginFixedNavigationAfterCorridorPreload({ x: goalX, y: altY, z: goalZ });
     };
     if (radarCanvas) radarCanvas.addEventListener('mousedown', onRadarMouseDown);
 
@@ -767,6 +890,7 @@ function rcRollingChannels(input) {
 }
 
 function updateRcRollingNavigation(input, now) {
+    if (fixedGoalPreloadInProgress) return;
     const channels = rcRollingChannels(input);
     const eligible = channels && input.armed
         && drone?.flightMode === 'so3' && mode === 'flight';
@@ -854,6 +978,17 @@ async function confirmSpawnAndFly() {
     spawnConfirmInProgress = true;
     flightStartWarnings = [];
     updateViewChoiceHint();
+    const requestScheduler = world.Cesium?.RequestScheduler || null;
+    const savedRequestsPerServer = requestScheduler
+        && Number.isFinite(Number(requestScheduler.maximumRequestsPerServer))
+        ? requestScheduler.maximumRequestsPerServer
+        : null;
+    if (savedRequestsPerServer !== null) {
+        requestScheduler.maximumRequestsPerServer = Math.max(
+            Number(savedRequestsPerServer),
+            Number(demoPerformance.config.preloadTileRequestsPerServer) || 18,
+        );
+    }
 
     try {
         const Cesium = world.Cesium;
@@ -889,26 +1024,27 @@ async function confirmSpawnAndFly() {
                 lift: 220,
                 gridSpacing: 160,
                 viewDistance: 240,
-                // 500 m / 160 m yields 29 in-circle samples including the
-                // center. Keep the full symmetric grid instead of truncating
-                // the outer ring by nearest-distance order.
+                // Keep the full symmetric grid instead of truncating the
+                // outer ring by nearest-distance order.
                 maxTargets: 30,
                 dwellMs: 160,
                 perViewTimeoutMs: 2500,
                 finalIdleTimeoutMs: 15000,
+                totalTimeoutMs: FLIGHT_PRELOAD_VIEW_TIMEOUT_MS,
                 verifyCoverage: true,
                 coverageSpacing: 160,
                 minCoverageRatio: FLIGHT_PRELOAD_MIN_COVERAGE,
-                repairPasses: 1,
-                repairTargets: 12,
+                repairPasses: Math.max(0, FLIGHT_PRELOAD_VIEW_ATTEMPTS - 1),
+                repairTargets: 18,
                 progressCb: setProgress,
             });
             const coverage = preload && preload.coverage ? preload.coverage.ratio : 0;
             const pct = Math.round(coverage * 100);
+            const coverageDetail = describeCoverageGaps(preload?.coverage, spawnPoint);
             if (preload && preload.coverage && coverage < FLIGHT_PRELOAD_MIN_COVERAGE) {
                 reportUserError(
                     'Flight tile preload coverage low',
-                    new Error(`coverage ${pct}% below required ${Math.round(FLIGHT_PRELOAD_MIN_COVERAGE * 100)}%`),
+                    new Error(`${coverageDetail}; required ${Math.round(FLIGHT_PRELOAD_MIN_COVERAGE * 100)}%`),
                     { key: 'flight-preload-coverage-low', intervalMs: 10000 }
                 );
             }
@@ -920,7 +1056,8 @@ async function confirmSpawnAndFly() {
                 (!FLIGHT_PRELOAD_STRICT || preload.finalIdle === true);
             if (!preloadReady) {
                 const coverageText = preload && preload.coverage ? `${pct}%` : 'unknown';
-                const message = `flight tile preload incomplete: idle=${preload ? preload.finalIdle : false}, coverage=${coverageText}`;
+                const deadlineText = preload?.deadlineExceeded ? ', deadline=60s' : '';
+                const message = `flight tile preload incomplete: idle=${preload ? preload.finalIdle : false}, coverage=${coverageText}${deadlineText}; ${coverageDetail}`;
                 if (FLIGHT_PRELOAD_STRICT) {
                     throw new Error(message);
                 }
@@ -978,6 +1115,9 @@ async function confirmSpawnAndFly() {
             });
         }
     } finally {
+        if (savedRequestsPerServer !== null) {
+            requestScheduler.maximumRequestsPerServer = savedRequestsPerServer;
+        }
         document.getElementById('loading-overlay')?.classList.remove('visible');
         spawnConfirmInProgress = false;
     }

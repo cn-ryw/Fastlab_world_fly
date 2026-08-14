@@ -30,7 +30,7 @@
 
 import { formatError, reportUserError } from './error-report.js';
 import { erpDirectionToComponent, sampleAnchorDirections } from './erp-geometry.js';
-import { demoPerformance } from './demo-performance.js?v=20260813-render-clock-r14';
+import { demoPerformance } from './demo-performance.js?v=20260814-route-corridor-r15';
 
 const DEFAULT_ION_TOKEN = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJqdGkiOiJlMTg2MGFhOS02YTdhLTQ1NWMtYjkzMi05YjQ2ODRlZjI5YTgiLCJpZCI6MjUxNzM1LCJpYXQiOjE3MzAyODI0ODN9.prWAxx4RB8teelutQQbVqdxhgRZpZ4zjw8wzM-8k1Ug';
 const DEFAULT_ASSET_ID = 2275207;
@@ -987,6 +987,128 @@ export class CesiumWorld {
         };
     }
 
+    _sampleLoadedCorridor(startLocal, endLocal, options = {}) {
+        this._heightSampleCache.clear();
+        const spacing = clampNumber(options.spacing, 10, 100, 30);
+        const halfWidth = clampNumber(options.halfWidth, 0, 120, 35);
+        const dx = endLocal.x - startLocal.x;
+        const dz = endLocal.z - startLocal.z;
+        const routeLength = Math.hypot(dx, dz);
+        const center = {
+            x: (startLocal.x + endLocal.x) * 0.5,
+            y: (startLocal.y + endLocal.y) * 0.5,
+            z: (startLocal.z + endLocal.z) * 0.5,
+        };
+        const normalX = routeLength > 1e-6 ? -dz / routeLength : 1;
+        const normalZ = routeLength > 1e-6 ? dx / routeLength : 0;
+        const alongSteps = routeLength > 1e-6 ? Math.max(1, Math.ceil(routeLength / spacing)) : 0;
+        const lateralSteps = halfWidth > 0 ? Math.max(1, Math.ceil(halfWidth / spacing)) : 0;
+        const lateralOffsets = lateralSteps > 0
+            ? Array.from(
+                { length: lateralSteps * 2 + 1 },
+                (_, index) => ((index - lateralSteps) / lateralSteps) * halfWidth,
+            )
+            : [0];
+        const samples = [];
+        const missing = [];
+        let loaded = 0;
+
+        for (let alongIndex = 0; alongIndex <= alongSteps; alongIndex++) {
+            const t = alongSteps > 0 ? alongIndex / alongSteps : 0;
+            const baseX = startLocal.x + dx * t;
+            const baseZ = startLocal.z + dz * t;
+            for (const lateralOffset of lateralOffsets) {
+                const localX = baseX + normalX * lateralOffset;
+                const localZ = baseZ + normalZ * lateralOffset;
+                const sample = {
+                    x: localX - center.x,
+                    z: localZ - center.z,
+                    localX,
+                    localZ,
+                    d: Math.hypot(localX - center.x, localZ - center.z),
+                    distanceAlong: routeLength * t,
+                    lateralOffset,
+                };
+                samples.push(sample);
+                const y = this.sampleHeightAtLocal(localX, localZ, 1.0);
+                if (Number.isFinite(y)) loaded++;
+                else missing.push(sample);
+            }
+        }
+
+        return {
+            loaded,
+            total: samples.length,
+            ratio: samples.length ? loaded / samples.length : 1,
+            missing,
+            center,
+            routeLength,
+            halfWidth,
+            spacing,
+        };
+    }
+
+    async preloadCollisionCorridor(startLocal, endLocal, options = {}) {
+        if (!this.viewer || !this.ready || !startLocal || !endLocal) return null;
+        const coordinates = [
+            startLocal.x, startLocal.y, startLocal.z,
+            endLocal.x, endLocal.y, endLocal.z,
+        ].map(Number);
+        if (!coordinates.every(Number.isFinite)) return null;
+
+        const start = { x: coordinates[0], y: coordinates[1], z: coordinates[2] };
+        const end = { x: coordinates[3], y: coordinates[4], z: coordinates[5] };
+        const routeLength = Math.hypot(end.x - start.x, end.z - start.z);
+        const halfWidth = clampNumber(options.halfWidth, 10, 120, 35);
+        const spacing = clampNumber(options.spacing, 10, 100, 30);
+        const maxRadius = clampNumber(options.maxRadius, 120, 1200, 400);
+        const radius = Math.min(maxRadius, Math.max(80, routeLength * 0.5 + halfWidth + 40));
+        const center = {
+            x: (start.x + end.x) * 0.5,
+            y: (start.y + end.y) * 0.5,
+            z: (start.z + end.z) * 0.5,
+        };
+        const attempts = Math.round(clampNumber(options.attempts, 1, 4, 3));
+        const maxTargets = Math.round(clampNumber(
+            options.maxTargets,
+            8,
+            32,
+            Math.min(24, Math.max(10, Math.ceil(routeLength / 50) + 8)),
+        ));
+        const coverageSampler = () => this._sampleLoadedCorridor(start, end, {
+            halfWidth,
+            spacing,
+        });
+
+        const report = await this.preloadLocalArea(center, {
+            radius,
+            lift: Number.isFinite(options.lift) ? options.lift : 180,
+            gridSpacing: Number.isFinite(options.gridSpacing) ? options.gridSpacing : 100,
+            viewDistance: Number.isFinite(options.viewDistance)
+                ? options.viewDistance
+                : Math.max(160, Math.min(260, radius * 0.9)),
+            maxTargets,
+            dwellMs: Number.isFinite(options.dwellMs) ? options.dwellMs : 120,
+            perViewTimeoutMs: Number.isFinite(options.perViewTimeoutMs)
+                ? options.perViewTimeoutMs
+                : 2500,
+            finalIdleTimeoutMs: Number.isFinite(options.finalIdleTimeoutMs)
+                ? options.finalIdleTimeoutMs
+                : 10000,
+            totalTimeoutMs: options.totalTimeoutMs,
+            verifyCoverage: true,
+            coverageSampler,
+            minCoverageRatio: 1,
+            repairPasses: attempts - 1,
+            repairTargets: 32,
+            progressCb: options.progressCb,
+        });
+        if (report) {
+            report.corridor = { center, routeLength, halfWidth, spacing, attempts };
+        }
+        return report;
+    }
+
     async preloadLocalArea(centerLocal, options = {}) {
         if (!this.viewer || !this.ready || !centerLocal) return null;
         const Cesium = this.Cesium;
@@ -1016,7 +1138,11 @@ export class CesiumWorld {
         const dwellMs = Math.max(80, Number.isFinite(options.dwellMs) ? options.dwellMs : 180);
         const perViewTimeoutMs = Math.max(450, Number.isFinite(options.perViewTimeoutMs) ? options.perViewTimeoutMs : 1600);
         const finalIdleTimeoutMs = Math.max(perViewTimeoutMs, Number.isFinite(options.finalIdleTimeoutMs) ? options.finalIdleTimeoutMs : 5000);
-        const verifyCoverage = options.verifyCoverage !== false && radius >= 350;
+        const verifyCoverage = options.verifyCoverage === true
+            || (options.verifyCoverage !== false && radius >= 350);
+        const coverageSampler = typeof options.coverageSampler === 'function'
+            ? options.coverageSampler
+            : null;
         const coverageSpacing = clampNumber(options.coverageSpacing, 100, 600, Math.max(240, gridSpacing));
         const minCoverageRatio = clampNumber(options.minCoverageRatio, 0, 1, 0.72);
         const repairPasses = Math.round(clampNumber(options.repairPasses, 0, 3, verifyCoverage ? 1 : 0));
@@ -1024,16 +1150,26 @@ export class CesiumWorld {
         const progressCb = typeof options.progressCb === 'function' ? options.progressCb : null;
         const label = radius >= 1000 ? `${(radius / 1000).toFixed(1)} km` : `${Math.round(radius)} m`;
         const delay = (ms) => new Promise(resolve => window.setTimeout(resolve, ms));
+        const totalTimeoutMs = Number.isFinite(options.totalTimeoutMs)
+            ? Math.max(1000, options.totalTimeoutMs)
+            : Infinity;
+        const preloadStartedAt = performance.now();
+        const remainingBudgetMs = () => totalTimeoutMs - (performance.now() - preloadStartedAt);
         const report = {
             radius,
             views: 0,
             timedOutViews: 0,
             finalIdle: false,
             coverage: null,
+            deadlineExceeded: false,
         };
 
         const runViews = async (views, passLabel) => {
             for (let i = 0; i < views.length; i++) {
+                if (remainingBudgetMs() <= 0) {
+                    report.deadlineExceeded = true;
+                    break;
+                }
                 const v = views[i];
                 const status = this.getTileLoadStatus();
                 const queue = status.pending !== null || status.processing !== null
@@ -1058,11 +1194,26 @@ export class CesiumWorld {
                     },
                 });
                 this.viewer.scene.requestRender();
-                await delay(dwellMs);
-                const idle = await this.waitForTilesIdle(perViewTimeoutMs);
+                await delay(Math.min(dwellMs, Math.max(0, remainingBudgetMs())));
+                const remaining = remainingBudgetMs();
+                if (remaining <= 0) {
+                    report.deadlineExceeded = true;
+                    report.views++;
+                    break;
+                }
+                const idle = await this.waitForTilesIdle(Math.max(1, Math.min(perViewTimeoutMs, remaining)));
                 if (!idle) report.timedOutViews++;
                 report.views++;
             }
+        };
+
+        const settleAfterViews = async () => {
+            const remaining = remainingBudgetMs();
+            if (remaining <= 0) {
+                report.deadlineExceeded = true;
+                return false;
+            }
+            return this.waitForTilesIdle(Math.max(1, Math.min(finalIdleTimeoutMs, remaining)), 350);
         };
 
         try {
@@ -1075,20 +1226,29 @@ export class CesiumWorld {
                 maxTargets
             );
             await runViews(initialViews, 'scan');
-            report.finalIdle = await this.waitForTilesIdle(finalIdleTimeoutMs, 350);
+            report.finalIdle = await settleAfterViews();
 
             for (let pass = 0; verifyCoverage && pass <= repairPasses; pass++) {
                 if (progressCb) progressCb(`Verifying ${label} collision tile coverage...`);
-                report.coverage = this._sampleLoadedCoverage(centerLocal, radius, coverageSpacing);
+                report.coverage = coverageSampler
+                    ? coverageSampler()
+                    : this._sampleLoadedCoverage(centerLocal, radius, coverageSpacing);
                 const pct = Math.round(report.coverage.ratio * 100);
                 if (progressCb) progressCb(`Collision preload coverage ${report.coverage.loaded}/${report.coverage.total} (${pct}%).`);
                 if (report.coverage.ratio >= minCoverageRatio || pass === repairPasses || !report.coverage.missing.length) break;
+                if (remainingBudgetMs() <= 0) {
+                    report.deadlineExceeded = true;
+                    break;
+                }
 
                 const repairViews = report.coverage.missing
                     .slice(0, repairTargets)
                     .map((offset, i) => this._makePreloadView(centerLocal, offset, i + pass * repairTargets, lift, viewDistance));
                 await runViews(repairViews, `repair ${pass + 1}`);
-                report.finalIdle = await this.waitForTilesIdle(finalIdleTimeoutMs, 350);
+                report.finalIdle = await settleAfterViews();
+            }
+            if (report.deadlineExceeded && progressCb) {
+                progressCb(`Collision preload reached its ${Math.round(totalTimeoutMs / 1000)} s time budget.`);
             }
         } finally {
             if (savedRequestsPerServer !== null) {
