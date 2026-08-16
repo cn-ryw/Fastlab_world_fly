@@ -14,7 +14,13 @@ API_CONTAINER="${MINDCLOUD_API_CONTAINER:-mindcloud-da360-yopo}"
 LEGACY_WEB_CONTAINER="google-tiles-flight"
 API_IMAGE="${MINDCLOUD_API_IMAGE:-mindcloud-da360-yopo:latest}"
 DA360_MODEL="${DA360_MODEL_PATH_HOST:-$SCRIPT_DIR/third_party/DA360/checkpoints/DA360_large.pth}"
-YOPO_STRATEGY="${MINDCLOUD_YOPO_STRATEGY:-baseline}"
+DEFAULT_YOPO_STRATEGY="d70_h30_epoch30"
+YOPO_STRATEGY="${MINDCLOUD_YOPO_STRATEGY:-$DEFAULT_YOPO_STRATEGY}"
+if [[ -n "${MINDCLOUD_YOPO_STRATEGY:-}" ]]; then
+    YOPO_STRATEGY_SOURCE="环境变量覆盖"
+else
+    YOPO_STRATEGY_SOURCE="默认"
+fi
 YOPO_BASE_CONFIG_PATH="$SCRIPT_DIR/third_party/YOPO/config/traj_opt.yaml"
 DEPENDENCY_MANIFEST="$SCRIPT_DIR/dependencies.versions.json"
 STARTUP_TIMEOUT="${MINDCLOUD_STARTUP_TIMEOUT:-180}"
@@ -259,11 +265,11 @@ python3 "$SCRIPT_DIR/scripts/verify_dependencies.py" \
     --da360-model "$DA360_MODEL" --yopo-model "$YOPO_MODEL" \
     --yopo-strategy "$YOPO_STRATEGY" \
     || die "runtime dependency version verification failed"
-echo "  DA360: $(basename "$DA360_MODEL")"
-echo "  strategy: $YOPO_STRATEGY"
-echo "  YOPO:  $(basename "$YOPO_MODEL")"
-echo "  config: $(basename "$YOPO_BASE_CONFIG_PATH") + $YOPO_CONFIG_NAME"
-echo "  image:  $API_IMAGE"
+echo "  DA360 模型: $(basename "$DA360_MODEL")"
+echo "  YOPO 策略: $YOPO_STRATEGY（$YOPO_STRATEGY_SOURCE）"
+echo "  YOPO 模型: $(basename "$YOPO_MODEL")"
+echo "  YOPO 配置: $(basename "$YOPO_BASE_CONFIG_PATH") + $YOPO_CONFIG_NAME"
+echo "  推理镜像: $API_IMAGE"
 
 OWNED_WEB_PIDS=()
 if [[ -f "$PID_FILE" ]]; then
@@ -397,7 +403,13 @@ echo " 全部就绪"
 echo "  Web:    http://$WEB_HOST:$WEB_PORT"
 echo "  DA360:  http://127.0.0.1:$API_PORT/health"
 echo "  YOPO:   http://127.0.0.1:$API_PORT/yopo/health"
-echo "  策略:   $YOPO_STRATEGY"
+echo "  策略:   $YOPO_STRATEGY（$YOPO_STRATEGY_SOURCE）"
 echo "========================================="
-echo "  启动 Firefox: ./launch-firefox-gpu.sh"
-echo "  停止全部:     ./stop-all.sh"
+echo "  推荐 Firefox:    ./launch-firefox-gpu.sh"
+echo "  备选 Chrome/T8L: ./launch-chrome-gpu.sh"
+if [[ "$YOPO_STRATEGY" == "$DEFAULT_YOPO_STRATEGY" ]]; then
+    echo "  可选 baseline:   MINDCLOUD_YOPO_STRATEGY=baseline ./start-all.sh"
+else
+    echo "  恢复默认策略:    ./start-all.sh"
+fi
+echo "  停止全部:        ./stop-all.sh"

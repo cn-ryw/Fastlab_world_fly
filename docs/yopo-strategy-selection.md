@@ -4,16 +4,16 @@
 
 | 名称 | checkpoint | 感知深度 | 最大轨迹距离 | 时域 |
 |---|---|---:|---:|---:|
-| `baseline`（默认） | YOPO_55/epoch10 | 20 m | 18 m | 1.125 s |
-| `d70_h30_epoch30` | YOPO_70/epoch30 | 70 m | 30 m | 1.875 s |
+| `baseline` | YOPO_55/epoch10 | 20 m | 18 m | 1.125 s |
+| `d70_h30_epoch30`（默认） | YOPO_70/epoch30 | 70 m | 30 m | 1.875 s |
 
-启动第二套策略：
+启动默认策略：
 
 ```bash
-MINDCLOUD_YOPO_STRATEGY=d70_h30_epoch30 ./start-all.sh
+./start-all.sh
 ```
 
-回到默认基线：
+切换到原有基线：
 
 ```bash
 MINDCLOUD_YOPO_STRATEGY=baseline ./start-all.sh
@@ -26,7 +26,7 @@ curl --noproxy '*' -s http://127.0.0.1:5688/yopo/health \
   | python3 -m json.tool
 ```
 
-第二套策略应显示：
+默认策略应显示：
 
 ```text
 strategy = d70_h30_epoch30

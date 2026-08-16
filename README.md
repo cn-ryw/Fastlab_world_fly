@@ -63,7 +63,7 @@ DA360 与 YOPO checkpoint 不随仓库分发。可通过环境变量指定位置
 
 ~~~bash
 DA360_MODEL_PATH_HOST=/path/to/DA360_large.pth \
-YOPO_MODEL_PATH_HOST=/path/to/epoch10.pth \
+YOPO_MODEL_PATH_HOST=/path/to/epoch30.pth \
 ./start-all.sh
 ~~~
 
@@ -93,10 +93,10 @@ Firefox 适合完整演示；RadioMaster T8L 的 Web Serial 连接请使用：
 
 ### 3. 选择 YOPO 策略
 
-默认策略为 <code>baseline</code>，对应 epoch10。可选的 70 m 感知/30 m 轨迹策略通过以下命令启用：
+默认策略为 <code>d70_h30_epoch30</code>，对应 epoch30、70 m 感知和 30 m 最大轨迹距离。如需使用原有 epoch10 基线策略，可显式切换：
 
 ~~~bash
-MINDCLOUD_YOPO_STRATEGY=d70_h30_epoch30 ./start-all.sh
+MINDCLOUD_YOPO_STRATEGY=baseline ./start-all.sh
 ~~~
 
 ### 4. 放置并飞行

@@ -7,7 +7,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_two_named_yopo_strategies_keep_baseline_as_default():
+def test_two_named_yopo_strategies_keep_d70_as_default():
     manifest = json.loads(
         (ROOT / "dependencies.versions.json").read_text(encoding="utf-8")
     )
@@ -21,11 +21,16 @@ def test_two_named_yopo_strategies_keep_baseline_as_default():
     assert strategies["d70_h30_epoch30"]["config"] == (
         "d70_h30_cruise15_recovery.yaml"
     )
+    assert manifest["model_checkpoints"]["yopo"] == {
+        "name": "epoch30.pth",
+        "default_host_path": "models/yopo/d70_h30_epoch30/epoch30.pth",
+    }
 
 
 def test_launcher_exposes_explicit_strategy_selection_and_identity():
     source = (ROOT / "start-all.sh").read_text(encoding="utf-8")
-    assert 'MINDCLOUD_YOPO_STRATEGY:-baseline' in source
+    assert 'MINDCLOUD_YOPO_STRATEGY:-$DEFAULT_YOPO_STRATEGY' in source
+    assert 'DEFAULT_YOPO_STRATEGY="d70_h30_epoch30"' in source
     assert '--yopo-strategy "$YOPO_STRATEGY"' in source
     assert 'MINDCLOUD_YOPO_STRATEGY=$YOPO_STRATEGY' in source
     assert 'YOPO_MODEL_PATH=$YOPO_CONTAINER_MODEL' in source

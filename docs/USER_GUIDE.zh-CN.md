@@ -40,17 +40,17 @@ Firefox 和 Chrome 的 <code>localStorage</code> 相互独立，因此需要分�
 
 ~~~bash
 DA360_MODEL_PATH_HOST=/path/to/DA360_large.pth \
-YOPO_MODEL_PATH_HOST=/path/to/epoch10.pth \
+YOPO_MODEL_PATH_HOST=/path/to/epoch30.pth \
 ./start-all.sh
 ~~~
 
-默认 YOPO 策略是 <code>baseline</code>，使用 epoch10。可选策略：
+默认 YOPO 策略是 <code>d70_h30_epoch30</code>，使用 epoch30、70 m 感知和 30 m 最大轨迹距离。切换到原有 epoch10 基线策略：
 
 ~~~bash
-MINDCLOUD_YOPO_STRATEGY=d70_h30_epoch30 ./start-all.sh
+MINDCLOUD_YOPO_STRATEGY=baseline ./start-all.sh
 ~~~
 
-该策略使用 70 m 感知/30 m 轨迹配置。切换策略后应查看服务启动输出与 <code>/yopo/health</code>，确认实际 checkpoint 和策略身份。
+切换策略后应查看服务启动输出与 <code>/yopo/health</code>，确认实际 checkpoint 和策略身份。
 
 ## 3. 启动与连通性
 
@@ -89,6 +89,13 @@ Firefox 适合主画面、G 航点和完整 Demo 测试。
 ~~~
 
 Chrome 使用持久的普通配置，不开启隐私模式。连接 RadioMaster T8L 时必须使用支持 Web Serial 的 Chrome/Chromium。
+
+Chrome 默认以 <code>CHROME_GPU_MODE=auto</code> 启动：优先尝试 NVIDIA PRIME，若 GPU/WebGL 初始化失败则明确告警并自动回退到桌面 GPU。也可显式选择：
+
+~~~bash
+CHROME_GPU_MODE=nvidia ./launch-chrome-gpu.sh  # 强制 NVIDIA，失败即停止
+CHROME_GPU_MODE=desktop ./launch-chrome-gpu.sh # 直接使用桌面 GPU
+~~~
 
 ### 停止服务
 
