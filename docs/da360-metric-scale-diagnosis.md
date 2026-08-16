@@ -11,7 +11,11 @@ b = 0
 
 `a * pred_disp + b` 的仿射拟合仅保留为离线诊断。如果非零 `b` 明显改善结果，应判定为输入预处理、数据、模型版本或评估契约存在偏差，而不是把 `b` 发布到运行时。标定脚本必须始终选择 `scale_only`，服务端必须拒绝任何非零 `b`。
 
-## Corrected conclusion
+![DA360 米制标定数据](assets/figures/da360-metric-calibration.zh-CN.png)
+
+图中数据来自 4 个地点、12 次采集和 833 个 0.5–20 m 有效范围锚点。覆盖率门槛通过，但固定全局尺度的自动精度门禁未通过。[下载可编辑 SVG](assets/figures/da360-metric-calibration.zh-CN.svg)；[查看脱敏摘要数据](data/da360-metric-calibration-summary.json)。
+
+## 结论边界（英文证据记录）
 
 The 12 audited captures reject one fixed cross-scene scale-only mapping
 

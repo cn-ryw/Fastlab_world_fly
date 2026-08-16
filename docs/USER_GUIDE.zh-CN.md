@@ -1,4 +1,4 @@
-# MindCloud World Fly 中文 User Guide
+# MindCloud World Fly 中文使用指南
 
 本指南面向第一次运行项目、使用 RadioMaster T8L 或测试 YOPO/SO3 闭环的用户。项目仅用于仿真研究与演示。
 
@@ -186,6 +186,8 @@ SO3 进入时固定第一帧世界 yaw 参考。Roll/Pitch 按该固定世界航
 Tab/Settings 中提供历史路径开关。开启后，主场景绘制无人机已经飞过的线条；关闭只影响显示，不影响日志、控制或规划。G 航点标记参与正常场景深度遮挡，建筑遮挡时不会穿透显示。
 
 ## 9. RGB、DA360 与规划状态
+
+DA360 输出的是已经消除平移不确定性的 scale-invariant 相对视差，不会直接给出绝对米制深度。项目在运行时使用 `1/D=a·p` 的 scale-only 标定，并固定 `b=0`。当前尺度只经过 sim-to-sim 人工检查，自动跨地点精度门禁尚未通过；详细数据见 [DA360 米制尺度诊断](da360-metric-scale-diagnosis.md)。
 
 | 字段或状态 | 含义 |
 |---|---|

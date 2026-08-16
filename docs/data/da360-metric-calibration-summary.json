@@ -1,0 +1,52 @@
+{
+  "schemaVersion": 1,
+  "description": "DA360 scale-only 米制标定脱敏摘要；不包含原始 RGB、深度图、绝对路径或设备信息。",
+  "deployment": {
+    "relation": "inverse_depth_1_per_m = a * pred_disp",
+    "a": 0.0011892812185910185,
+    "b": 0.0,
+    "selectedModel": "scale_only",
+    "scope": "sim-to-sim",
+    "automaticAccuracyGatePassed": false
+  },
+  "collection": {
+    "sites": 4,
+    "captures": 12,
+    "anchorsTotal": 1536,
+    "anchorsValid": 1140,
+    "validAnchorFraction": 0.7421875,
+    "anchorsInRange": 833,
+    "metricRangeM": [0.5, 20.0]
+  },
+  "gates": {
+    "medianAbsRelMax": 0.15,
+    "p90AbsRelMax": 0.3,
+    "near10mP90ErrorMMax": 1.0,
+    "validAnchorFractionMin": 0.7
+  },
+  "globalScaleOnly": {
+    "medianAbsRel": 0.37573337310072513,
+    "p90AbsRel": 1.5070208607309958,
+    "near10mP90ErrorM": 4.054186582565308
+  },
+  "captures": [
+    {"id": "A03", "site": "A", "scaleA": 0.00073789063629, "rangeAnchors": 80},
+    {"id": "A04", "site": "A", "scaleA": 0.000798714980147, "rangeAnchors": 68},
+    {"id": "A05", "site": "A", "scaleA": 0.000679254798454, "rangeAnchors": 56},
+    {"id": "B01", "site": "B", "scaleA": 0.000950885605065, "rangeAnchors": 80},
+    {"id": "B02", "site": "B", "scaleA": 0.00314656435562, "rangeAnchors": 84},
+    {"id": "B03", "site": "B", "scaleA": 0.00136120151694, "rangeAnchors": 70},
+    {"id": "C02", "site": "C", "scaleA": 0.000779568100099, "rangeAnchors": 51},
+    {"id": "C03", "site": "C", "scaleA": 0.000799050921168, "rangeAnchors": 59},
+    {"id": "C04", "site": "C", "scaleA": 0.000782538176858, "rangeAnchors": 46},
+    {"id": "D02", "site": "D", "scaleA": 0.00128684703126, "rangeAnchors": 67},
+    {"id": "D04", "site": "D", "scaleA": 0.00141824290356, "rangeAnchors": 88},
+    {"id": "D05", "site": "D", "scaleA": 0.00133311486799, "rangeAnchors": 84}
+  ],
+  "leaveOneLocationOut": [
+    {"site": "A", "n": 204, "medianAbsRel": 0.39880379841191294, "p90AbsRel": 0.5441621260658897},
+    {"site": "B", "n": 234, "medianAbsRel": 0.36639307263978793, "p90AbsRel": 2.124530649821773},
+    {"site": "C", "n": 156, "medianAbsRel": 0.38308449101442865, "p90AbsRel": 0.4427670031186228},
+    {"site": "D", "n": 239, "medianAbsRel": 0.3132818704843152, "p90AbsRel": 0.9815132824570583}
+  ]
+}

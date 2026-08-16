@@ -14,7 +14,7 @@
 
 MindCloud World Fly 在浏览器中加载 Google Photorealistic 3D Tiles，以六面相机生成 360° ERP RGB，经 DA360 估计 scale-invariant 相对视差，再通过 `b=0` 的 scale-only 仿真标定转换为近似米制深度；YOPO 随后生成 Poly5 局部轨迹，最后由浏览器内 SO3 控制器闭环跟踪。项目同时支持键鼠、RadioMaster T8L、固定 G 航点和滚动遥控航点。
 
-> 本仓库当前定位为研究与演示用仿真平台。下方日志证明了两次零碰撞成功到达，但不代表持续 15 Hz 规划门禁、真实飞行或安全认证已经通过。
+> 本项目用于仿真研究与演示。下方两段日志记录了零碰撞到达案例；持续 15 Hz 规划、真实飞行和安全认证仍未完成。
 
 ## 功能概览
 
@@ -156,6 +156,14 @@ python3 scripts/plot_demo_flights.py \
 | <code>v0.1.0-demo.20260814</code> | 本 README 对应的演示 Release |
 | <code>upstream-baseline-c6406dd</code> | 上游原始基线定位标签 |
 | <code>archive/da360-prototype-c0b82d5-20260809</code> | 早期 DA360 原型归档 |
+
+## DA360 米制标定数据
+
+![DA360 米制标定数据](docs/assets/figures/da360-metric-calibration.zh-CN.png)
+
+当前运行时采用 scale-only 关系 `1/D=a·p`，固定 `b=0`。12 次采集的有效锚点覆盖率达到 74.2%，但单帧尺度差异和四地点留一验证误差均表明：一个固定全局尺度尚未通过自动精度门禁。现有配置仅作为人工检查后的 sim-to-sim 基线，不代表真实传感器或跨场景米制精度已经通过。
+
+[可编辑 SVG](docs/assets/figures/da360-metric-calibration.zh-CN.svg) · [PDF](docs/assets/figures/da360-metric-calibration.zh-CN.pdf) · [脱敏摘要数据](docs/data/da360-metric-calibration-summary.json) · [绘图脚本](scripts/plot_da360_metric_calibration.py)
 
 ## 当前边界
 

@@ -91,9 +91,9 @@
 
 ### DA360 metric（sim-to-sim 已人工接受，自动精度门禁未通过）
 
-- 4 地点×3 captures、共 12 组四件套和 LOLO 报告已完成：`../experiment_data/metric_fit-lolo-20260810-12capture/fit_report.json`。1536 anchors 中 1140 有效（74.22%），833 个在 0.5–20m。
+- 4 地点×3 captures、共 12 组四件套和 LOLO 报告已完成；原始实验文件不随公开仓库分发，[脱敏摘要](data/da360-metric-calibration-summary.json)保留了图表所需指标。1536 anchors 中 1140 有效（74.22%），833 个在 0.5–20m。
 - 数据完整性通过，但四个留出地点的 median/p90 AbsRel、10m 内 p90 误差分别为：site-a 0.399/0.544/3.326m，site-b 0.366/2.125/5.959m，site-c 0.383/0.443/3.545m，site-d 0.313/0.982/4.051m，均未过精度门禁。
-- `success=true` 只代表 fitter 完成；自动 `acceptance.passed=false`。全量 scale-only 结果 `a=0.0011892812185910185,b=0` 的 median/p90 AbsRel=0.376/1.507、近距 p90=4.054m。项目负责人于 2026-08-11 根据实时深度效果将其人工接受为 sim-to-sim 基线；`../experiment_data/depth_calibration.json` 保留失败的自动报告并以 `manual_acceptance` 记录该决定。
+- `success=true` 只代表 fitter 完成；自动 `acceptance.passed=false`。全量 scale-only 结果 `a=0.0011892812185910185,b=0` 的 median/p90 AbsRel=0.376/1.507、近距 p90=4.054m。该配置于 2026-08-11 经实时深度效果人工检查后接受为 sim-to-sim 基线；本地运行时标定文件保留失败的自动报告，并以 `manual_acceptance` 记录该决定。
 - DA360 已在模型内部消除 disparity shift；部署公式固定为 `1/D_metric=a*pred_disp`，并强制 `b=0`。scale+shift 只保留为离线诊断，不能被选中、导出或用于运行时推理。
 - 476×238→1036×518 pilot 在相同 134×67 source JPEG 下从 25.6ms 增至 151.9ms（5.94×），且 site-a 显著变差；不得提升 live DA360 输入到 1036×518。
 - 尚未完成 metric 驱动的真实低空闭环或 Cesium truth parity；人工批准仅覆盖 sim-to-sim，不得写成自动 LOLO 精度门禁通过或真实传感器精度验收。
