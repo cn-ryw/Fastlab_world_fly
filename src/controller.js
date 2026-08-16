@@ -155,9 +155,15 @@ function _sanitizeButtonMapping(saved) {
     const result = {};
     for (const action of BUTTON_ACTIONS) {
         const defaults = DEFAULT_BUTTON_MAPPING[action];
-        const candidate = source[action] && typeof source[action] === 'object' && !Array.isArray(source[action])
+        const hasCandidate = source[action] && typeof source[action] === 'object' && !Array.isArray(source[action]);
+        const candidate = hasCandidate
             ? source[action]
             : {};
+        const invalidArmSource = action === 'arm' && hasCandidate
+            && candidate.source !== 'axis' && candidate.source !== 'button';
+        const fallback = invalidArmSource
+            ? { source: 'button', buttonIndex: -1, axisIndex: -1, axisThreshold: 0.5, inverted: false, triggerMode: 'toggle' }
+            : defaults;
         const buttonIndex = candidate.buttonIndex === null || typeof candidate.buttonIndex === 'boolean'
             ? NaN
             : Number(candidate.buttonIndex);
@@ -167,18 +173,18 @@ function _sanitizeButtonMapping(saved) {
         result[action] = {
             source: candidate.source === 'axis' || candidate.source === 'button'
                 ? candidate.source
-                : defaults.source,
+                : fallback.source,
             buttonIndex: Number.isInteger(buttonIndex) && buttonIndex >= -1 && buttonIndex <= 255
                 ? buttonIndex
-                : defaults.buttonIndex,
+                : fallback.buttonIndex,
             axisIndex: Number.isInteger(axisIndex) && axisIndex >= -1 && axisIndex <= 63
                 ? axisIndex
-                : defaults.axisIndex,
-            axisThreshold: _finiteClamped(candidate.axisThreshold, defaults.axisThreshold, 0, 1),
-            inverted: typeof candidate.inverted === 'boolean' ? candidate.inverted : defaults.inverted,
+                : fallback.axisIndex,
+            axisThreshold: _finiteClamped(candidate.axisThreshold, fallback.axisThreshold, 0, 1),
+            inverted: typeof candidate.inverted === 'boolean' ? candidate.inverted : fallback.inverted,
             triggerMode: candidate.triggerMode === 'level' || candidate.triggerMode === 'toggle'
                 ? candidate.triggerMode
-                : defaults.triggerMode,
+                : fallback.triggerMode,
         };
     }
     return result;

@@ -11,9 +11,27 @@
  */
 
 // drone.js 在模块顶层构造 pc 对象，先装最小桩件再动态 import。
+class MockQuat {
+    constructor() { this.x = 0; this.y = 0; this.z = 0; this.w = 1; }
+    set(x, y, z, w) { this.x = x; this.y = y; this.z = z; this.w = w; return this; }
+    copy(value) { Object.assign(this, value); return this; }
+    invert() { this.x *= -1; this.y *= -1; this.z *= -1; return this; }
+    mul() { return this; }
+    getEulerAngles(out) { out.x = 0; out.y = 0; out.z = 0; return out; }
+}
+class MockMat4 {
+    setTRS(_position, orientation) { this.orientation = orientation; return this; }
+    getZ(out) {
+        const { x = 0, y = 0, z = 0, w = 1 } = this.orientation || {};
+        out.x = 2 * (x * z + w * y);
+        out.y = 2 * (y * z - w * x);
+        out.z = 1 - 2 * (x * x + y * y);
+        return out;
+    }
+}
 globalThis.pc = {
-    Quat: class { constructor() { this.x = 0; this.y = 0; this.z = 0; this.w = 1; } },
-    Mat4: class {},
+    Quat: MockQuat,
+    Mat4: MockMat4,
     Vec3: class { constructor(x = 0, y = 0, z = 0) { this.x = x; this.y = y; this.z = z; } },
 };
 globalThis.pc.Vec3.ZERO = new globalThis.pc.Vec3(0, 0, 0);

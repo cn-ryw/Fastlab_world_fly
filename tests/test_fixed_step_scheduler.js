@@ -20,8 +20,8 @@ const updateFlightSource = mainSource.slice(
 assert.equal(updateFlightSource.match(/controller\.update\(\)/g)?.length, 1,
     'the render loop must poll controller input exactly once');
 assert.match(updateFlightSource,
-    /flightControlScheduler\.advance\([\s\S]*?drone\.update\(stepDt, input, collisionProvider\)/,
-    'every fixed step must reuse the one render-frame input snapshot');
+    /flightControlScheduler\.advance\([\s\S]*?drone\.update\(stepDt, input, collisionProvider, frameCollisionCadence\)/,
+    'every fixed step must reuse the input snapshot and frame collision cadence');
 assert.equal(updateFlightSource.match(/panoramaSensor\?\.update\(/g)?.length, 1,
     'panorama capture must remain a once-per-render operation');
 assert.ok(

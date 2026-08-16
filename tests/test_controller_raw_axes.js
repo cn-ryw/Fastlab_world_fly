@@ -36,6 +36,14 @@ controller._getGamepad = () => ({
 });
 controller._updateGamepadDisplay = () => {};
 
+// Keep this controller-contract test independent from the RadioMaster T8L
+// hardware defaults (throttle is exposed as an analogue button there).
+controller.mapping.throttle.source = 'axis';
+controller.mapping.throttle.axisIndex = 2;
+controller.mapping.throttle.buttonIndex = -1;
+controller.mapping.yaw.source = 'axis';
+controller.mapping.yaw.axisIndex = 3;
+controller.mapping.yaw.buttonIndex = -1;
 controller.mapping.roll.deadzone = 0.2;
 controller.mapping.roll.expo = 0.5;
 controller.mapping.pitch.deadzone = 0.2;

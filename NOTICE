@@ -27,6 +27,34 @@ PlayCanvas Engine
   included in all copies or substantial portions of the Software.
 
 -------------------------------------------------------------------------
+CesiumJS
+  License: Apache License 2.0
+  URL: https://github.com/CesiumGS/cesium
+
+-------------------------------------------------------------------------
+DA360
+  License: MIT
+  URL: https://github.com/Insta360-Research-Team/DA360
+
+-------------------------------------------------------------------------
+YOPO / YOPO_360
+  License: MIT
+  Project adaptation: https://github.com/cn-ryw/YOPO_360
+  Upstream branch: https://github.com/zwhhhhh9/YOPO_360/tree/velocity_15ms
+
+-------------------------------------------------------------------------
+External data services
+  Google Photorealistic 3D Tiles are accessed through Cesium Ion. Their
+  use is subject to the applicable Google Maps Platform and Cesium terms;
+  the tile data is not distributed by this repository.
+
+-------------------------------------------------------------------------
+Documentation assets
+  Simulator screenshots and demo recordings were produced by this project.
+  The system architecture illustration was generated with an OpenAI image
+  generation tool and reviewed for technical consistency by the project team.
+
+-------------------------------------------------------------------------
 JSZip
   Version: 3.10.1
   License: MIT (or GPLv3)

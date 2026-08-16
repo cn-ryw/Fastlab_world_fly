@@ -118,8 +118,8 @@ const { CesiumWorld } = await import('../src/cesium-world.js?scheduler-test');
     }
 }
 
-// Hidden-viewer defaults avoid sibling/leaf over-fetch, while the explicit
-// rollback profile retains the previous Cesium streaming flags for live A/B.
+// demo30 keeps parent tiles visible while children refine, without sibling,
+// hidden-view, desired-leaf, or prefer-leaf over-fetch.
 {
     const propertyNames = [
         'maximumScreenSpaceError', 'cullRequestsWhileMoving',
@@ -134,21 +134,12 @@ const { CesiumWorld } = await import('../src/cesium-world.js?scheduler-test');
     const world = Object.create(CesiumWorld.prototype);
     world.panoramaTileSSE = 512;
     world.panoramaLeanStreaming = true;
-    const lean = makeTileset();
-    world._configurePanoramaTileset(lean);
-    if (lean.loadSiblings || lean.preloadWhenHidden || lean.preloadFlightDestinations
-        || lean.immediatelyLoadDesiredLevelOfDetail || lean.preferLeaves
-        || lean.skipLevelOfDetail !== true) {
-        throw new Error('lean panorama tileset profile retained an over-fetch flag');
-    }
-
-    world.panoramaLeanStreaming = false;
-    const legacy = makeTileset();
-    world._configurePanoramaTileset(legacy);
-    if (!legacy.loadSiblings || !legacy.preloadWhenHidden || !legacy.preloadFlightDestinations
-        || !legacy.immediatelyLoadDesiredLevelOfDetail || !legacy.preferLeaves
-        || legacy.skipLevelOfDetail !== false) {
-        throw new Error('legacy panorama tileset rollback profile was not preserved');
+    const demo = makeTileset();
+    world._configurePanoramaTileset(demo);
+    if (demo.loadSiblings || demo.preloadWhenHidden || demo.preloadFlightDestinations
+        || demo.immediatelyLoadDesiredLevelOfDetail || demo.preferLeaves
+        || demo.skipLevelOfDetail !== false) {
+        throw new Error('demo30 panorama profile violated parent-first lean streaming');
     }
 }
 
@@ -181,14 +172,15 @@ function harness() {
 
 for (const [facesPerSlice, expectedYields] of [[2, 2], [3, 1], [6, 0]]) {
     yieldCount = 0;
-    globalThis.window.requestAnimationFrame = callback => {
-        yieldCount++;
-        queueMicrotask(() => callback(performance.now()));
+    globalThis.window.setTimeout = (callback, delay = 0) => {
+        if (delay === 0) yieldCount++;
+        queueMicrotask(callback);
+        return 0;
     };
     const { world, viewer, transform, faces } = harness();
     const result = await world._capturePanoramaHybridWithViewerAsync(
         viewer, transform, 384, 192, 96, 180,
-        { captureAnyway: true, facesPerSlice },
+        { captureAnyway: false, facesPerSlice },
     );
     if (faces.length !== 6) throw new Error(`expected 6 captured faces, got ${faces.length}`);
     if (yieldCount !== expectedYields) {
@@ -212,8 +204,8 @@ for (const [facesPerSlice, expectedYields] of [[2, 2], [3, 1], [6, 0]]) {
     }
 }
 
-// A zero-wait flight capture still returns its projected canvas for live use,
-// while `ready` truthfully remains false until all six tile views are settled.
+// A zero-wait flight capture is a camera product: it returns a complete RGB
+// frame without blocking on, or claiming, per-face tile provenance.
 {
     const { world, viewer, transform } = harness();
     world._panoramaTileset.tilesLoaded = false;
@@ -225,10 +217,9 @@ for (const [facesPerSlice, expectedYields] of [[2, 2], [3, 1], [6, 0]]) {
     if (!result.canvas || !result.complete) {
         throw new Error('partial flight capture must retain the completed ERP canvas');
     }
-    if (result.ready || result.allFacesTileReady || result.readyFaces !== 0
-        || result.faceTileReadiness?.length !== 6
-        || result.readinessReason !== 'tiles-partial') {
-        throw new Error('partial flight capture was mislabeled as tiles-ready');
+    if (!result.ready || result.allFacesTileReady !== undefined
+        || result.readyFaces !== undefined || result.faceTileReadiness !== undefined) {
+        throw new Error('live camera capture unexpectedly waited for tile provenance');
     }
 }
 
@@ -277,7 +268,7 @@ for (const [facesPerSlice, expectedYields] of [[2, 2], [3, 1], [6, 0]]) {
     world._panoramaTileLoadState.lastErrorAt = performance.now();
     const result = await world._capturePanoramaHybridWithViewerAsync(
         viewer, transform, 384, 192, 96, 180,
-        { captureAnyway: true, facesPerSlice: 6 },
+        { captureAnyway: false, facesPerSlice: 6 },
     );
     if (!result.complete || result.ready || !result.tileError
         || result.readinessReason !== 'tile-error') {
@@ -321,9 +312,10 @@ for (const [facesPerSlice, expectedYields] of [[2, 2], [3, 1], [6, 0]]) {
 {
     const controller = new AbortController();
     const { world, viewer, transform, faces } = harness();
-    globalThis.window.requestAnimationFrame = callback => {
-        controller.abort('test-cancel');
-        queueMicrotask(() => callback(performance.now()));
+    globalThis.window.setTimeout = (callback, delay = 0) => {
+        if (delay === 0) controller.abort('test-cancel');
+        queueMicrotask(callback);
+        return 0;
     };
     await world._capturePanoramaHybridWithViewerAsync(
         viewer, transform, 384, 192, 96, 180,
@@ -386,7 +378,7 @@ for (const [facesPerSlice, expectedYields] of [[2, 2], [3, 1], [6, 0]]) {
         || flightPreloadOptions.frameDelayMs !== 32
         || flightPreloadOptions.tileTimeoutMs !== 4000
         || flightPreloadOptions.tileQuietMs !== 150
-        || flightPreloadOptions.timeoutMs !== 30000) {
+        || flightPreloadOptions.timeoutMs !== 60000) {
         throw new Error('flight preload must settle hidden-viewer tiles before zero-wait live capture');
     }
 

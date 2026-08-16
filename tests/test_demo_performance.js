@@ -9,8 +9,8 @@ assert.equal(demo.profile, 'demo30');
 assert.equal(demo.tileRequestsPerServer, 12);
 assert.equal(demo.normalFacesPerSlice, 3);
 assert.equal(demo.constrainedFacesPerSlice, 2);
-assert.equal(demo.preloadRadiusMeters, 300);
-assert.equal(demo.preloadTimeoutMs, 30000);
+assert.equal(demo.preloadRadiusMeters, 400);
+assert.equal(demo.preloadTimeoutMs, 60000);
 assert.equal(demo.preloadFrameDelayMs, 32);
 assert.equal(demo.preloadFaceTileTimeoutMs, 4000);
 assert.equal(demo.preloadFaceTileQuietMs, 150);
@@ -41,7 +41,7 @@ assert.equal(controller.facesPerSlice(false, 6), 3);
 
 const scheduler = { maximumRequestsPerServer: 18 };
 controller.configureCesium({ RequestScheduler: scheduler });
-assert.equal(scheduler.maximumRequestsPerServer, 8);
+assert.equal(scheduler.maximumRequestsPerServer, 12);
 
 const viewer = {
     resolutionScale: 1,
@@ -54,7 +54,7 @@ assert.equal(viewer.resolutionScale, 0.7);
 // then reduce capture slicing from 3 to 2 without going below the 10 Hz floor.
 for (let now = 0; now <= 9000; now += 50) controller.recordFrame(now);
 let metrics = controller.snapshotSince(0);
-assert.equal(metrics.adaptiveResolutionScaleFinal, 0.55);
+assert.equal(metrics.adaptiveResolutionScaleFinal, 0.6);
 assert.equal(metrics.panoramaFacesPerSliceFinal, 2);
 assert.equal(metrics.mainFrameIntervalP95Ms, 50);
 

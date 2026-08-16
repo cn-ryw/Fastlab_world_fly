@@ -16,6 +16,16 @@ controller._buildSettingsUI = () => {};
 controller._updateT8LDisplay = () => {};
 controller._updateHIDDisplay = () => {};
 controller._updateGamepadDisplay = () => {};
+for (const [action, axisIndex] of Object.entries({
+    roll: 0,
+    pitch: 1,
+    throttle: 2,
+    yaw: 3,
+})) {
+    controller.mapping[action].source = 'axis';
+    controller.mapping[action].axisIndex = axisIndex;
+    controller.mapping[action].buttonIndex = -1;
+}
 controller._getHIDAxes = () => new Array(10).fill(0.9);
 controller._getGamepad = () => ({
     id: 'fallback-gamepad', connected: true, axes: new Array(10).fill(0.8), buttons: [],
@@ -63,7 +73,10 @@ assert.equal(modeChanges.at(-1), 'so3', 'T8L Mode high selects SO3');
 
 t8l = { ...t8l, axes: [...t8l.axes.slice(0, 5), -1, ...t8l.axes.slice(6)] };
 controller.update();
-assert.equal(modeChanges.at(-1), 'drone', 'T8L Mode low selects Easy');
+assert.equal(modeChanges.at(-1), 'fpv', 'T8L Mode low selects FPV');
+t8l = { ...t8l, axes: [...t8l.axes.slice(0, 5), 0, ...t8l.axes.slice(6)] };
+controller.update();
+assert.equal(modeChanges.at(-1), 'drone', 'T8L Mode middle selects Easy');
 
 t8l = { ...t8l, fresh: false, ageMs: 251 };
 input = controller.update();

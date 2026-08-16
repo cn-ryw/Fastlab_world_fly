@@ -88,8 +88,8 @@ for (const distance of [3.9, 4.1, 8.9]) {
         `${distance} m must not arrive while disarmed and before any valid trajectory`);
 }
 
-// Crossing the 4 m sphere at speed neither arrives nor cuts away an
-// unexecutable final Poly5 to fly a straight goal chord.
+// Entering the 4 m sphere commits the already-installed final Poly5 even at
+// speed; it does not cut the path or apply an acceleration/endpoint gate.
 {
     const drone = new Drone();
     drone.x = 0; drone.y = 10; drone.z = 0;
@@ -102,15 +102,15 @@ for (const distance of [3.9, 4.1, 8.9]) {
         0.5,
     ), 'high-speed arrival precondition trajectory is accepted');
     drone.update(0.005, { armed: true }, null);
-    assert(drone._idealGoal !== null, 'high-speed 4 m crossing does not arrive');
-    assert(drone.getControlDiagnostics().terminalPhase === 'approach',
-        'high-speed candidate above the 25m/s2 peak remains planner-controlled');
+    assert(drone._idealGoal !== null, 'goal remains active until the final Poly5 ends');
+    assert(drone.getControlDiagnostics().terminalPhase === 'terminal-track',
+        'high-speed 4 m crossing commits the current final Poly5');
     assert(drone._trajectory.active,
         'high-speed terminal proximity does not discard the obstacle-aware path');
 }
 
-// Arrival requires completion of the committed suffix followed by a continuous
-// 0.4 s collision-free stationary dwell at the goal.
+// The committed short Poly5 completes, then arrival enters SO3 hold without an
+// extra stationary dwell or exact-position gate.
 {
     const drone = new Drone();
     drone.x = 0; drone.y = 10; drone.z = 0;
@@ -121,17 +121,15 @@ for (const distance of [3.9, 4.1, 8.9]) {
         [0, 0, 0, 10, 0, 0, 0, 0, 0],
         0.05,
     ), 'settled arrival precondition trajectory is accepted');
-    for (let step = 0; step < 20 && drone._terminalPhase !== 'settling'; step++) {
-        drone.update(0.005, { armed: true }, null);
-    }
-    assert(drone._terminalPhase === 'settling',
-        'safe terminal Poly5 completes before dwell begins');
-    for (let step = 0; step < 79; step++) {
-        drone.update(0.005, { armed: true }, null);
-    }
-    assert(drone._idealGoal !== null, '0.395 s stationary dwell is not yet arrived');
     drone.update(0.005, { armed: true }, null);
-    assert(drone._idealGoal === null, '0.4 s stationary dwell inside 4 m arrives');
+    assert(drone._terminalPhase === 'terminal-track',
+        'arrival radius commits the current short Poly5');
+    for (let step = 0; step < 30 && drone._idealGoal !== null; step++) {
+        drone.update(0.005, { armed: true }, null);
+    }
+    assert(drone._idealGoal === null, 'final Poly5 completion declares arrival without dwell');
+    assert(drone._navigationState === 'arrived' && drone._terminalPhase === 'arrived',
+        'arrival transitions directly into SO3 hold');
 }
 
 {

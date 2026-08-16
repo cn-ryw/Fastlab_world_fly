@@ -32,7 +32,7 @@ import { formatError, reportUserError } from './error-report.js';
 import { erpDirectionToComponent, sampleAnchorDirections } from './erp-geometry.js';
 import { demoPerformance } from './demo-performance.js?v=20260814-adaptive-a1';
 
-const DEFAULT_ION_TOKEN = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJqdGkiOiJlMTg2MGFhOS02YTdhLTQ1NWMtYjkzMi05YjQ2ODRlZjI5YTgiLCJpZCI6MjUxNzM1LCJpYXQiOjE3MzAyODI0ODN9.prWAxx4RB8teelutQQbVqdxhgRZpZ4zjw8wzM-8k1Ug';
+const CESIUM_ION_TOKEN_STORAGE_KEY = 'mindcloud_cesium_ion_token';
 const DEFAULT_ASSET_ID = 2275207;
 const DEFAULT_VIEW = {
     longitude: 114.1690321,
@@ -69,6 +69,14 @@ function urlNumber(name, fallback) {
     if (v == null || v === '') return fallback;
     const n = Number(v);
     return Number.isFinite(n) ? n : fallback;
+}
+
+function storedCesiumIonToken() {
+    try {
+        return globalThis.localStorage?.getItem(CESIUM_ION_TOKEN_STORAGE_KEY)?.trim() || '';
+    } catch (_) {
+        return '';
+    }
 }
 
 function urlString(name, fallback) {
@@ -423,7 +431,7 @@ function rotateXZ(v, radians) {
 export class CesiumWorld {
     constructor(containerId, options = {}) {
         this.containerId = containerId;
-        this.token = options.token || urlString('ionToken', DEFAULT_ION_TOKEN);
+        this.token = options.token || storedCesiumIonToken() || urlString('ionToken', '');
         this.assetId = Number(options.assetId || urlNumber('assetId', DEFAULT_ASSET_ID));
         this.initialView = {
             longitude: urlNumber('lon', options.longitude ?? DEFAULT_VIEW.longitude),
@@ -527,6 +535,11 @@ export class CesiumWorld {
     async init(progressCb = null) {
         const Cesium = requireCesium();
         this.Cesium = Cesium;
+        if (!this.token) {
+            throw new Error(
+                `Cesium Ion token is not configured. Set localStorage key ${CESIUM_ION_TOKEN_STORAGE_KEY} and reload.`
+            );
+        }
         Cesium.Ion.defaultAccessToken = this.token;
 
         demoPerformance.configureCesium(Cesium);

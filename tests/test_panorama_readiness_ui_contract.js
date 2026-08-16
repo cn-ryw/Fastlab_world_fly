@@ -10,13 +10,14 @@ assert.match(main, /RGB READY \$\{capturedFaces\}\/\$\{totalFaces\}/);
 assert.match(main, /RGB CAPTURING \$\{capturedFaces\}\/\$\{totalFaces\}/);
 assert.doesNotMatch(main, /AUTO UNVERIFIED|TILE ERROR|SETTLED/);
 
-// A structured panorama can have a projected canvas while one or more 3D-tile
-// faces are still incomplete. Explicit strict preload must require both facts.
+// A complete captured frame is the hard preload boundary. Tile settling stays
+// diagnostic so a refining Google Tiles queue cannot lock the user out.
 assert.match(
     main,
     /result\?\.ready === true && result\?\.allFacesTileReady === true/,
 );
-assert.match(main, /if \(!framePrimed \|\| \(strictPreload && !sceneTilesReady\)\)/);
+assert.match(main, /if \(!framePrimed \|\| !captureAccepted\)/);
+assert.match(main, /else if \(strictPreload && !sceneTilesReady\)/);
 assert.match(main, /if \(strictPreload\) throw new Error\(message\)/);
 assert.match(main, /signal: preloadController\.signal/);
 assert.match(main, /preloadController\.abort\('panorama-preload-finished-with-error'\)/);

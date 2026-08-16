@@ -42,6 +42,8 @@ MAX_SAFE_GENERATION = 2**53 - 1
 SAFE_RESOLVED_URL_ENUM_QUERY_VALUES = {
     "panoProfile": frozenset(("flight", "calibration")),
     "panoCaptureProfile": frozenset(("flight", "calibration")),
+    "perfProfile": frozenset(("demo30", "baseline")),
+    "dynamicSse": frozenset(("current", "off")),
 }
 SAFE_RESOLVED_URL_NUMERIC_QUERY_KEYS = frozenset((
     "panoCaptureAnyway",
@@ -83,6 +85,7 @@ SAFE_RESOLVED_URL_NUMERIC_QUERY_KEYS = frozenset((
     "flightPreloadViewTimeoutMs",
     "flightPreloadViewAttempts",
     "flightPreloadStrict",
+    "tileRequestsPerServer",
 ))
 SAFE_RESOLVED_URL_QUERY_KEYS = frozenset(SAFE_RESOLVED_URL_ENUM_QUERY_VALUES) \
     | SAFE_RESOLVED_URL_NUMERIC_QUERY_KEYS

@@ -433,9 +433,9 @@ function readySo3Drone(endpoint = SO3_ENDPOINT, duration = 1.125) {
     return drone;
 }
 
-// A planner response is fitted in the frozen capture state, then sampled at
-// the remaining suffix when it reaches the controller. A dynamically
-// consistent apply state accepts the absolute endpoint without translating it.
+// Capture age is a freshness gate only. Like upstream plan_from_reference=false,
+// each accepted response installs a full-duration Poly5 from the measured
+// apply-time state instead of fast-forwarding a frozen capture-time suffix.
 {
     const drone = new Drone();
     drone.flightMode = 'so3';
@@ -463,32 +463,33 @@ function readySo3Drone(endpoint = SO3_ENDPOINT, duration = 1.125) {
         },
     );
     assert(accepted, 'capture-time aligned trajectory is accepted');
-    near(drone._trajectory.time, 0.25, 1e-12,
-        'capture-to-apply age fast-forwards the tracker');
+    near(drone._trajectory.time, 0, 1e-12,
+        'capture-to-apply age does not fast-forward the fresh tracker');
     near(drone._trajectory.lastReference.x, 0.25, 1e-12,
         'first reference samples the original Poly5 at apply age');
     near(drone._trajectory.referenceAt(1).x, 1, 1e-12,
         'apply-time vehicle motion does not translate the planner endpoint');
     drone.update(DT, input(), null);
     const diagnostics = drone.getControlDiagnostics();
-    near(diagnostics.createdSimTime, 0.75, 1e-12,
-        'trajectory creation time remains in the capture simulation domain');
-    near(diagnostics.expirySimTime, 1.75, 1e-12,
-        'trajectory expiry remains capture time plus original duration');
-    near(diagnostics.trajectoryOriginalAgeS, 0.25, 1e-12,
-        'diagnostics retain the original capture-to-apply age');
-    near(diagnostics.trackerAgeS, 0.255, 1e-12,
-        'diagnostics expose the current original-domain tracker age');
-    near(diagnostics.trajectoryRemainingS, 0.745, 1e-12,
-        'diagnostics expose the executable suffix duration');
+    near(diagnostics.createdSimTime, 1, 1e-12,
+        'trajectory creation time uses the apply simulation domain');
+    near(diagnostics.expirySimTime, 2, 1e-12,
+        'trajectory receives its full duration from apply time');
+    near(diagnostics.trajectoryOriginalAgeS, 0, 1e-12,
+        'the installed polynomial starts at age zero');
+    near(diagnostics.trackerAgeS, 0.005, 1e-12,
+        'diagnostics expose the fresh tracker age');
+    near(diagnostics.trajectoryRemainingS, 0.995, 1e-12,
+        'diagnostics expose the full-duration remainder');
     near(diagnostics.trajectoryApplyPositionErrorM, 0, 1e-12,
         'diagnostics expose apply position consistency error');
     near(diagnostics.trajectoryApplyVelocityErrorMps, 0, 1e-12,
         'diagnostics expose apply velocity consistency error');
     near(diagnostics.poly5PeakSpeedMps, 1, 1e-12,
         'diagnostics expose the validated Poly5 peak speed');
-    near(diagnostics.poly5PeakAccelerationMps2, 0, 1e-12,
-        'diagnostics expose the validated Poly5 peak acceleration');
+    assert(Number.isFinite(diagnostics.poly5PeakAccelerationMps2)
+        && diagnostics.poly5PeakAccelerationMps2 > 0,
+    'diagnostics expose the apply-time fitted Poly5 peak acceleration');
     assert(diagnostics.planningFrameId === 314
         && diagnostics.planningRequestId === 'request-314'
         && diagnostics.selectedCandidateId === 6,
@@ -504,16 +505,15 @@ function readySo3Drone(endpoint = SO3_ENDPOINT, duration = 1.125) {
     'force projection diagnostics expose the logger-compatible alias');
 }
 
-// A suffix whose skipped prefix was not actually flown is rejected atomically;
-// an older valid command remains active until its own envelope ends.
+// Rolling replans intentionally do not use a position/velocity suffix gate.
+// A fresh response replaces the old command from the current measured state.
 {
     const drone = readySo3Drone([0, 0, 0, 2, 0, 0, 0, 0, 0], 1);
-    const previousTracker = drone._trajectory;
-    const previousTime = previousTracker.time;
+    const previousContext = drone._trajectory.context;
     drone._simTimeS = 1;
     drone.x = 4;
     drone.vx = 3;
-    assert(!drone.setYopoTrajectory(
+    assert(drone.setYopoTrajectory(
         [1, 1, 0, 2, 0, 0, 0, 0, 0],
         1,
         {
@@ -523,13 +523,15 @@ function readySo3Drone(endpoint = SO3_ENDPOINT, duration = 1.125) {
                 velocity: { x: 1, y: 0, z: 0 },
             },
         },
-    ), 'apply state outside the 1.2m suffix envelope is rejected');
-    assert(drone._trajectory === previousTracker && drone._trajectory.active,
-        'rejected suffix does not destroy the older valid trajectory');
-    near(drone._trajectory.time, previousTime, 1e-12,
-        'atomic suffix rejection does not advance or rewind the old tracker');
+    ), 'fresh candidate is accepted without a suffix continuity gate');
+    assert(drone._trajectory.context !== previousContext && drone._trajectory.active,
+        'fresh candidate replaces the older command');
+    near(drone._trajectory.lastReference.x, 4, 1e-12,
+        'replacement starts from the measured apply position');
+    near(drone._trajectory.lastReference.vx, 3, 1e-12,
+        'replacement starts from the measured apply velocity');
     assert(!drone.consumeReplanRequest(),
-        'suffix mismatch relies on rolling cadence while an older command remains valid');
+        'accepted rolling replacement does not request an epoch-changing replan');
 }
 
 // Deadline rollback is compare-and-clear: it removes exactly the command that
@@ -677,8 +679,8 @@ function readySo3Drone(endpoint = SO3_ENDPOINT, duration = 1.125) {
         },
     );
     assert(accepted, 'wall-clock age is accepted when capture simulation time is unavailable');
-    near(drone._trajectory.time, 0.25, 1e-12,
-        'wall-clock fallback fast-forwards the same original polynomial');
+    near(drone._trajectory.time, 0, 1e-12,
+        'wall-clock fallback remains a freshness gate without fast-forwarding');
 }
 
 {
@@ -721,34 +723,8 @@ function readySo3Drone(endpoint = SO3_ENDPOINT, duration = 1.125) {
         'an elapsed capture-time trajectory never reaches DIRECT_ACCELERATION');
 }
 
-// Being close to the goal is insufficient if the active planner endpoint is
-// still on a lateral avoidance leg. This prevents terminal hold from cutting a
-// straight 18 m chord through a final obstacle.
-{
-    const drone = new Drone();
-    drone.flightMode = 'so3';
-    drone.update(DT, input(), null);
-    drone.x = 14.1;
-    drone.vx = 15;
-    drone.setIdealGoal({ x: 18, y: 2, z: 0 });
-    assert(drone.setYopoTrajectory(
-        [30.975, 15, 0, 2, 0, 0, 0, 0, 0],
-        1.125,
-    ), 'near-goal lateral-leg trajectory is accepted');
-    drone.update(DT, input(), null);
-    assert(drone._terminalPhase === 'approach' && drone._trajectory.active,
-        'endpoint outside the goal sphere keeps YOPO in control');
-    assert(drone._idealGoal !== null && drone._navigationState !== 'arrived',
-        'crossing inside 4m at high speed is never declared arrived');
-    assert(drone.getControlDiagnostics().goalReached === true,
-        'the valid high-speed crossing is logged as goal-reached separately from settled arrival');
-    assert(drone.getControlDiagnostics().terminalTrajectoryEligible === false,
-        'diagnostics identify a non-terminal active endpoint');
-}
-
-// A high-speed candidate is not allowed to turn endpoint proximity into a
-// straight-line goal hold. The complete acceleration peak must be executable by
-// the 25m/s2 direct controller before terminal ownership is allowed.
+// Fixed-goal completion is a measured 4 m radius event. It does not depend on
+// candidate endpoint proximity, speed, or a fitted Poly5 acceleration gate.
 {
     const drone = new Drone();
     drone.flightMode = 'so3';
@@ -759,192 +735,28 @@ function readySo3Drone(endpoint = SO3_ENDPOINT, duration = 1.125) {
     assert(drone.setYopoTrajectory(
         [16, 0, -20, 2, 0, 0, 0, 0, 0],
         0.5,
-    ), '15m/s terminal-eligible trajectory is accepted');
-    drone.update(DT, input(), null);
-    assert(drone._terminalPhase === 'approach',
-        `high-acceleration endpoint stays in approach, got ${drone._terminalPhase}`);
-    assert(drone._idealGoal !== null && drone._navigationState !== 'arrived',
-        'high-speed goal-sphere crossing is not declared arrived');
-    assert(drone.vx > 14,
-        `terminal transition preserves physical velocity continuity, vx=${drone.vx}`);
-    assert(drone._trajectory.active,
-        'controller does not cut away the obstacle-aware Poly5 merely because its endpoint is near goal');
-    near(drone._terminalEndpointGoalDistanceM, 2, 1e-12,
-        'terminal eligibility uses the absolute endpoint-to-goal distance');
-    assert(!drone.getControlDiagnostics().terminalTrajectoryEligible,
-        'diagnostics expose that the >25m/s2 candidate is not terminal-committable');
-}
-
-// Cruise-speed terminal states do not need the network to synthesize a
-// near-zero endpoint. The obstacle-aware Poly5 is executed in full, then a
-// bounded zero-speed hold brakes along its terminal tangent around the actual
-// endpoint. Here the goal is still ahead when braking begins, so a negative X
-// command proves that the controller is not switching to a direct goal chord.
-{
-    const drone = new Drone();
-    drone.flightMode = 'so3';
-    drone.update(DT, input(), null);
-    drone.x = 0;
-    drone.vx = 10;
-    drone.setIdealGoal({ x: 10, y: 2, z: 0 });
-    assert(drone.setYopoTrajectory(
-        [10, 10, 0, 2, 0, 0, 0, 0, 0],
-        1,
-        { generation: 41, frameId: 410, requestId: 'terminal-10mps' },
-    ), '10m/s constant-velocity terminal candidate is accepted');
+        { generation: 41, frameId: 410, requestId: 'terminal-radius' },
+    ), 'high-acceleration final trajectory remains valid in simulation');
+    const committedPolyX = drone._yopoPolyX;
     drone.update(DT, input(), null);
     assert(drone._terminalPhase === 'terminal-track' && drone._trajectory.active,
-        '10m/s candidate freezes the complete obstacle-aware suffix');
-    const committedTracker = drone._trajectory;
-    let suffixStayedIntact = true;
-    for (let step = 0; step < 250 && drone._terminalPhase === 'terminal-track'; step++) {
-        suffixStayedIntact = suffixStayedIntact
-            && drone._trajectory === committedTracker
-            && drone._trajectory.active;
-        drone.update(DT, input(), null);
-    }
-    assert(suffixStayedIntact,
-        'runtime terminal deceleration never truncates the active Poly5');
-    assert(drone._terminalPhase === 'terminal-decelerating' && !drone._trajectory.active,
-        'terminal deceleration starts only after the complete Poly5 expires');
-    assert(drone._terminalDecelerationAnchor.x < 10,
-        'deceleration anchor is the actual path endpoint, not the goal');
-    const firstBrakeDiagnostics = drone.getControlDiagnostics();
-    assert(firstBrakeDiagnostics.source === 'terminal-deceleration'
-        && firstBrakeDiagnostics.rawAcceleration.x < 0,
-    'with the goal ahead, terminal acceleration still opposes the positive terminal velocity');
-    assert(firstBrakeDiagnostics.terminalBrakeDistanceM > 4
-        && firstBrakeDiagnostics.terminalPredictedStopGoalDistanceM < 5,
-    'diagnostics expose the bounded tangent stopping envelope');
-
-    let maximumDecelerationGoalDistanceM = 0;
-    let sawSettling = false;
-    for (let step = 0; step < 800 && drone._navigationState !== 'arrived'; step++) {
-        if (drone._terminalPhase === 'terminal-decelerating') {
-            maximumDecelerationGoalDistanceM = Math.max(
-                maximumDecelerationGoalDistanceM,
-                Math.hypot(drone.x - 10, drone.y - 2, drone.z),
-            );
-        }
-        if (drone._terminalPhase === 'settling') sawSettling = true;
-        drone.update(DT, input(), null);
-    }
-    assert(sawSettling && drone._navigationState === 'arrived',
-        '10m/s terminal candidate decelerates, settles and arrives without a new network stop state');
-    assert(maximumDecelerationGoalDistanceM < 5,
-        `10m/s tangent brake remains inside recovery envelope, max=${maximumDecelerationGoalDistanceM}`);
-    assert(Math.hypot(drone.vx, drone.vy, drone.vz) <= 0.75 + 1e-9,
-        'arrival still enforces the original 0.75m/s 3-D settle speed');
-    assert(!drone.consumeReplanRequest(),
-        'successful runtime terminal deceleration does not spuriously request replanning');
-}
-
-// Endpoint proximity alone is not enough for a high-speed terminal commit. An
-// outward terminal tangent whose conservative stop point leaves the 5m local
-// envelope remains planner-owned and will expire into hold+replan instead.
-{
-    const drone = new Drone();
-    drone.flightMode = 'so3';
-    drone.update(DT, input(), null);
-    drone.x = 3.9;
-    drone.vx = 10;
-    drone.setIdealGoal({ x: 10, y: 2, z: 0 });
-    assert(drone.setYopoTrajectory(
-        [13.9, 10, 0, 2, 0, 0, 0, 0, 0],
-        1,
-    ), 'outward high-speed endpoint remains a valid non-terminal Poly5');
-    drone.update(DT, input(), null);
-    const diagnostics = drone.getControlDiagnostics();
-    assert(drone._terminalPhase === 'approach' && drone._trajectory.active,
-        'unsafe predicted stop point cannot seize terminal ownership');
-    assert(!diagnostics.terminalTrajectoryEligible
-        && diagnostics.terminalPredictedStopGoalDistanceM > 5,
-    'diagnostics explain outward tangent rejection by its stop envelope');
-}
-
-// A safe terminal candidate is frozen, executed through its complete remaining
-// Poly5, then settles at the actual endpoint rather than cutting to the goal.
-{
-    const drone = new Drone();
-    drone.flightMode = 'so3';
-    drone.update(DT, input(), null);
-    drone.x = 0;
-    drone.vx = 1;
-    drone.setIdealGoal({ x: 3.5, y: 2, z: 0 });
-    assert(drone.setYopoTrajectory(
-        [1, 1, 0, 2, 0, 0, 0, 0, 0],
-        1,
-    ), 'constant-velocity terminal candidate is accepted');
-    drone.update(DT, input(), null);
-    assert(drone._terminalPhase === 'terminal-track' && drone._trajectory.active,
-        'safe endpoint commits terminal-track without clearing the Poly5');
-    const committedTracker = drone._trajectory;
+        'entering the 4 m radius commits the current Poly5 at any speed');
+    assert(drone._goalReached && drone._idealGoal !== null,
+        'radius entry is recorded while the committed short trajectory finishes');
     const intake = drone.getYopoTrajectoryIntakeDisposition();
     assert(intake.outcome === 'ignored' && intake.reason === 'terminal-committed',
-        'a committed terminal suffix tells the perception loop to pause rolling replans');
+        'terminal commit pauses later rolling responses');
     assert(!drone.setYopoTrajectory(
-        [2, 1, 0, 2, 0, 0, 0, 0, 0],
-        1,
-    ), 'later replacement is rejected while the terminal suffix is committed');
-    assert(drone._trajectory === committedTracker && drone._trajectory.active,
-        'rejected replacement cannot splice the committed terminal path');
-    for (let step = 0; step < 250 && drone._terminalPhase === 'terminal-track'; step++) {
-        drone.update(DT, input(), null);
-    }
-    assert(drone._terminalPhase === 'settling' && !drone._trajectory.active,
-        'terminal Poly5 expiry transitions to current-position settling');
-    near(drone._so3Hold.x, drone.x, 0.01,
-        'settling hold is latched at the actual endpoint before the first braking integration step');
-    assert(Math.abs(drone._so3Hold.x - 3.5) > 1,
-        'terminal settling never creates a long straight chord to the exact goal');
-    const terminalDiagnostics = drone.getControlDiagnostics();
-    assert(terminalDiagnostics.terminalTrajectoryEligible
-        && Number.isFinite(terminalDiagnostics.trajectoryApplyPositionErrorM),
-    'settling diagnostics retain the frozen terminal candidate identity and suffix error');
-    assert(drone.getYopoTrajectoryIntakeDisposition().outcome === 'ignored',
-        'settling continues to suppress responses which cannot safely own motion');
+        [17, 0, 0, 2, 0, 0, 0, 0, 0],
+        0.5,
+    ), 'later response cannot splice the committed final Poly5');
+    assert(drone._yopoPolyX === committedPolyX && drone._trajectory.active,
+        'rejected replacement leaves the committed final Poly5 intact');
 }
 
-// A rolling candidate that fails apply-time continuity must not invalidate a
-// still-live old command or trigger an epoch-abort/replan loop. Normal capture
-// cadence gets another chance; expiry/fault handling remains the authority for
-// requesting an immediate replacement.
-{
-    const drone = new Drone();
-    drone.flightMode = 'so3';
-    drone.update(DT, input(), null);
-    drone.setIdealGoal({ x: 100, y: 2, z: 0 });
-    assert(drone.setYopoTrajectory(
-        [10, 10, 0, 2, 0, 0, 0, 0, 0],
-        1,
-        { generation: 51, frameId: 510, requestId: 'active-old' },
-    ), 'continuity-rejection precondition installs the old trajectory');
-    const activeTracker = drone._trajectory;
-    drone.vx = -10;
-    assert(!drone.setYopoTrajectory(
-        [-10, -10, 0, 2, 0, 0, 0, 0, 0],
-        1,
-        {
-            generation: 51,
-            frameId: 511,
-            requestId: 'inconsistent-new',
-            captureActualState: {
-                position: { x: drone.x, y: drone.y, z: drone.z },
-                velocity: { x: 10, y: 0, z: 0 },
-            },
-            planningAgeS: 0,
-        },
-    ), 'apply-time velocity mismatch rejects only the new candidate');
-    assert(drone._trajectory === activeTracker && drone._trajectory.active,
-        'continuity rejection preserves the live old command');
-    assert(!drone.consumeReplanRequest(),
-        'continuity rejection does not request an epoch-changing immediate replan');
-    assert(drone.getYopoTrajectoryIntakeDisposition().outcome === 'accept',
-        'ordinary rolling planning remains enabled after preserving the old command');
-}
-
-// Arrival requires the full terminal suffix plus 0.4 s continuously inside
-// both the position/speed envelopes. A new goal resets the terminal state.
+// Once the committed short segment expires, arrival immediately latches the
+// measured endpoint as an SO3 hold. No exact-position or stationary dwell gate
+// is inserted after the radius event.
 {
     const drone = new Drone();
     drone.flightMode = 'so3';
@@ -953,36 +765,37 @@ function readySo3Drone(endpoint = SO3_ENDPOINT, duration = 1.125) {
     assert(drone.setYopoTrajectory(
         [0, 0, 0, 2, 0, 0, 0, 0, 0],
         0.05,
-    ), 'stationary terminal trajectory is accepted');
-    for (let step = 0; step < 20 && drone._terminalPhase !== 'settling'; step++) {
+    ), 'stationary final trajectory is accepted');
+    drone.update(DT, input(), null);
+    assert(drone._terminalPhase === 'terminal-track' && drone._trajectory.active,
+        'radius entry preserves the active final Poly5');
+    for (let step = 0; step < 30 && drone._navigationState !== 'arrived'; step++) {
         drone.update(DT, input(), null);
     }
-    assert(drone._terminalPhase === 'settling',
-        'stationary terminal suffix reaches settling within its 0.05s envelope');
-    runSteps(drone, 0.395, input());
-    assert(drone._idealGoal !== null && drone._terminalPhase === 'settling',
-        '0.395s collision-free settled dwell is not yet arrival');
-    drone.update(DT, input(), null);
-    assert(drone._idealGoal === null && drone._navigationState === 'arrived',
-        '0.4s continuously settled inside 4m declares arrival');
-    near(drone._so3Hold.x, 0, 1e-12,
-        'settled arrival retains the latched actual endpoint hold');
+    assert(drone._navigationState === 'arrived' && drone._terminalPhase === 'arrived',
+        'Poly5 expiry completes the mission without an additional dwell');
+    assert(drone._idealGoal === null && !drone._trajectory.active,
+        'arrival clears the goal and stops planning');
+    near(drone._so3Hold.x, drone.x, 1e-12,
+        'arrival hold is latched at the measured endpoint');
+    assert(!drone.consumeReplanRequest(),
+        'successful arrival does not request another plan');
 
     const before = [drone.x, drone.y, drone.z, drone.vx, drone.vy, drone.vz];
     drone.setIdealGoal({ x: 10, y: 2, z: 0 });
-    assert(drone._terminalPhase === 'approach' && drone._terminalSettledTimeS === 0,
-        'new goal resets terminal phase and dwell');
+    assert(drone._terminalPhase === 'approach' && drone._navigationState === 'active',
+        'a new goal restarts planning after arrival');
     assert(JSON.stringify(before) === JSON.stringify([
         drone.x, drone.y, drone.z, drone.vx, drone.vy, drone.vz,
     ]), 'new goal does not mutate physical position or velocity');
     assert(drone.setYopoTrajectory(
         [5, 5, 0, 2, 0, 0, 0, 0, 0],
         1,
-    ), 'new goal accepts a fresh trajectory after settled arrival');
+    ), 'new goal accepts a fresh trajectory');
 }
 
-// Collision and overrun abort terminal ownership, hold the current pose and
-// allow a fresh planner response to take control again.
+// Collision remains authoritative while the final Poly5 owns motion: it aborts
+// terminal ownership, clears the command, holds safely, and requests replanning.
 {
     const drone = new Drone();
     drone.flightMode = 'so3';
@@ -1003,131 +816,9 @@ function readySo3Drone(endpoint = SO3_ENDPOINT, duration = 1.125) {
         },
     });
     assert(drone._terminalPhase === 'approach' && !drone._trajectory.active,
-        'collision exits terminal ownership and clears the committed suffix');
-    assert(drone.consumeReplanRequest(), 'terminal collision requests a fresh planning frame');
-    const duration = 1;
-    assert(drone.setYopoTrajectory([
-        drone.x + drone.vx * duration, drone.vx, 0,
-        drone.y + drone.vy * duration, drone.vy, 0,
-        drone.z + drone.vz * duration, drone.vz, 0,
-    ], duration), 'fresh post-collision trajectory can take control again');
-
-    drone._terminalPhase = 'terminal-track';
-    drone._terminalTrajectoryEligible = true;
-    drone.handleControlOverrun({ droppedSeconds: 0.2, acceptedSeconds: 0.1 });
-    assert(drone._terminalPhase === 'approach' && !drone._trajectory.active,
-        'control overrun exits terminal ownership');
-    assert(drone.consumeReplanRequest(), 'terminal overrun requests replanning');
-}
-
-// Faults during the runtime deceleration phase have the same fail-closed and
-// recoverable semantics as faults during the committed Poly5 suffix.
-{
-    const makeDeceleratingDrone = label => {
-        const drone = new Drone();
-        drone.flightMode = 'so3';
-        drone.update(DT, input(), null);
-        drone.x = -2;
-        drone.vx = 10;
-        drone.setIdealGoal({ x: 10, y: 2, z: 0 });
-        assert(drone.setYopoTrajectory(
-            [8, 10, 0, 2, 0, 0, 0, 0, 0],
-            1,
-            { generation: 42, requestId: label },
-        ), `${label} deceleration fault precondition trajectory is accepted`);
-        for (let step = 0; step < 250 && drone._terminalPhase !== 'terminal-decelerating'; step++) {
-            drone.update(DT, input(), null);
-        }
-        assert(drone._terminalPhase === 'terminal-decelerating',
-            `${label} fault occurs during runtime terminal deceleration`);
-        return drone;
-    };
-
-    const colliding = makeDeceleratingDrone('collision');
-    let collisionQueries = 0;
-    colliding.update(DT, input(), {
-        queryCollisionResponse() {
-            if (collisionQueries++ > 0) return null;
-            return { penetration: 0.1, normal: { x: -1, y: 0, z: 0 }, source: 'overlap' };
-        },
-    });
-    assert(colliding._terminalPhase === 'approach'
-        && colliding.consumeReplanRequest(),
-    'deceleration collision exits terminal ownership and requests replanning');
-    assert(colliding.setYopoTrajectory([
-        colliding.x + colliding.vx, colliding.vx, 0,
-        colliding.y + colliding.vy, colliding.vy, 0,
-        colliding.z + colliding.vz, colliding.vz, 0,
-    ], 1, { generation: 42, requestId: 'collision-recovery' }),
-    'fresh plan is accepted after a terminal-deceleration collision');
-
-    const overrun = makeDeceleratingDrone('overrun');
-    overrun.handleControlOverrun({ droppedSeconds: 0.2, acceptedSeconds: 0.1 });
-    assert(overrun._terminalPhase === 'approach' && !overrun._trajectory.active,
-        'deceleration overrun exits terminal ownership and clears its hold authority');
-    assert(overrun.consumeReplanRequest(),
-        'deceleration overrun requests a fresh planning frame');
-
-    const timeout = makeDeceleratingDrone('timeout');
-    timeout._terminalDecelerationElapsedS = 2.5;
-    timeout.update(DT, input(), null);
-    assert(timeout._terminalPhase === 'approach' && timeout.consumeReplanRequest(),
-        'bounded deceleration timeout prevents permanent terminal ownership');
-}
-
-// A collision on the exact sample that would complete the dwell must win over
-// arrival; drifting beyond the 5m hysteresis envelope also returns to planning.
-{
-    const makeSettlingDrone = () => {
-        const drone = new Drone();
-        drone.flightMode = 'so3';
-        drone.update(DT, input(), null);
-        drone.setIdealGoal({ x: 0, y: 2, z: 0 });
-        assert(drone.setYopoTrajectory(
-            [0, 0, 0, 2, 0, 0, 0, 0, 0],
-            0.05,
-        ), 'settling fault precondition trajectory is accepted');
-        for (let step = 0; step < 20 && drone._terminalPhase !== 'settling'; step++) {
-            drone.update(DT, input(), null);
-        }
-        return drone;
-    };
-
-    const colliding = makeSettlingDrone();
-    runSteps(colliding, 0.395, input());
-    let queries = 0;
-    colliding.update(DT, input(), {
-        queryCollisionResponse() {
-            if (queries++ > 0) return null;
-            return { penetration: 0.1, normal: { x: 1, y: 0, z: 0 }, source: 'overlap' };
-        },
-    });
-    assert(colliding._navigationState !== 'arrived' && colliding._idealGoal !== null,
-        'same-sample collision prevents pending terminal arrival');
-    assert(colliding._terminalPhase === 'approach' && colliding.consumeReplanRequest(),
-        'settling collision exits to approach and requests replanning');
-
-    const outside = makeSettlingDrone();
-    outside.x = 5.01;
-    outside.update(DT, input(), null);
-    assert(outside._terminalPhase === 'approach' && outside._idealGoal !== null,
-        'settling beyond the 5m hysteresis envelope returns to approach');
-    assert(outside.consumeReplanRequest(), 'out-of-envelope settling requests replanning');
-
-    const invalid = new Drone();
-    invalid.flightMode = 'so3';
-    invalid.update(DT, input(), null);
-    invalid.setIdealGoal({ x: 0, y: 2, z: 0 });
-    assert(invalid.setYopoTrajectory(
-        [0, 0, 0, 2, 0, 0, 0, 0, 0],
-        1,
-    ), 'non-finite terminal precondition trajectory is accepted');
-    invalid.update(DT, input(), null);
-    assert(invalid._terminalPhase === 'terminal-track' && invalid._trajectory.active,
-        'non-finite terminal precondition commits an active suffix');
-    invalid.update(DT, input({ pitch: NaN }), null);
-    assert(invalid._terminalPhase === 'approach' && invalid.consumeReplanRequest(),
-        'non-finite command exits terminal ownership and requests replanning');
+        'collision exits terminal ownership and clears the final Poly5');
+    assert(drone.consumeReplanRequest(),
+        'terminal collision requests a fresh planning frame');
 }
 
 {
@@ -1250,21 +941,17 @@ function readySo3Drone(endpoint = SO3_ENDPOINT, duration = 1.125) {
         { generation: 43, frameId: 430, requestId: 'terminal-endpoint-boundary' },
     ), 'terminal endpoint-boundary trajectory is accepted');
 
-    let directSamples = 0;
     for (let step = 0; step < 10; step++) {
         drone.update(DT, input(), null);
-        if (drone.getControlDiagnostics().commandType === ControlCommandType.DIRECT_ACCELERATION) {
-            directSamples++;
-        }
     }
-    assert(directSamples === 10 && drone._terminalPhase === 'terminal-track',
-        'terminal-track executes the complete ten-sample suffix before transitioning');
     assert(Math.abs(drone.x - 4.045) < 4,
         'the final Poly5 sample advances the physical state inside the 4m terminal boundary');
 
-    drone.update(DT, input(), null);
-    assert(drone._terminalPhase === 'settling',
-        'the first post-endpoint step settles instead of reporting terminal-track-missed');
+    // Terminal logic observes the post-physics radius crossing at the next
+    // fixed-step boundary, then expiry transitions directly to arrival hold.
+    if (drone._terminalPhase !== 'arrived') drone.update(DT, input(), null);
+    assert(drone._terminalPhase === 'arrived' && drone._navigationState === 'arrived',
+        'the endpoint boundary transitions directly to arrival hold');
     assert(!drone.consumeReplanRequest(),
         'a boundary reached by the final authorized sample does not spuriously replan');
 }
@@ -1391,24 +1078,11 @@ function readySo3Drone(endpoint = SO3_ENDPOINT, duration = 1.125) {
         'SO3 yaw lock persists across trajectory replacement');
 
     yawLockEnabled = false;
-    let maximumYawAcceleration = 0;
-    let maximumYawRate = 0;
-    let previousYawRate = drone._so3YawRateSetpointDeg;
-    runSteps(drone, 0.8, input({ yaw: -1 }), null, state => {
-        const yawRate = state._so3YawRateSetpointDeg;
-        maximumYawAcceleration = Math.max(
-            maximumYawAcceleration,
-            Math.abs(yawRate - previousYawRate) / DT,
-        );
-        maximumYawRate = Math.max(maximumYawRate, Math.abs(yawRate));
-        previousYawRate = yawRate;
-    });
-    assert(maximumYawAcceleration <= 20 + 1e-9,
-        `unlocked SO3 yaw acceleration ${maximumYawAcceleration}°/s² must be <=20`);
-    assert(maximumYawRate <= 60 + 1e-9,
-        `unlocked SO3 yaw rate ${maximumYawRate}°/s must be <=60`);
-    assert(Math.abs(drone._wrapDegrees(drone._so3YawSetpointDeg - lockedYaw)) > 1,
-        'unlocked SO3 yaw turns toward horizontal reference velocity');
+    runSteps(drone, 0.8, input({ yaw: -1 }));
+    near(drone._so3YawSetpointDeg, lockedYaw, 1e-9,
+        'SO3 keeps its first-frame world yaw even when the legacy UI toggle is off');
+    near(drone._so3YawRateSetpointDeg, 0, 1e-9,
+        'SO3 fixed-yaw mode keeps a zero yaw-rate setpoint');
     yawLockEnabled = true;
 }
 
