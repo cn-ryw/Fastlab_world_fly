@@ -137,6 +137,9 @@ export class HUD {
         const targetSpeed = Number.isFinite(drone.targetGroundSpeed)
             ? drone.targetGroundSpeed
             : (Number.isFinite(drone.commandedGroundSpeed) ? drone.commandedGroundSpeed : 0);
+        const so3ReferenceSpeed = Number.isFinite(drone.commandedGroundSpeed)
+            ? drone.commandedGroundSpeed
+            : 0;
         const pilotCommandSpeed = Number.isFinite(drone.pilotGroundSpeedCommand)
             ? drone.pilotGroundSpeedCommand
             : targetSpeed;
@@ -150,6 +153,10 @@ export class HUD {
                 this.speedCommandEl.innerHTML =
                     `${targetSpeed.toFixed(1)} / ${effectiveMaxSpeed.toFixed(1)}<br>` +
                     `<span class="hud-kmh">${Math.round(targetSpeed * 3.6)} / ${Math.round(effectiveMaxSpeed * 3.6)} km/h</span>`;
+            } else if (drone.flightMode === 'so3') {
+                this.speedCommandEl.innerHTML =
+                    `${groundSpeed.toFixed(1)} ACT / ${so3ReferenceSpeed.toFixed(1)} REF<br>` +
+                    `<span class="hud-kmh">${Math.round(groundSpeed * 3.6)} / ${Math.round(so3ReferenceSpeed * 3.6)} km/h</span>`;
             } else {
                 const throttlePct = Number.isFinite(drone.throttlePercent) ? Math.round(drone.throttlePercent * 100) : 0;
                 this.speedCommandEl.innerHTML =
@@ -158,7 +165,13 @@ export class HUD {
             }
         }
         if (this.speedCommandLabelEl) {
-            this.speedCommandLabelEl.textContent = drone.flightMode === 'drone' ? 'TGT / LIM (m/s)' : 'AIR SPD / THR';
+            const labels = {
+                drone: 'TGT / LIM (m/s)',
+                fpv: 'AIR SPD / THR',
+                stabilized: 'AIR SPD / THR',
+                so3: 'ACT / POLY5 REF (m/s)',
+            };
+            this.speedCommandLabelEl.textContent = labels[drone.flightMode] || 'FAILSAFE';
         }
         if (this.speedHintEl) {
             let hint = '';
@@ -170,8 +183,19 @@ export class HUD {
                 } else if (drone.boostActive) {
                     hint = effectiveMaxSpeed >= 83 ? 'Boost active; speed is capped at 300 km/h.' : 'Boost active';
                 }
-            } else if (groundSpeed < 2.0 && (drone.throttlePercent || 0) > 0.65) {
-                hint = 'FPV needs nose-down pitch to turn thrust into forward speed.';
+            } else if (drone.flightMode === 'fpv') {
+                if (groundSpeed < 2.0 && (drone.throttlePercent || 0) > 0.65) {
+                    hint = 'FPV needs nose-down pitch to turn thrust into forward speed.';
+                }
+            } else if (drone.flightMode === 'stabilized') {
+                hint = 'Level: roll/pitch self-level; W/S is manual thrust—pilot holds altitude.';
+            } else if (drone.flightMode === 'so3') {
+                const nominalCruise = Number.isFinite(drone.so3CruiseMps)
+                    ? drone.so3CruiseMps
+                    : 15;
+                hint = `SO3 YOPO Auto: Cruise-${nominalCruise.toFixed(0)} is policy context, not a speed setpoint.`;
+            } else {
+                hint = 'Invalid flight mode: controller is in failsafe.';
             }
             this.speedHintEl.textContent = hint;
         }

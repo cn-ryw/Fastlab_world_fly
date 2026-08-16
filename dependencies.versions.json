@@ -1,0 +1,73 @@
+{
+  "schema_version": 1,
+  "purpose": "Human-readable runtime dependency versions and local paths (no content hashes)",
+  "runtime_dependencies": {
+    "cesium": {
+      "version": "1.117",
+      "local_path": "third_party/Cesium",
+      "entrypoint": "third_party/Cesium/Cesium.js",
+      "source": "https://cesium.com/downloads/cesiumjs/releases/1.117/Build/Cesium/"
+    },
+    "playcanvas": {
+      "version": "2.17.2",
+      "revision": "2892d5e",
+      "local_path": "asset/vendor/playcanvas.min.js",
+      "source": "https://cdn.jsdelivr.net/npm/playcanvas@2.17.2/build/playcanvas.min.js"
+    },
+    "da360": {
+      "repository": "https://github.com/Insta360-Research-Team/DA360.git",
+      "branch": "main",
+      "local_path": "third_party/DA360",
+      "required_files": [
+        "networks/__init__.py",
+        "networks/da360.py",
+        "depth_anything_v2/dpt.py"
+      ]
+    },
+    "yopo": {
+      "repository": "https://github.com/zwhhhhh9/YOPO_360.git",
+      "source_branch": "feat/x5-cruise15-release",
+      "source_path": "/home/ykx/ros1/YOPO_360_v15",
+      "local_path": "third_party/YOPO",
+      "base_config": "third_party/YOPO/config/traj_opt.yaml",
+      "profile": "third_party/YOPO/config/x5_cruise15_18m_a12_mask_wc3.yaml",
+      "required_files": [
+        "policy/yopo_network.py",
+        "policy/state_transform.py",
+        "policy/poly_solver.py",
+        "config/config.py"
+      ]
+    },
+    "wheels": [
+      "third_party/wheels/flask_cors-6.0.5-py3-none-any.whl",
+      "third_party/wheels/timm-1.0.28-py3-none-any.whl"
+    ]
+  },
+  "model_checkpoints": {
+    "da360": {
+      "name": "DA360_large.pth",
+      "default_host_path": "third_party/DA360/checkpoints/DA360_large.pth"
+    },
+    "yopo": {
+      "name": "epoch10.pth",
+      "default_host_path": "/home/ykx/ros1/YOPO_360_v15/YOPO/saved/YOPO_55/epoch10.pth"
+    }
+  },
+  "yopo_strategies": {
+    "baseline": {
+      "description": "YOPO_55 epoch10, 20 m perception and 18 m maximum trajectory distance",
+      "checkpoint_name": "epoch10.pth",
+      "default_host_path": "/home/ykx/ros1/YOPO_360_v15/YOPO/saved/YOPO_55/epoch10.pth",
+      "config": "x5_cruise15_18m_a12_mask_wc3.yaml"
+    },
+    "d70_h30_epoch30": {
+      "description": "YOPO_70 epoch30, 70 m perception and 30 m maximum trajectory distance",
+      "checkpoint_name": "epoch30.pth",
+      "default_host_path": "models/yopo/d70_h30_epoch30/epoch30.pth",
+      "config": "d70_h30_cruise15_recovery.yaml"
+    }
+  },
+  "container_images": {
+    "yopo_base": "ghcr.io/cn-ryw/yopo:sim-u2004-noetic-py38"
+  }
+}

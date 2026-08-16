@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "claim": "Two collision-free simulator runs reached the 4 m goal region.",
+  "formal_acceptance_note": "Demo evidence only; not a sustained 15 Hz or real-flight acceptance result.",
+  "runs": [
+    {
+      "log_id": "20260814-130247",
+      "navigation_kind": "fixed",
+      "arrived": true,
+      "collision_count": 0,
+      "duration_s": 21.23,
+      "planning_rate_hz": 8.0,
+      "capture_to_apply_p95_ms": 236.0,
+      "da360_p95_ms": 28.3,
+      "yopo_p95_ms": 3.7,
+      "max_speed_mps": 13.912,
+      "min_goal_distance_m": 1.335,
+      "formal_gate_passed": false,
+      "formal_gate_failure_reasons": [
+        "duration_below_60s",
+        "planning_rate_below_15hz"
+      ]
+    },
+    {
+      "log_id": "20260814-130423",
+      "navigation_kind": "fixed",
+      "arrived": true,
+      "collision_count": 0,
+      "duration_s": 24.05,
+      "planning_rate_hz": 10.0,
+      "capture_to_apply_p95_ms": 160.0,
+      "da360_p95_ms": 28.9,
+      "yopo_p95_ms": 3.9,
+      "max_speed_mps": 16.501,
+      "min_goal_distance_m": 1.401,
+      "formal_gate_passed": false,
+      "formal_gate_failure_reasons": [
+        "duration_below_60s",
+        "planning_rate_below_15hz"
+      ]
+    }
+  ]
+}

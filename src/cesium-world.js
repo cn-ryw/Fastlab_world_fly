@@ -28,9 +28,11 @@
  * longitude/latitude.
  */
 
-import { reportUserError } from './error-report.js';
+import { formatError, reportUserError } from './error-report.js';
+import { erpDirectionToComponent, sampleAnchorDirections } from './erp-geometry.js';
+import { demoPerformance } from './demo-performance.js?v=20260814-adaptive-a1';
 
-const DEFAULT_ION_TOKEN = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJqdGkiOiJlMTg2MGFhOS02YTdhLTQ1NWMtYjkzMi05YjQ2ODRlZjI5YTgiLCJpZCI6MjUxNzM1LCJpYXQiOjE3MzAyODI0ODN9.prWAxx4RB8teelutQQbVqdxhgRZpZ4zjw8wzM-8k1Ug';
+const CESIUM_ION_TOKEN_STORAGE_KEY = 'mindcloud_cesium_ion_token';
 const DEFAULT_ASSET_ID = 2275207;
 const DEFAULT_VIEW = {
     longitude: 114.1690321,
@@ -38,8 +40,21 @@ const DEFAULT_VIEW = {
     height: 1800,
 };
 const CESIUM_DRONE_MODEL_URI = 'asset/models/CesiumDrone.glb';
+// CesiumDrone.glb 的原始包围盒为 3.964 × 1.120 × 4.668 单位（水平最大跨度 4.668）。
+// 目标是让渲染尺寸匹配物理机体：半径约 0.4 m，即跨度 0.8 m。
+//   scale = 0.8 / 4.668 ≈ 0.171
+// 旧默认值 1.35 会渲染出 6.3 m 跨度（等效半径 3.15 m），比物理碰撞半径
+// (collisionRadius = 0.6 m) 大一个数量级，视觉上完全失真。
+const CESIUM_DRONE_MODEL_SCALE = clampNumber(
+    urlNumber('droneScale', 0.171),
+    0.01, 10.0, 0.171
+);
 const HEIGHT_CACHE_TTL_MS = 140;
 const HEIGHT_CACHE_LIMIT = 256;
+// These texture names are legacy cubemap labels.  In this simulator's flight
+// convention local +X is body-left (yaw=0 faces -Z and body-right is -X), even
+// though the +X texture has historically been named `right`.  ERP azimuth must
+// therefore be derived from the explicit NWU contract, never from these names.
 const PANORAMA_FACE_DEFS = [
     { name: 'front', dir: { x: 0, y: 0, z: -1 }, up: { x: 0, y: 1, z: 0 } },
     { name: 'right', dir: { x: 1, y: 0, z: 0 }, up: { x: 0, y: 1, z: 0 } },
@@ -54,6 +69,14 @@ function urlNumber(name, fallback) {
     if (v == null || v === '') return fallback;
     const n = Number(v);
     return Number.isFinite(n) ? n : fallback;
+}
+
+function storedCesiumIonToken() {
+    try {
+        return globalThis.localStorage?.getItem(CESIUM_ION_TOKEN_STORAGE_KEY)?.trim() || '';
+    } catch (_) {
+        return '';
+    }
 }
 
 function urlString(name, fallback) {
@@ -146,6 +169,7 @@ class PanoramaEquirectProjector {
         this.readyFaces = new Set();
         this.faceNames = ['front', 'right', 'back', 'left', 'up', 'down'];
         this.textures = new Map();
+        this.textureSizes = new Map();
 
         this.program = createPanoramaProgram(gl, `
             attribute vec2 a_position;
@@ -226,6 +250,9 @@ class PanoramaEquirectProjector {
             vec3 directionFromPitchYaw(float pitch, float yaw) {
                 float cosPitch = cos(pitch);
                 float forward = cosPitch * cos(yaw);
+                // YOPO training ERP uses body NWU (+x forward, +y left,
+                // +z up).  This renderer's component +X is that body-left
+                // axis, so yaw=+90 deg maps directly to component +X.
                 float left = cosPitch * sin(yaw);
                 return normalize(vec3(left, sin(pitch), -forward));
             }
@@ -287,7 +314,20 @@ class PanoramaEquirectProjector {
         if (!texture || !sourceCanvas || !sourceCanvas.width || !sourceCanvas.height) return;
         gl.bindTexture(gl.TEXTURE_2D, texture);
         gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
-        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, sourceCanvas);
+        const allocated = this.textureSizes.get(name);
+        if (allocated?.width === sourceCanvas.width && allocated?.height === sourceCanvas.height) {
+            gl.texSubImage2D(
+                gl.TEXTURE_2D, 0, 0, 0, gl.RGBA, gl.UNSIGNED_BYTE, sourceCanvas
+            );
+        } else {
+            gl.texImage2D(
+                gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, sourceCanvas
+            );
+            this.textureSizes.set(name, {
+                width: sourceCanvas.width,
+                height: sourceCanvas.height,
+            });
+        }
         this.readyFaces.add(name);
     }
 
@@ -352,6 +392,27 @@ function getTransformBasisLocal(transform) {
     };
 }
 
+function componentDirectionToLocal(basis, component) {
+    return normalize3({
+        x: basis.right.x * component.x + basis.up.x * component.y + basis.back.x * component.z,
+        y: basis.right.y * component.x + basis.up.y * component.y + basis.back.y * component.z,
+        z: basis.right.z * component.x + basis.up.z * component.y + basis.back.z * component.z,
+    });
+}
+
+function captureTransformsEquivalent(a, b, positionToleranceM = 1e-5, orientationTolerance = 1e-6) {
+    if (!a?.position || !a?.orientation || !b?.position || !b?.orientation) return false;
+    const positionDelta = Math.hypot(
+        a.position.x - b.position.x,
+        a.position.y - b.position.y,
+        a.position.z - b.position.z,
+    );
+    const qa = a.orientation;
+    const qb = b.orientation;
+    const dot = Math.abs(qa.x * qb.x + qa.y * qb.y + qa.z * qb.z + qa.w * qb.w);
+    return positionDelta <= positionToleranceM && Math.abs(1 - dot) <= orientationTolerance;
+}
+
 function clampNumber(value, min, max, fallback) {
     const n = Number(value);
     if (!Number.isFinite(n)) return fallback;
@@ -370,7 +431,7 @@ function rotateXZ(v, radians) {
 export class CesiumWorld {
     constructor(containerId, options = {}) {
         this.containerId = containerId;
-        this.token = options.token || urlString('ionToken', DEFAULT_ION_TOKEN);
+        this.token = options.token || storedCesiumIonToken() || urlString('ionToken', '');
         this.assetId = Number(options.assetId || urlNumber('assetId', DEFAULT_ASSET_ID));
         this.initialView = {
             longitude: urlNumber('lon', options.longitude ?? DEFAULT_VIEW.longitude),
@@ -378,10 +439,10 @@ export class CesiumWorld {
             height: urlNumber('height', options.height ?? DEFAULT_VIEW.height),
         };
         this.flightResolutionScale = clampNumber(
-            urlNumber('resolutionScale', options.resolutionScale ?? 0.72),
+            urlNumber('resolutionScale', options.resolutionScale ?? 0.80),
             0.45,
             1,
-            0.72
+            0.80
         );
         this.placementResolutionScale = clampNumber(
             urlNumber('placementResolutionScale', options.placementResolutionScale ?? 0.88),
@@ -390,10 +451,10 @@ export class CesiumWorld {
             0.88
         );
         this.flightTileSSE = clampNumber(
-            urlNumber('flightTileSse', options.flightTileSSE ?? 24),
+            urlNumber('flightTileSse', options.flightTileSSE ?? 20),
             8,
             64,
-            24
+            20
         );
         this.placementTileSSE = clampNumber(
             urlNumber('placementTileSse', options.placementTileSSE ?? 16),
@@ -407,12 +468,29 @@ export class CesiumWorld {
             8192,
             2048
         ));
+        const defaultPanoramaTileSSE = demoPerformance.config.profile === 'demo30' ? 256 : 512;
         this.panoramaTileSSE = clampNumber(
-            urlNumber('panoramaTileSse', options.panoramaTileSSE ?? 32),
+            urlNumber('panoramaTileSse', options.panoramaTileSSE ?? defaultPanoramaTileSSE),
             4,
-            128,
-            32
+            1024,
+            defaultPanoramaTileSSE
         );
+        // The hidden 96 px capture faces are used for local obstacle sensing,
+        // not a globe-scale horizon. A finite far plane materially reduces the
+        // six repeated tileset traversals without changing ERP dimensions or
+        // the accepted DA360 projection/calibration contract.
+        this.panoramaFarMeters = clampNumber(
+            urlNumber('panoramaFarMeters', options.panoramaFarMeters ?? 1200),
+            500,
+            15000000,
+            1200
+        );
+        this.panoramaLeanStreaming = urlNumber(
+            'panoramaLeanStreaming',
+            options.panoramaLeanStreaming === undefined
+                ? 1
+                : options.panoramaLeanStreaming ? 1 : 0,
+        ) >= 0.5;
         this.Cesium = null;
         this.viewer = null;
         this.tileset = null;
@@ -423,12 +501,26 @@ export class CesiumWorld {
         this._panoramaFaceSize = 0;
         this._panoramaProjector = null;
         this._panoramaTileset = null;
-        this._panoramaTileLoadState = { pending: null, processing: null };
+        this._panoramaTileLoadState = {
+            pending: null,
+            processing: null,
+            errorCount: 0,
+            lastErrorAt: null,
+            lastErrorMessage: null,
+        };
+        this._panoramaCaptureActiveCount = 0;
+        this._panoramaCaptureRevision = 0;
+        this._lastCompletedPanoramaCapture = null;
 
         this.originCartographic = null;
         this.enuToFixed = null;
         this.fixedToEnu = null;
         this.spawnMarker = null;
+        this._goalMarker = null;
+        this._flightPathEntity = null;
+        this._flightPathPositions = [];
+        this._flightPathLastLocal = null;
+        this._flightPathVisible = true;
         this.aircraftEntities = [];
         this.aircraftModelEntity = null;
         this._aircraftModelPosition = null;
@@ -443,14 +535,14 @@ export class CesiumWorld {
     async init(progressCb = null) {
         const Cesium = requireCesium();
         this.Cesium = Cesium;
-        Cesium.Ion.defaultAccessToken = this.token;
-
-        if (Cesium.RequestScheduler && 'maximumRequestsPerServer' in Cesium.RequestScheduler) {
-            Cesium.RequestScheduler.maximumRequestsPerServer = Math.max(
-                Cesium.RequestScheduler.maximumRequestsPerServer || 0,
-                18
+        if (!this.token) {
+            throw new Error(
+                `Cesium Ion token is not configured. Set localStorage key ${CESIUM_ION_TOKEN_STORAGE_KEY} and reload.`
             );
         }
+        Cesium.Ion.defaultAccessToken = this.token;
+
+        demoPerformance.configureCesium(Cesium);
 
         if (progressCb) progressCb('Creating Cesium viewer...');
         this.viewer = new Cesium.Viewer(this.containerId, {
@@ -468,20 +560,31 @@ export class CesiumWorld {
             shouldAnimate: true,
             globe: false,
             skyAtmosphere: new Cesium.SkyAtmosphere(),
-            requestRenderMode: false,
-            targetFrameRate: 60,
+            requestRenderMode: true,    // Cesium 社区 #1 CPU 优化：空闲时 0% CPU
+            // Keep explicit rendering, but do not hard-cap an interactive
+            // flight view at 20 fps when the measured Chrome loop sustains 40+.
+            targetFrameRate: 30,
+            // resolutionScale 降低渲染像素数，同时减少 CPU draw-call 准备开销
+            resolutionScale: 0.7,
             useBrowserRecommendedResolution: true,
             orderIndependentTranslucency: false,
             contextOptions: {
                 webgl: {
                     alpha: false,
                     antialias: false,
-                    preserveDrawingBuffer: true,
+                    preserveDrawingBuffer: false,
                     powerPreference: 'high-performance',
                     failIfMajorPerformanceCaveat: false,
                 },
             },
         });
+
+        demoPerformance.attachViewer(this.viewer, () => ({
+            main: this.getTileLoadStatus?.() || null,
+            panorama: this._panoramaTileLoadState
+                ? { ...this._panoramaTileLoadState }
+                : null,
+        }));
 
         this.viewer.scene.fog.enabled = false;
         this.viewer.scene.highDynamicRange = false;
@@ -517,7 +620,7 @@ export class CesiumWorld {
         this.viewer.scene.requestRender();
         if (progressCb) progressCb('Waiting for initial Google 3D Tiles...');
         await new Promise(resolve => window.setTimeout(resolve, 150));
-        await this.waitForTilesIdle(4500, 250);
+        await this.waitForTilesIdle(3000, 250);
 
         this.ready = true;
         this.viewer.scene.requestRender();
@@ -548,30 +651,79 @@ export class CesiumWorld {
 
     async _createGoogleTileset(progressCb = null) {
         const Cesium = this.Cesium;
-        if (typeof Cesium.createGooglePhotorealistic3DTileset === 'function') {
+        // Resolve the ion external asset ourselves so the Google API key can
+        // travel in its supported X-Goog-Api-Key header instead of every tile
+        // URL. Derived Cesium Resources inherit headers, while Firefox's own
+        // network errors can no longer print the key in a failed request URL.
+        if (Cesium.IonResource?.fromAssetId
+            && Cesium.Resource
+            && Cesium.Cesium3DTileset?.fromUrl) {
             try {
                 if (progressCb) progressCb('Loading Google Photorealistic 3D Tiles...');
-                return await Cesium.createGooglePhotorealistic3DTileset();
+                const ionResource = await Cesium.IonResource.fromAssetId(this.assetId);
+                const sourceUrl = new URL(ionResource.url);
+                const googleApiKey = sourceUrl.searchParams.get('key');
+                if (sourceUrl.hostname !== 'tile.googleapis.com' || !googleApiKey) {
+                    throw new Error('ion Google Tiles endpoint is missing its expected host/key contract');
+                }
+                sourceUrl.username = '';
+                sourceUrl.password = '';
+                sourceUrl.searchParams.delete('key');
+                sourceUrl.hash = '';
+                const resourceOptions = {
+                    url: sourceUrl.toString(),
+                    headers: {
+                        ...(ionResource.headers || {}),
+                        'X-Goog-Api-Key': googleApiKey,
+                    },
+                    credits: ionResource.credits,
+                };
+                if (ionResource.proxy) resourceOptions.proxy = ionResource.proxy;
+                const resource = new Cesium.Resource(resourceOptions);
+                return await Cesium.Cesium3DTileset.fromUrl(resource, {
+                    cacheBytes: 1536 * 1024 * 1024,
+                    maximumCacheOverflowBytes: 1024 * 1024 * 1024,
+                    enableCollision: true,
+                });
             } catch (e) {
-                reportUserError('Google Photorealistic tileset API failed; falling back to ion asset', e, {
-                    key: 'google-photorealistic-tileset',
+                reportUserError('Credential-safe Google Photorealistic tileset load failed', e, {
+                    key: 'google-photorealistic-tileset-safe-load',
                     intervalMs: 10000,
                 });
+                // Do not silently fall back to query credentials: that would
+                // reintroduce API keys into Firefox-native network errors.
+                throw e;
             }
         }
 
-        if (progressCb) progressCb(`Loading Google Photorealistic 3D Tiles asset ${this.assetId}...`);
-        return Cesium.Cesium3DTileset.fromIonAssetId(this.assetId);
+        throw new Error('Cesium build lacks credential-safe Google Tiles Resource APIs');
     }
 
     _wireTilesetDiagnostics(progressCb = null, tileset = this.tileset, loadState = null, label = 'Google 3D Tiles') {
         if (!tileset) return;
         const keyPrefix = String(label || 'Google 3D Tiles').toLowerCase().replace(/[^a-z0-9]+/g, '-');
+        let nextFailureReportAt = -Infinity;
+        let failureReportBackoffMs = 10000;
+        let lastFailureAt = -Infinity;
         const onFailure = (error) => {
-            const message = error && error.message ? error.message : String(error || 'unknown tile error');
+            const message = formatError(error);
+            const now = performance.now();
+            if (loadState) {
+                loadState.errorCount = Math.max(0, Number(loadState.errorCount) || 0) + 1;
+                loadState.lastErrorAt = now;
+                loadState.lastErrorMessage = message;
+            }
+            // Cesium can emit one event per failed JSON/GLB. Report one
+            // sanitized summary with exponential backoff instead of flooding
+            // DevTools (and the Firefox main thread) with full request errors.
+            if (now - lastFailureAt > 60000) failureReportBackoffMs = 10000;
+            lastFailureAt = now;
+            if (now < nextFailureReportAt) return;
+            nextFailureReportAt = now + failureReportBackoffMs;
+            failureReportBackoffMs = Math.min(60000, failureReportBackoffMs * 2);
             reportUserError(`${label} request failed`, error, {
-                key: `${keyPrefix}-failed-${message}`,
-                intervalMs: 10000,
+                key: `${keyPrefix}-request-failed`,
+                intervalMs: 0,
             });
             if (progressCb) progressCb(`${label} request failed: ${message}`, true);
         };
@@ -630,8 +782,12 @@ export class CesiumWorld {
         setIfPresent('foveatedScreenSpaceError', true);
         setIfPresent('foveatedConeSize', flightMode ? 0.2 : 0.28);
         setIfPresent('foveatedMinimumScreenSpaceErrorRelaxation', flightMode ? 4 : 2);
+        const dynamicSseEnabled = demoPerformance.config.dynamicSse !== 'off';
+        setIfPresent('dynamicScreenSpaceError', dynamicSseEnabled);  // 远处自动降 LOD
+        setIfPresent('dynamicScreenSpaceErrorDensity', 0.2);
+        setIfPresent('dynamicScreenSpaceErrorFactor', 4.0);
         setIfPresent('foveatedTimeDelay', flightMode ? 0.08 : 0.15);
-        setIfPresent('dynamicScreenSpaceError', true);
+        setIfPresent('dynamicScreenSpaceError', dynamicSseEnabled);
         setIfPresent('dynamicScreenSpaceErrorDensity', flightMode ? 0.0035 : 0.0025);
         setIfPresent('dynamicScreenSpaceErrorFactor', flightMode ? 12 : 8);
         setIfPresent('loadSiblings', false);
@@ -674,7 +830,15 @@ export class CesiumWorld {
         };
     }
 
-    waitForTilesIdle(timeoutMs = 1600, quietMs = 180, tileset = null, loadState = null, renderViewer = null) {
+    waitForTilesIdle(
+        timeoutMs = 1600,
+        quietMs = 180,
+        tileset = null,
+        loadState = null,
+        renderViewer = null,
+        renderTimings = null,
+        signal = null
+    ) {
         const targetTileset = tileset || this.tileset;
         if (!targetTileset) return Promise.resolve(true);
 
@@ -691,13 +855,19 @@ export class CesiumWorld {
 
             const tick = () => {
                 if (done) return;
-                if (
-                    renderViewer &&
-                    (!renderViewer.isDestroyed || !renderViewer.isDestroyed()) &&
-                    renderViewer.scene
-                ) {
+                if (signal?.aborted) return finish(false);
+                const renderViewerDestroyed = renderViewer
+                    && typeof renderViewer.isDestroyed === 'function'
+                    && renderViewer.isDestroyed();
+                if (renderViewer && !renderViewerDestroyed && renderViewer.scene) {
                     renderViewer.scene.requestRender();
+                    const renderStartedAt = performance.now();
                     this._renderViewerNow(renderViewer);
+                    if (renderTimings && typeof renderTimings === 'object') {
+                        renderTimings.renderMs = (Number(renderTimings.renderMs) || 0)
+                            + performance.now() - renderStartedAt;
+                        renderTimings.renderCount = (Number(renderTimings.renderCount) || 0) + 1;
+                    }
                 }
                 const now = performance.now();
                 const pending = loadState ? loadState.pending : this._tileLoadPending;
@@ -834,9 +1004,142 @@ export class CesiumWorld {
         };
     }
 
+    _sampleLoadedCorridor(startLocal, endLocal, options = {}) {
+        this._heightSampleCache.clear();
+        const spacing = clampNumber(options.spacing, 10, 100, 30);
+        const halfWidth = clampNumber(options.halfWidth, 0, 120, 35);
+        const dx = endLocal.x - startLocal.x;
+        const dz = endLocal.z - startLocal.z;
+        const routeLength = Math.hypot(dx, dz);
+        const center = {
+            x: (startLocal.x + endLocal.x) * 0.5,
+            y: (startLocal.y + endLocal.y) * 0.5,
+            z: (startLocal.z + endLocal.z) * 0.5,
+        };
+        const normalX = routeLength > 1e-6 ? -dz / routeLength : 1;
+        const normalZ = routeLength > 1e-6 ? dx / routeLength : 0;
+        const alongSteps = routeLength > 1e-6 ? Math.max(1, Math.ceil(routeLength / spacing)) : 0;
+        const lateralSteps = halfWidth > 0 ? Math.max(1, Math.ceil(halfWidth / spacing)) : 0;
+        const lateralOffsets = lateralSteps > 0
+            ? Array.from(
+                { length: lateralSteps * 2 + 1 },
+                (_, index) => ((index - lateralSteps) / lateralSteps) * halfWidth,
+            )
+            : [0];
+        const samples = [];
+        const missing = [];
+        let loaded = 0;
+
+        for (let alongIndex = 0; alongIndex <= alongSteps; alongIndex++) {
+            const t = alongSteps > 0 ? alongIndex / alongSteps : 0;
+            const baseX = startLocal.x + dx * t;
+            const baseZ = startLocal.z + dz * t;
+            for (const lateralOffset of lateralOffsets) {
+                const localX = baseX + normalX * lateralOffset;
+                const localZ = baseZ + normalZ * lateralOffset;
+                const sample = {
+                    x: localX - center.x,
+                    z: localZ - center.z,
+                    localX,
+                    localZ,
+                    d: Math.hypot(localX - center.x, localZ - center.z),
+                    distanceAlong: routeLength * t,
+                    lateralOffset,
+                };
+                samples.push(sample);
+                const y = this.sampleHeightAtLocal(localX, localZ, 1.0);
+                if (Number.isFinite(y)) loaded++;
+                else missing.push(sample);
+            }
+        }
+
+        return {
+            loaded,
+            total: samples.length,
+            ratio: samples.length ? loaded / samples.length : 1,
+            missing,
+            center,
+            routeLength,
+            halfWidth,
+            spacing,
+        };
+    }
+
+    async preloadCollisionCorridor(startLocal, endLocal, options = {}) {
+        if (!this.viewer || !this.ready || !startLocal || !endLocal) return null;
+        const coordinates = [
+            startLocal.x, startLocal.y, startLocal.z,
+            endLocal.x, endLocal.y, endLocal.z,
+        ].map(Number);
+        if (!coordinates.every(Number.isFinite)) return null;
+
+        const start = { x: coordinates[0], y: coordinates[1], z: coordinates[2] };
+        const end = { x: coordinates[3], y: coordinates[4], z: coordinates[5] };
+        const routeLength = Math.hypot(end.x - start.x, end.z - start.z);
+        const halfWidth = clampNumber(options.halfWidth, 10, 120, 35);
+        const spacing = clampNumber(options.spacing, 10, 100, 30);
+        const maxRadius = clampNumber(options.maxRadius, 120, 1200, 400);
+        const radius = Math.min(maxRadius, Math.max(80, routeLength * 0.5 + halfWidth + 40));
+        const center = {
+            x: (start.x + end.x) * 0.5,
+            y: (start.y + end.y) * 0.5,
+            z: (start.z + end.z) * 0.5,
+        };
+        const attempts = Math.round(clampNumber(options.attempts, 1, 4, 3));
+        const maxTargets = Math.round(clampNumber(
+            options.maxTargets,
+            8,
+            32,
+            Math.min(24, Math.max(10, Math.ceil(routeLength / 50) + 8)),
+        ));
+        const coverageSampler = () => this._sampleLoadedCorridor(start, end, {
+            halfWidth,
+            spacing,
+        });
+
+        const report = await this.preloadLocalArea(center, {
+            radius,
+            lift: Number.isFinite(options.lift) ? options.lift : 180,
+            gridSpacing: Number.isFinite(options.gridSpacing) ? options.gridSpacing : 100,
+            viewDistance: Number.isFinite(options.viewDistance)
+                ? options.viewDistance
+                : Math.max(160, Math.min(260, radius * 0.9)),
+            maxTargets,
+            dwellMs: Number.isFinite(options.dwellMs) ? options.dwellMs : 120,
+            perViewTimeoutMs: Number.isFinite(options.perViewTimeoutMs)
+                ? options.perViewTimeoutMs
+                : 2500,
+            finalIdleTimeoutMs: Number.isFinite(options.finalIdleTimeoutMs)
+                ? options.finalIdleTimeoutMs
+                : 10000,
+            totalTimeoutMs: options.totalTimeoutMs,
+            verifyCoverage: true,
+            coverageSampler,
+            minCoverageRatio: 1,
+            repairPasses: attempts - 1,
+            repairTargets: 32,
+            progressCb: options.progressCb,
+        });
+        if (report) {
+            report.corridor = { center, routeLength, halfWidth, spacing, attempts };
+        }
+        return report;
+    }
+
     async preloadLocalArea(centerLocal, options = {}) {
         if (!this.viewer || !this.ready || !centerLocal) return null;
         const Cesium = this.Cesium;
+        const requestScheduler = Cesium?.RequestScheduler;
+        const savedRequestsPerServer = requestScheduler
+            && 'maximumRequestsPerServer' in requestScheduler
+            ? requestScheduler.maximumRequestsPerServer
+            : null;
+        if (savedRequestsPerServer !== null) {
+            requestScheduler.maximumRequestsPerServer = Math.max(
+                savedRequestsPerServer,
+                Number(demoPerformance.config.preloadTileRequestsPerServer) || 18,
+            );
+        }
         const camera = this.viewer.camera;
         const saved = {
             position: Cesium.Cartesian3.clone(camera.positionWC),
@@ -852,7 +1155,11 @@ export class CesiumWorld {
         const dwellMs = Math.max(80, Number.isFinite(options.dwellMs) ? options.dwellMs : 180);
         const perViewTimeoutMs = Math.max(450, Number.isFinite(options.perViewTimeoutMs) ? options.perViewTimeoutMs : 1600);
         const finalIdleTimeoutMs = Math.max(perViewTimeoutMs, Number.isFinite(options.finalIdleTimeoutMs) ? options.finalIdleTimeoutMs : 5000);
-        const verifyCoverage = options.verifyCoverage !== false && radius >= 350;
+        const verifyCoverage = options.verifyCoverage === true
+            || (options.verifyCoverage !== false && radius >= 350);
+        const coverageSampler = typeof options.coverageSampler === 'function'
+            ? options.coverageSampler
+            : null;
         const coverageSpacing = clampNumber(options.coverageSpacing, 100, 600, Math.max(240, gridSpacing));
         const minCoverageRatio = clampNumber(options.minCoverageRatio, 0, 1, 0.72);
         const repairPasses = Math.round(clampNumber(options.repairPasses, 0, 3, verifyCoverage ? 1 : 0));
@@ -860,16 +1167,26 @@ export class CesiumWorld {
         const progressCb = typeof options.progressCb === 'function' ? options.progressCb : null;
         const label = radius >= 1000 ? `${(radius / 1000).toFixed(1)} km` : `${Math.round(radius)} m`;
         const delay = (ms) => new Promise(resolve => window.setTimeout(resolve, ms));
+        const totalTimeoutMs = Number.isFinite(options.totalTimeoutMs)
+            ? Math.max(1000, options.totalTimeoutMs)
+            : Infinity;
+        const preloadStartedAt = performance.now();
+        const remainingBudgetMs = () => totalTimeoutMs - (performance.now() - preloadStartedAt);
         const report = {
             radius,
             views: 0,
             timedOutViews: 0,
             finalIdle: false,
             coverage: null,
+            deadlineExceeded: false,
         };
 
         const runViews = async (views, passLabel) => {
             for (let i = 0; i < views.length; i++) {
+                if (remainingBudgetMs() <= 0) {
+                    report.deadlineExceeded = true;
+                    break;
+                }
                 const v = views[i];
                 const status = this.getTileLoadStatus();
                 const queue = status.pending !== null || status.processing !== null
@@ -894,11 +1211,26 @@ export class CesiumWorld {
                     },
                 });
                 this.viewer.scene.requestRender();
-                await delay(dwellMs);
-                const idle = await this.waitForTilesIdle(perViewTimeoutMs);
+                await delay(Math.min(dwellMs, Math.max(0, remainingBudgetMs())));
+                const remaining = remainingBudgetMs();
+                if (remaining <= 0) {
+                    report.deadlineExceeded = true;
+                    report.views++;
+                    break;
+                }
+                const idle = await this.waitForTilesIdle(Math.max(1, Math.min(perViewTimeoutMs, remaining)));
                 if (!idle) report.timedOutViews++;
                 report.views++;
             }
+        };
+
+        const settleAfterViews = async () => {
+            const remaining = remainingBudgetMs();
+            if (remaining <= 0) {
+                report.deadlineExceeded = true;
+                return false;
+            }
+            return this.waitForTilesIdle(Math.max(1, Math.min(finalIdleTimeoutMs, remaining)), 350);
         };
 
         try {
@@ -911,22 +1243,34 @@ export class CesiumWorld {
                 maxTargets
             );
             await runViews(initialViews, 'scan');
-            report.finalIdle = await this.waitForTilesIdle(finalIdleTimeoutMs, 350);
+            report.finalIdle = await settleAfterViews();
 
             for (let pass = 0; verifyCoverage && pass <= repairPasses; pass++) {
                 if (progressCb) progressCb(`Verifying ${label} collision tile coverage...`);
-                report.coverage = this._sampleLoadedCoverage(centerLocal, radius, coverageSpacing);
+                report.coverage = coverageSampler
+                    ? coverageSampler()
+                    : this._sampleLoadedCoverage(centerLocal, radius, coverageSpacing);
                 const pct = Math.round(report.coverage.ratio * 100);
                 if (progressCb) progressCb(`Collision preload coverage ${report.coverage.loaded}/${report.coverage.total} (${pct}%).`);
                 if (report.coverage.ratio >= minCoverageRatio || pass === repairPasses || !report.coverage.missing.length) break;
+                if (remainingBudgetMs() <= 0) {
+                    report.deadlineExceeded = true;
+                    break;
+                }
 
                 const repairViews = report.coverage.missing
                     .slice(0, repairTargets)
                     .map((offset, i) => this._makePreloadView(centerLocal, offset, i + pass * repairTargets, lift, viewDistance));
                 await runViews(repairViews, `repair ${pass + 1}`);
-                report.finalIdle = await this.waitForTilesIdle(finalIdleTimeoutMs, 350);
+                report.finalIdle = await settleAfterViews();
+            }
+            if (report.deadlineExceeded && progressCb) {
+                progressCb(`Collision preload reached its ${Math.round(totalTimeoutMs / 1000)} s time budget.`);
             }
         } finally {
+            if (savedRequestsPerServer !== null) {
+                requestScheduler.maximumRequestsPerServer = savedRequestsPerServer;
+            }
             camera.setView({
                 destination: saved.position,
                 orientation: {
@@ -1119,9 +1463,182 @@ export class CesiumWorld {
         if (this.spawnMarker) this.spawnMarker.show = false;
     }
 
+    validateGoalPlacement(clickedLocal, goalLocal, options = {}) {
+        const x = Number(clickedLocal?.x);
+        const clickedY = Number(clickedLocal?.y);
+        const z = Number(clickedLocal?.z);
+        const goalY = Number(goalLocal?.y);
+        if (![x, clickedY, z, goalY].every(Number.isFinite)) {
+            return {
+                valid: false,
+                reason: 'invalid-position',
+                message: 'Goal rejected: invalid map position.'
+            };
+        }
+
+        const collisionRadius = Math.max(0.1, Number(options.collisionRadius) || 0.6);
+        const centerSurfaceY = this.sampleHeightAtLocal(x, z, Math.max(0.5, collisionRadius));
+        if (!Number.isFinite(centerSurfaceY)) {
+            return {
+                valid: false,
+                reason: 'surface-unresolved',
+                message: 'Goal rejected: the clicked map surface has not loaded yet.'
+            };
+        }
+
+        // Google photorealistic tiles do not expose dependable building labels.
+        // A click-only sparse height ring distinguishes elevated roofs/facades
+        // without adding any work to the flight render or planning loops.
+        const offsets = [];
+        for (const distance of [12, 30, 60]) {
+            offsets.push(
+                [distance, 0], [-distance, 0],
+                [0, distance], [0, -distance]
+            );
+        }
+        const nearbyHeights = offsets
+            .map(([dx, dz]) => this.sampleHeightAtLocal(x + dx, z + dz, 1.0))
+            .filter(Number.isFinite)
+            .sort((a, b) => a - b);
+        if (nearbyHeights.length >= 4) {
+            const lowerQuartile = nearbyHeights[Math.floor((nearbyHeights.length - 1) * 0.25)];
+            const surfaceRelief = Math.max(clickedY, centerSurfaceY) - lowerQuartile;
+            if (surfaceRelief > 4.5) {
+                return {
+                    valid: false,
+                    reason: 'building-surface',
+                    message: 'Goal rejected: click on visible ground, not on a building.',
+                    surfaceRelief
+                };
+            }
+        }
+
+        const requiredClearance = collisionRadius + 0.2;
+        if (goalY <= centerSurfaceY + requiredClearance) {
+            return {
+                valid: false,
+                reason: 'goal-inside-surface',
+                message: 'Goal rejected: the requested flight height is inside a building or the ground.',
+                surfaceY: centerSurfaceY,
+                requiredClearance
+            };
+        }
+
+        return { valid: true, surfaceY: centerSurfaceY };
+    }
+
+    showGoalMarker(local) {
+        const Cesium = this.Cesium;
+        if (this._goalMarker) this.viewer.entities.remove(this._goalMarker);
+        const pos = this.localToCartesian(local);
+        const groundPos = this.localToCartesian({ x: local.x, y: 0, z: local.z });
+        const goalColor = Cesium.Color.LIME;
+        const goalDash = new Cesium.PolylineDashMaterialProperty({
+            color: goalColor.withAlpha(0.9),
+            dashLength: 10,
+        });
+        this._goalMarker = this.viewer.entities.add({
+            position: pos,
+            point: {
+                pixelSize: 15,
+                color: goalColor,
+                outlineColor: Cesium.Color.BLACK,
+                outlineWidth: 3,
+                disableDepthTestDistance: Number.POSITIVE_INFINITY,
+            },
+            label: {
+                text: `GOAL  ${Math.round(local.y)}m`,
+                font: `${(typeof window !== 'undefined' && window._goalFontSize) || 18}px Chakra Petch, monospace`,
+                fillColor: goalColor,
+                outlineColor: Cesium.Color.BLACK,
+                outlineWidth: 3,
+                style: Cesium.LabelStyle.FILL_AND_OUTLINE,
+                verticalOrigin: Cesium.VerticalOrigin.BOTTOM,
+                pixelOffset: new Cesium.Cartesian2(0, -18),
+                disableDepthTestDistance: Number.POSITIVE_INFINITY,
+            },
+            polyline: {
+                positions: [groundPos, pos],
+                material: goalDash,
+                depthFailMaterial: new Cesium.PolylineDashMaterialProperty({
+                    color: goalColor.withAlpha(0.55),
+                    dashLength: 10,
+                }),
+                width: 3,
+            },
+        });
+        this._goalMarker.point.disableDepthTestDistance = 0;
+        this._goalMarker.label.disableDepthTestDistance = 0;
+        this._goalMarker.polyline.depthFailMaterial = undefined;
+        this.viewer.scene.requestRender();
+    }
+
+    clearGoalMarker() {
+        if (this._goalMarker) {
+            this.viewer.entities.remove(this._goalMarker);
+            this._goalMarker = null;
+        }
+    }
+
+    setFlightPathVisible(visible) {
+        this._flightPathVisible = !!visible;
+        if (this._flightPathEntity) this._flightPathEntity.show = this._flightPathVisible;
+        this.viewer?.scene?.requestRender?.();
+    }
+
+    resetFlightPath(local = null) {
+        this._flightPathPositions = [];
+        this._flightPathLastLocal = null;
+        if (local) this.updateFlightPath(local, true);
+        this.viewer?.scene?.requestRender?.();
+    }
+
+    updateFlightPath(local, force = false) {
+        if (!this.viewer || !this.ready || !local) return;
+        const values = [local.x, local.y, local.z].map(Number);
+        if (!values.every(Number.isFinite)) return;
+        const point = { x: values[0], y: values[1], z: values[2] };
+        if (!force && this._flightPathLastLocal) {
+            const distance = Math.hypot(
+                point.x - this._flightPathLastLocal.x,
+                point.y - this._flightPathLastLocal.y,
+                point.z - this._flightPathLastLocal.z,
+            );
+            if (distance < 0.5) return;
+        }
+
+        this._flightPathLastLocal = point;
+        this._flightPathPositions.push(this.localToCartesian(point));
+        if (this._flightPathPositions.length > 6000) this._flightPathPositions.shift();
+
+        if (!this._flightPathEntity) {
+            const Cesium = this.Cesium;
+            this._flightPathEntity = this.viewer.entities.add({
+                name: 'Flight Path History',
+                show: this._flightPathVisible,
+                polyline: {
+                    positions: new Cesium.CallbackProperty(
+                        () => this._flightPathPositions,
+                        false,
+                    ),
+                    width: 4,
+                    material: new Cesium.PolylineGlowMaterialProperty({
+                        glowPower: 0.18,
+                        color: Cesium.Color.CYAN.withAlpha(0.92),
+                    }),
+                    depthFailMaterial: Cesium.Color.CYAN.withAlpha(0.32),
+                    arcType: Cesium.ArcType.NONE,
+                },
+            });
+        }
+        this.viewer.scene.requestRender();
+    }
+
     _collisionExclusions() {
         const excluded = [];
         if (this.spawnMarker) excluded.push(this.spawnMarker);
+        if (this._goalMarker) excluded.push(this._goalMarker);
+        if (this._flightPathEntity) excluded.push(this._flightPathEntity);
         for (const entity of this.aircraftEntities) {
             if (entity) excluded.push(entity);
         }
@@ -1149,9 +1666,12 @@ export class CesiumWorld {
             ), false),
             model: {
                 uri: CESIUM_DRONE_MODEL_URI,
-                scale: 1.35,
-                minimumPixelSize: 44,
-                maximumScale: 18,
+                scale: CESIUM_DRONE_MODEL_SCALE,
+                // minimumPixelSize 会在远距离强行把模型撑到给定屏占像素，
+                // 从而让实际观感脱离物理尺寸。之前的 44 是视觉过大的第二个原因，
+                // 这里降到刚好保证远处可见的程度。
+                minimumPixelSize: 8,
+                maximumScale: 4,
                 runAnimations: true,
                 incrementallyLoadTextures: false,
                 shadows: Cesium.ShadowMode.DISABLED,
@@ -1446,22 +1966,36 @@ export class CesiumWorld {
         const setIfPresent = (key, value) => {
             if (key in tileset) tileset[key] = value;
         };
+        const baselineProfile = demoPerformance.config.profile === 'baseline';
+        const leanStreaming = baselineProfile && this.panoramaLeanStreaming;
 
         setIfPresent('maximumScreenSpaceError', this.panoramaTileSSE);
         setIfPresent('cullRequestsWhileMoving', false);
-        setIfPresent('preloadWhenHidden', true);
-        setIfPresent('preloadFlightDestinations', true);
+        setIfPresent('preloadWhenHidden', baselineProfile && !leanStreaming);
+        setIfPresent('preloadFlightDestinations', baselineProfile && !leanStreaming);
         setIfPresent('foveatedScreenSpaceError', false);
-        setIfPresent('dynamicScreenSpaceError', true);
+        setIfPresent(
+            'dynamicScreenSpaceError',
+            demoPerformance.config.dynamicSse !== 'off',
+        );
         setIfPresent('dynamicScreenSpaceErrorDensity', 0.004);
         setIfPresent('dynamicScreenSpaceErrorFactor', 12);
-        setIfPresent('loadSiblings', true);
-        setIfPresent('immediatelyLoadDesiredLevelOfDetail', true);
-        setIfPresent('preferLeaves', true);
+        // demo30 uses normal parent-first replacement refinement. A coarse
+        // parent remains visible until its children arrive, avoiding blank
+        // blocks without expanding requests to siblings or hidden views.
+        setIfPresent('loadSiblings', baselineProfile && !leanStreaming);
+        setIfPresent('skipLevelOfDetail', baselineProfile && leanStreaming);
+        setIfPresent('baseScreenSpaceError', baselineProfile && leanStreaming ? 1536 : 512);
+        setIfPresent('skipScreenSpaceErrorFactor', baselineProfile && leanStreaming ? 18 : 8);
+        setIfPresent('skipLevels', baselineProfile && leanStreaming ? 2 : 0);
+        setIfPresent('immediatelyLoadDesiredLevelOfDetail', baselineProfile && !leanStreaming);
+        setIfPresent('preferLeaves', baselineProfile && !leanStreaming);
 
-        if ('maximumMemoryUsage' in tileset) tileset.maximumMemoryUsage = 768;
-        if ('cacheBytes' in tileset) tileset.cacheBytes = 768 * 1024 * 1024;
-        if ('maximumCacheOverflowBytes' in tileset) tileset.maximumCacheOverflowBytes = 256 * 1024 * 1024;
+        // The hidden viewer owns a separate cache from the main view. Keep it
+        // large enough to avoid churn without switching policy while capturing.
+        if ('maximumMemoryUsage' in tileset) tileset.maximumMemoryUsage = 1536;
+        if ('cacheBytes' in tileset) tileset.cacheBytes = 1536 * 1024 * 1024;
+        if ('maximumCacheOverflowBytes' in tileset) tileset.maximumCacheOverflowBytes = 512 * 1024 * 1024;
     }
 
     _destroyPanoramaCaptureViewer() {
@@ -1476,7 +2010,15 @@ export class CesiumWorld {
         this._panoramaInitPromise = null;
         this._panoramaFaceSize = 0;
         this._panoramaTileset = null;
-        this._panoramaTileLoadState = { pending: null, processing: null };
+        this._panoramaTileLoadState = {
+            pending: null,
+            processing: null,
+            errorCount: 0,
+            lastErrorAt: null,
+            lastErrorMessage: null,
+        };
+        this._panoramaCaptureActiveCount = 0;
+        this._lastCompletedPanoramaCapture = null;
     }
 
     async _createPanoramaCaptureViewer(faceSize) {
@@ -1539,7 +2081,13 @@ export class CesiumWorld {
         const tileset = await this._createGoogleTileset(null);
         this._configurePanoramaTileset(tileset);
         this._panoramaTileset = tileset;
-        this._panoramaTileLoadState = { pending: null, processing: null };
+        this._panoramaTileLoadState = {
+            pending: null,
+            processing: null,
+            errorCount: 0,
+            lastErrorAt: null,
+            lastErrorMessage: null,
+        };
         this._wireTilesetDiagnostics(null, tileset, this._panoramaTileLoadState, 'Panorama Google 3D Tiles');
         viewer.scene.primitives.add(tileset);
         viewer.resize();
@@ -1560,13 +2108,27 @@ export class CesiumWorld {
         }
 
         if (!this._panoramaInitPromise) {
-            this._panoramaInitPromise = this._createPanoramaCaptureViewer(faceSize)
-                .finally(() => {
+            const initTimeoutMs = 20000;
+            const initPromise = this._createPanoramaCaptureViewer(faceSize);
+            const trackedPromise = initPromise.finally(() => {
+                if (this._panoramaInitPromise === trackedPromise) {
                     this._panoramaInitPromise = null;
-                });
+                }
+            });
+            // Keep the real initialization promise authoritative after a
+            // caller times out. Clearing it on Promise.race timeout allowed a
+            // slow Chrome/network startup to create overlapping Cesium/WebGL
+            // panorama viewers, multiplying render and tile-streaming cost.
+            this._panoramaInitPromise = trackedPromise;
         }
 
-        return this._panoramaInitPromise;
+        return Promise.race([
+            this._panoramaInitPromise,
+            new Promise((_, reject) => setTimeout(
+                () => reject(new Error('Panorama capture viewer init timed out')),
+                20000,
+            )),
+        ]);
     }
 
     _getPanoramaProjector() {
@@ -1587,14 +2149,22 @@ export class CesiumWorld {
 
     async warmPanoramaCaptureViewer(faceSize = 256) {
         if (!this.viewer || !this.ready) return false;
-        const size = Math.max(96, Math.round(faceSize || 256));
+        const size = Math.max(64, Math.round(faceSize || 256));
         await this._ensurePanoramaCaptureViewer(size);
         return !!this._getPanoramaProjector();
     }
 
     async _capturePanoramaHybridWithViewerAsync(viewer, transform, width, height, faceSize, verticalFovDeg = 180, options = {}) {
+        const totalStartedAt = performance.now();
         const projector = this._getPanoramaProjector();
-        if (!projector) return { canvas: null, complete: false, ready: false };
+        if (!projector) {
+            return {
+                canvas: null,
+                complete: false,
+                ready: false,
+                faces: PANORAMA_FACE_DEFS.length,
+            };
+        }
         if (projector.readyFaces) projector.readyFaces.clear();
 
         const camera = viewer.camera;
@@ -1612,17 +2182,99 @@ export class CesiumWorld {
         const frameDelayMs = Math.max(0, Math.min(1000, Number(options.frameDelayMs) || 0));
         const tileTimeoutMs = Math.max(0, Math.min(120000, Number(options.tileTimeoutMs) || 0));
         const tileQuietMs = Math.max(0, Math.min(5000, Number(options.tileQuietMs) || 0));
+        const captureAnyway = !!options.captureAnyway;
+        const continueOnTileTimeout = options.continueOnTileTimeout === true;
+        const signal = options.signal || null;
+        const facesPerSlice = Math.max(1, Math.min(
+            PANORAMA_FACE_DEFS.length,
+            Math.round(Number(options.facesPerSlice) || 2)
+        ));
         const progressCb = typeof options.progressCb === 'function' ? options.progressCb : null;
         const sleep = (ms) => new Promise(resolve => window.setTimeout(resolve, ms));
+        // Yield to the browser task queue between face batches without waiting
+        // for the next visible animation frame. Waiting on requestAnimationFrame
+        // coupled perception latency to main-view tile stalls (up to hundreds
+        // of milliseconds) even though the six actual renders took ~30 ms.
+        const yieldFrame = () => new Promise(resolve => window.setTimeout(resolve, 0));
+        const throwIfAborted = () => {
+            if (!signal?.aborted) return;
+            const error = new Error(String(signal.reason || 'panorama capture aborted'));
+            error.name = 'AbortError';
+            throw error;
+        };
+        let sceneRenderMs = 0;
+        let tileWaitMs = 0;
+        let waitRerenderMs = 0;
+        let faceUploadMs = 0;
+        let projectMs = 0;
+        let schedulerMs = 0;
+        const captureTimings = () => ({
+            scene_render: sceneRenderMs,
+            tile_wait: tileWaitMs,
+            wait_rerender: waitRerenderMs,
+            face_upload: faceUploadMs,
+            project: projectMs,
+            scheduler: schedulerMs,
+            // Backward-compatible aggregate fields. `render` deliberately
+            // excludes tile quiet time, scheduler waits and texture uploads.
+            render: sceneRenderMs + waitRerenderMs,
+            scheduler_yield: schedulerMs,
+            total: performance.now() - totalStartedAt,
+        });
+        const trackTileReadiness = !captureAnyway;
+        const faceTileReadiness = [];
+        let capturedFaces = 0;
+        const captureRevision = Number.isSafeInteger(this._panoramaCaptureRevision)
+            ? this._panoramaCaptureRevision + 1
+            : 1;
+        this._panoramaCaptureRevision = captureRevision;
+        const captureTileset = this._panoramaTileset;
+        const captureLoadState = this._panoramaTileLoadState;
+        const tileErrorCountAtStart = Math.max(0, Number(captureLoadState?.errorCount) || 0);
+        this._panoramaCaptureActiveCount = Math.max(0, Number(this._panoramaCaptureActiveCount) || 0) + 1;
+
+        const readinessSnapshot = (captureComplete = false) => {
+            const frozenFaces = Object.freeze(faceTileReadiness.slice());
+            const readyFaces = frozenFaces.reduce(
+                (count, face) => count + (face.readyWhenCopied === true ? 1 : 0),
+                0,
+            );
+            const allFaceFlagsReady = captureComplete
+                && frozenFaces.length === PANORAMA_FACE_DEFS.length
+                && readyFaces === PANORAMA_FACE_DEFS.length;
+            const rawLastErrorAt = captureLoadState?.lastErrorAt;
+            const lastErrorAt = Number(rawLastErrorAt);
+            const tileError = (
+                (Math.max(0, Number(captureLoadState?.errorCount) || 0) > tileErrorCountAtStart)
+                || (rawLastErrorAt != null
+                    && Number.isFinite(lastErrorAt)
+                    && lastErrorAt >= totalStartedAt - 5000)
+            );
+            const allFacesTileReady = allFaceFlagsReady && !tileError;
+            return Object.freeze({
+                faceTileReadiness: frozenFaces,
+                readyFaces,
+                allFacesTileReady,
+                readinessReason: tileError
+                    ? 'tile-error'
+                    : allFacesTileReady
+                    ? 'tiles-ready'
+                    : captureComplete
+                    ? 'tiles-partial'
+                    : 'capture-incomplete',
+                tileError,
+            });
+        };
 
         try {
             if (frustum) {
                 if ('fov' in frustum) frustum.fov = faceFovDeg * Math.PI / 180;
                 if ('near' in frustum) frustum.near = 0.03;
-                if ('far' in frustum) frustum.far = 15000000;
+                if ('far' in frustum) frustum.far = this.panoramaFarMeters || 1200;
             }
 
             for (let faceIndex = 0; faceIndex < PANORAMA_FACE_DEFS.length; faceIndex++) {
+                throwIfAborted();
                 const faceDef = PANORAMA_FACE_DEFS[faceIndex];
                 if (progressCb) progressCb(`face ${faceIndex + 1}/${PANORAMA_FACE_DEFS.length} ${faceDef.name}`);
                 camera.setView({
@@ -1633,21 +2285,37 @@ export class CesiumWorld {
                     },
                 });
                 viewer.scene.requestRender();
+                let sceneRenderStartedAt = performance.now();
                 this._renderViewerNow(viewer);
+                sceneRenderMs += performance.now() - sceneRenderStartedAt;
                 if (frameDelayMs > 0) {
                     await sleep(frameDelayMs);
+                    throwIfAborted();
                     viewer.scene.requestRender();
+                    sceneRenderStartedAt = performance.now();
                     this._renderViewerNow(viewer);
+                    sceneRenderMs += performance.now() - sceneRenderStartedAt;
                 }
-                if (tileTimeoutMs > 0) {
-                    const tilesReady = await this.waitForTilesIdle(
+                let faceTilesReady = true;
+                if (trackTileReadiness && tileTimeoutMs > 0) {
+                    const tileWaitStartedAt = performance.now();
+                    const waitRenderTimings = { renderMs: 0, renderCount: 0 };
+                    faceTilesReady = await this.waitForTilesIdle(
                         tileTimeoutMs,
                         tileQuietMs,
                         this._panoramaTileset,
                         this._panoramaTileLoadState,
-                        viewer
+                        viewer,
+                        waitRenderTimings,
+                        signal
                     );
-                    if (!tilesReady) {
+                    const waitElapsedMs = performance.now() - tileWaitStartedAt;
+                    const waitRenderElapsedMs = Math.max(0, Number(waitRenderTimings.renderMs) || 0);
+                    waitRerenderMs += waitRenderElapsedMs;
+                    tileWaitMs += Math.max(0, waitElapsedMs - waitRenderElapsedMs);
+                    throwIfAborted();
+                    if (!faceTilesReady && !continueOnTileTimeout) {
+                        const readiness = readinessSnapshot(false);
                         return {
                             canvas: null,
                             complete: false,
@@ -1655,20 +2323,74 @@ export class CesiumWorld {
                             loadingTiles: true,
                             faceIndex,
                             faces: PANORAMA_FACE_DEFS.length,
+                            ...readiness,
+                            timings_ms: captureTimings(),
                         };
                     }
+                } else if (trackTileReadiness) {
+                    faceTilesReady = !!captureTileset && captureTileset.tilesLoaded === true;
                 }
+                const faceUploadStartedAt = performance.now();
                 projector.updateFace(faceDef.name, viewer.scene.canvas);
+                faceUploadMs += performance.now() - faceUploadStartedAt;
+                capturedFaces++;
+                if (trackTileReadiness) {
+                    faceTileReadiness.push(Object.freeze({
+                        face: faceDef.name,
+                        readyWhenCopied: faceTilesReady,
+                    }));
+                }
+
+                if ((faceIndex + 1) % facesPerSlice === 0 && faceIndex + 1 < PANORAMA_FACE_DEFS.length) {
+                    const yieldStartedAt = performance.now();
+                    await yieldFrame();
+                    schedulerMs += performance.now() - yieldStartedAt;
+                }
             }
 
+            throwIfAborted();
+            const projectStartedAt = performance.now();
             const canvas = projector.render(width, height, verticalFovDeg, faceFovDeg, topPoleGuardDeg, bottomPoleGuardDeg);
+            projectMs = performance.now() - projectStartedAt;
+            const complete = !!canvas
+                && capturedFaces === PANORAMA_FACE_DEFS.length;
+            const readiness = trackTileReadiness ? readinessSnapshot(complete) : null;
+            if (canvas && viewer === this._panoramaViewer && captureTileset === this._panoramaTileset
+                && captureRevision > (this._lastCompletedPanoramaCapture?.revision || 0)) {
+                this._lastCompletedPanoramaCapture = Object.freeze({
+                    revision: captureRevision,
+                    viewer,
+                    tileset: captureTileset,
+                    transform: Object.freeze({
+                        position: Object.freeze({ ...transform.position }),
+                        orientation: Object.freeze({ ...transform.orientation }),
+                    }),
+                    width,
+                    height,
+                    faceSize,
+                    verticalFovDeg,
+                    complete,
+                    ready: readiness ? readiness.allFacesTileReady : complete,
+                    faceTileReadiness: readiness?.faceTileReadiness || Object.freeze([]),
+                    readyFaces: readiness?.readyFaces ?? (complete ? PANORAMA_FACE_DEFS.length : 0),
+                    allFacesTileReady: readiness?.allFacesTileReady ?? null,
+                    readinessReason: readiness?.readinessReason || (
+                        complete ? 'capture-complete' : 'capture-incomplete'
+                    ),
+                    tileError: readiness?.tileError === true,
+                    completedAt: performance.now(),
+                });
+            }
             return {
                 canvas,
-                complete: !!canvas,
-                ready: !!canvas,
+                complete,
+                ready: readiness ? readiness.allFacesTileReady : complete,
+                ...(readiness || {}),
                 faces: PANORAMA_FACE_DEFS.length,
+                timings_ms: captureTimings(),
             };
         } finally {
+            this._panoramaCaptureActiveCount = Math.max(0, this._panoramaCaptureActiveCount - 1);
             if (frustum) {
                 if (saved.fov !== undefined && 'fov' in frustum) frustum.fov = saved.fov;
                 if (saved.near !== undefined && 'near' in frustum) frustum.near = saved.near;
@@ -1684,18 +2406,30 @@ export class CesiumWorld {
 
         const width = Math.max(256, Math.round(options.width || 512));
         const height = Math.max(128, Math.round(options.height || Math.round(width / 2)));
-        const faceSize = Math.max(96, Math.round(options.faceSize || 128));
+        const faceSize = Math.max(64, Math.round(options.faceSize || 128));
         const verticalFovDeg = Math.max(1, Math.min(180, Number(options.verticalFovDeg) || 180));
         const viewer = await this._ensurePanoramaCaptureViewer(faceSize);
-        return this._capturePanoramaHybridWithViewerAsync(viewer, transform, width, height, faceSize, verticalFovDeg, {
-            faceFovDeg: options.faceFovDeg,
-            topPoleGuardDeg: options.topPoleGuardDeg,
-            bottomPoleGuardDeg: options.bottomPoleGuardDeg,
-            frameDelayMs: options.frameDelayMs,
-            tileTimeoutMs: options.tileTimeoutMs,
-            tileQuietMs: options.tileQuietMs,
-            progressCb: options.progressCb,
-        });
+        return this._capturePanoramaHybridWithViewerAsync(
+            viewer,
+            transform,
+            width,
+            height,
+            faceSize,
+            verticalFovDeg,
+            {
+                faceFovDeg: options.faceFovDeg,
+                topPoleGuardDeg: options.topPoleGuardDeg,
+                bottomPoleGuardDeg: options.bottomPoleGuardDeg,
+                frameDelayMs: options.frameDelayMs,
+                tileTimeoutMs: options.tileTimeoutMs,
+                tileQuietMs: options.tileQuietMs,
+                captureAnyway: options.captureAnyway,
+                continueOnTileTimeout: options.continueOnTileTimeout,
+                facesPerSlice: options.facesPerSlice,
+                signal: options.signal,
+                progressCb: options.progressCb,
+            },
+        );
     }
 
     async capturePanoramaIncrementalAsync(transform, options = {}) {
@@ -1705,7 +2439,7 @@ export class CesiumWorld {
 
         const width = Math.max(256, Math.round(options.width || 512));
         const height = Math.max(128, Math.round(options.height || Math.round(width / 2)));
-        const faceSize = Math.max(96, Math.round(options.faceSize || 128));
+        const faceSize = Math.max(64, Math.round(options.faceSize || 128));
         const verticalFovDeg = Math.max(1, Math.min(180, Number(options.verticalFovDeg) || 180));
         const viewer = await this._ensurePanoramaCaptureViewer(faceSize);
         return this._capturePanoramaHybridWithViewerAsync(viewer, transform, width, height, faceSize, verticalFovDeg, {
@@ -1715,6 +2449,9 @@ export class CesiumWorld {
             frameDelayMs: options.frameDelayMs,
             tileTimeoutMs: options.tileTimeoutMs,
             tileQuietMs: options.tileQuietMs,
+            captureAnyway: options.captureAnyway,
+            facesPerSlice: options.facesPerSlice,
+            signal: options.signal,
             progressCb: options.progressCb,
         });
     }
@@ -1741,5 +2478,289 @@ export class CesiumWorld {
             `lat ${this.Cesium.Math.toDegrees(carto.latitude).toFixed(6)}`,
             `alt ${Number(altitudeMeters || 0).toFixed(1)} m`,
         ].join(' | ');
+    }
+
+    /**
+     * Sample sparse metric-depth anchors via Cesium ray-casting against
+     * the currently-loaded 3D Tiles (Google Photorealistic).
+     *
+     * Each anchor is an ERP grid cell centre projected through the exact same
+     * sensor-NWU → cubemap-component → capture-transform path as the RGB
+     * panorama, then ray-cast against that panorama capture viewer's own scene
+     * and tileset.  The returned object contains both successful hits and
+     * per-anchor failure reasons so the downstream metric-fitting stage can
+     * decide how to handle missing data.
+     *
+     * @param {object} transform  – { position: {x,y,z}, orientation: quaternion }
+     * @param {object} [options]
+     * @param {number} [options.gridCols=16]
+     * @param {number} [options.gridRows=8]
+     * @param {number} [options.maxRangeM=100]
+     * @param {number} [options.excludeTopDeg=15]   – skip anchors within N° of top pole
+     * @param {number} [options.excludeBottomDeg=5] – skip anchors within N° of bottom pole
+     * @param {number} [options.imageWidth=384]     – ERP width for geometry
+     * @param {number} [options.imageHeight=192]    – ERP height for geometry
+     * @param {number} [options.verticalFovDeg=180]
+     * @param {string} options.sessionId            – stable collection-session ID
+     * @param {string} [options.locationId]         – stable physical-site ID for held-out validation
+     * @param {string} [options.captureId]          – ID shared by RGB/raw/anchor artifacts
+     * @param {string} [options.frameId]            – perception frame that supplied the RGB
+     * @returns {{ anchors: Array, failures: Array, metadata: object }}
+     */
+    sampleMetricDepthAnchors(transform, options = {}) {
+        const defaults = {
+            gridCols: 16, gridRows: 8,
+            maxRangeM: 100,
+            excludeTopDeg: 15, excludeBottomDeg: 5,
+            imageWidth: 384, imageHeight: 192,
+            verticalFovDeg: 180,
+        };
+        const opts = { ...defaults, ...options };
+
+        if (!transform || !transform.position || !transform.orientation) {
+            throw new TypeError('sampleMetricDepthAnchors requires a panorama capture transform');
+        }
+        const positionValues = [transform.position.x, transform.position.y, transform.position.z];
+        const orientationValues = [
+            transform.orientation.x,
+            transform.orientation.y,
+            transform.orientation.z,
+            transform.orientation.w,
+        ];
+        if (![...positionValues, ...orientationValues].every(Number.isFinite)) {
+            throw new TypeError('sampleMetricDepthAnchors requires a finite capture transform');
+        }
+        const quaternionNorm = Math.hypot(...orientationValues);
+        if (Math.abs(quaternionNorm - 1) > 1e-3) {
+            throw new RangeError('sampleMetricDepthAnchors requires a unit capture quaternion');
+        }
+        for (const key of ['gridCols', 'gridRows', 'imageWidth', 'imageHeight']) {
+            if (!Number.isInteger(opts[key]) || opts[key] <= 0) {
+                throw new RangeError(`${key} must be a positive integer`);
+            }
+        }
+        for (const key of ['maxRangeM', 'excludeTopDeg', 'excludeBottomDeg', 'verticalFovDeg']) {
+            if (!Number.isFinite(opts[key])) throw new RangeError(`${key} must be finite`);
+        }
+        if (opts.maxRangeM <= 0) throw new RangeError('maxRangeM must be positive');
+        if (opts.excludeTopDeg < 0 || opts.excludeTopDeg >= 90
+            || opts.excludeBottomDeg < 0 || opts.excludeBottomDeg >= 90) {
+            throw new RangeError('ERP pole exclusions must be in [0, 90) degrees');
+        }
+        if (opts.verticalFovDeg <= 0 || opts.verticalFovDeg > 180) {
+            throw new RangeError('verticalFovDeg must be in (0, 180]');
+        }
+        const identity = {};
+        for (const key of ['sessionId', 'captureId', 'locationId', 'frameId']) {
+            if (typeof opts[key] !== 'string' || opts[key].trim() === '') {
+                throw new TypeError(`${key} is required for metric anchor capture`);
+            }
+            identity[key] = opts[key];
+        }
+        const vfovRad = opts.verticalFovDeg / 180 * Math.PI;
+        const raySource = this._metricAnchorRaySource(transform, opts);
+        const tilesReady = this._tilesReady(raySource.tileset);
+
+        const anchors = [];
+        const failures = [];
+        const basis = getTransformBasisLocal(transform);
+        const samples = sampleAnchorDirections(
+            opts.gridCols,
+            opts.gridRows,
+            opts.imageWidth,
+            opts.imageHeight,
+            vfovRad
+        );
+
+        for (const sample of samples) {
+            const { col, row, u, v, yaw, pitch: pitchRad } = sample;
+            const pitchDeg = pitchRad * 180 / Math.PI;
+
+            // Pole exclusion
+            if (pitchDeg > (90 - opts.excludeTopDeg) || pitchDeg < (-90 + opts.excludeBottomDeg)) {
+                failures.push({ col, row, u, v, reason: 'pole_excluded', pitchDeg });
+                continue;
+            }
+
+            // The RGB projector first maps canonical sensor NWU into its
+            // cubemap component axes, then rotates those axes by exactly
+            // this capture transform.  Metric rays must follow the same
+            // path or anchors and pixels describe different directions.
+            const componentDirection = erpDirectionToComponent(sample);
+            const dir = componentDirectionToLocal(basis, componentDirection);
+            if (Math.hypot(dir.x, dir.y, dir.z) < 1e-9) {
+                failures.push({ col, row, u, v, reason: 'zero_direction' });
+                continue;
+            }
+
+            // Ray cast
+            const origin = transform.position;
+            const hit = this._pickLocalRayFromViewer(
+                raySource.viewer,
+                origin,
+                dir,
+                opts.maxRangeM,
+            );
+
+            if (!hit) {
+                // Distinguish failure modes
+                const reason = tilesReady
+                    ? 'no_hit' : 'tile_not_ready';
+                failures.push({ col, row, u, v, reason });
+                continue;
+            }
+
+            if (!Number.isFinite(hit.distance) || hit.distance <= 0 || hit.distance > opts.maxRangeM) {
+                failures.push({ col, row, u, v, reason: 'out_of_range', distance: hit.distance });
+                continue;
+            }
+
+            anchors.push({
+                col, row,
+                u, v,
+                yawDeg: yaw * 180 / Math.PI,
+                pitchDeg,
+                sensorDirection: { x: sample.dx, y: sample.dy, z: sample.dz },
+                componentDirection,
+                direction: dir,
+                distance: hit.distance,
+                position: hit.position,
+            });
+        }
+
+        return {
+            anchors,
+            failures,
+            metadata: {
+                schemaVersion: 1,
+                identity,
+                image: {
+                    width: opts.imageWidth,
+                    height: opts.imageHeight,
+                    pixelCoordinateConvention: 'integer-pixel-centres',
+                },
+                erp: {
+                    verticalFovDeg: opts.verticalFovDeg,
+                    sensorFrame: 'NWU(+x forward,+y left,+z up)',
+                    componentFrame: '(+x body-left,+y up,+z back)',
+                },
+                sampling: {
+                    gridCols: opts.gridCols,
+                    gridRows: opts.gridRows,
+                    maxRangeM: opts.maxRangeM,
+                    excludeTopDeg: opts.excludeTopDeg,
+                    excludeBottomDeg: opts.excludeBottomDeg,
+                },
+                transform: JSON.parse(JSON.stringify(transform)),
+                totalCells: opts.gridCols * opts.gridRows,
+                validAnchors: anchors.length,
+                failureCount: failures.length,
+                raycastSource: 'panorama-capture-viewer',
+                tilesetSharedWithRgb: true,
+                panoramaFaceSize: this._panoramaFaceSize || null,
+                panoramaCaptureRevision: raySource.capture.revision,
+                panoramaSourceImage: {
+                    width: raySource.capture.width,
+                    height: raySource.capture.height,
+                    verticalFovDeg: raySource.capture.verticalFovDeg,
+                },
+                panoramaFaceTileReadiness: raySource.capture.faceTileReadiness,
+                tileState: tilesReady ? 'ready' : 'loading',
+                timestamp: Date.now(),
+            },
+        };
+    }
+
+    _metricAnchorRaySource(transform, options) {
+        const viewer = this._panoramaViewer;
+        const tileset = this._panoramaTileset;
+        if (!viewer || (typeof viewer.isDestroyed === 'function' && viewer.isDestroyed()) || !viewer.scene) {
+            throw new Error('panorama capture viewer unavailable for metric anchor sampling');
+        }
+        if (!tileset) {
+            throw new Error('panorama capture tileset unavailable for metric anchor sampling');
+        }
+        if (this._panoramaCaptureActiveCount > 0) {
+            throw new Error('panorama capture is in progress; retry metric anchor sampling after the frame is frozen');
+        }
+        const capture = this._lastCompletedPanoramaCapture;
+        if (!capture || capture.viewer !== viewer || capture.tileset !== tileset) {
+            throw new Error('no completed RGB panorama capture matches the metric anchor ray source');
+        }
+        if (!captureTransformsEquivalent(capture.transform, transform)) {
+            throw new Error('metric anchor transform does not match the completed RGB panorama capture');
+        }
+        if (Math.abs(capture.verticalFovDeg - options.verticalFovDeg) > 1e-6) {
+            throw new Error('metric anchor vertical FOV does not match the completed RGB panorama capture');
+        }
+        if (capture.allFacesTileReady !== true) {
+            throw new Error('RGB panorama was copied before every cubemap face reported tiles ready');
+        }
+        // The upload canvas rounds width and height independently. Accept a
+        // target only when both rounded dimensions can come from one common
+        // source scale; this permits half-pixel rounding without admitting a
+        // genuinely distorted ERP aspect ratio.
+        const widthScaleRange = [
+            (options.imageWidth - 0.5) / capture.width,
+            (options.imageWidth + 0.5) / capture.width,
+        ];
+        const heightScaleRange = [
+            (options.imageHeight - 0.5) / capture.height,
+            (options.imageHeight + 0.5) / capture.height,
+        ];
+        const scaleRangesOverlap = Math.max(widthScaleRange[0], heightScaleRange[0])
+            <= Math.min(widthScaleRange[1], heightScaleRange[1]) + 1e-12;
+        if (!scaleRangesOverlap) {
+            throw new Error('metric anchor image aspect does not match the completed RGB panorama capture');
+        }
+        const primitives = viewer.scene.primitives;
+        if (primitives && typeof primitives.contains === 'function' && !primitives.contains(tileset)) {
+            throw new Error('panorama capture tileset is not attached to the RGB capture viewer');
+        }
+        return { viewer, tileset, capture };
+    }
+
+    _pickLocalRayFromViewer(viewer, originLocal, directionLocal, maxDistance) {
+        if (!viewer || !viewer.scene) return null;
+        const Cesium = this.Cesium;
+        const scene = viewer.scene;
+        if (!Cesium || typeof scene.pickFromRay !== 'function') return null;
+
+        const dir = normalize3(directionLocal);
+        if (Math.hypot(dir.x, dir.y, dir.z) < 1e-6) return null;
+
+        const origin = this.localToCartesian(originLocal);
+        const direction = this.localDirectionToFixed(dir);
+        const ray = new Cesium.Ray(origin, direction);
+
+        let hit;
+        try {
+            // The dedicated capture scene contains only its Google 3D Tileset,
+            // so exclusions from the main viewer must not be mixed into this pick.
+            hit = scene.pickFromRay(ray);
+        } catch (error) {
+            reportUserError('Panorama scene pickFromRay failed during metric anchor capture', error, {
+                key: 'panorama-anchor-pick-from-ray',
+                intervalMs: 10000,
+            });
+            return null;
+        }
+        if (!hit || !Cesium.defined(hit.position)) return null;
+
+        const local = this.cartesianToLocal(hit.position);
+        const distance = Math.hypot(
+            local.x - originLocal.x,
+            local.y - originLocal.y,
+            local.z - originLocal.z,
+        );
+        if (!Number.isFinite(distance) || distance <= 0 || distance > maxDistance) return null;
+        return { position: local, distance };
+    }
+
+    _tilesReady(tileset = this.tileset) {
+        if (tileset && typeof tileset.tilesLoaded !== 'undefined') {
+            return tileset.tilesLoaded;
+        }
+        return true; // optimistic
     }
 }

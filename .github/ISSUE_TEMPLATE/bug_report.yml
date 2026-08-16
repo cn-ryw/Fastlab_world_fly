@@ -1,0 +1,28 @@
+name: Bug 报告
+description: 报告可复现的仿真器问题
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: 请勿包含 token、代理凭据、私有飞行日志、原始标定数据或个人路径。
+  - type: textarea
+    id: description
+    attributes:
+      label: 发生了什么？
+      description: 描述实际行为和预期行为。
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: 复现步骤
+    validations:
+      required: true
+  - type: input
+    id: revision
+    attributes:
+      label: 版本与环境
+      description: 提交、操作系统、浏览器和 GPU/驱动版本，请勿粘贴凭据。
+    validations:
+      required: true

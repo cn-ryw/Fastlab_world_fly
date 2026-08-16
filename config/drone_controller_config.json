@@ -1,0 +1,318 @@
+{
+  "configVersion": 6,
+  "mapping": {
+    "roll": {
+      "source": "axis",
+      "axisIndex": 0,
+      "buttonIndex": -1,
+      "inverted": false,
+      "deadzone": 0,
+      "rate": 1,
+      "expo": 0
+    },
+    "pitch": {
+      "source": "axis",
+      "axisIndex": 1,
+      "buttonIndex": -1,
+      "inverted": false,
+      "deadzone": 0,
+      "rate": 1,
+      "expo": 0
+    },
+    "throttle": {
+      "source": "button",
+      "axisIndex": -1,
+      "buttonIndex": 6,
+      "inverted": false,
+      "deadzone": 0,
+      "rate": 1,
+      "expo": 0
+    },
+    "yaw": {
+      "source": "axis",
+      "axisIndex": 2,
+      "buttonIndex": -1,
+      "inverted": false,
+      "deadzone": 0,
+      "rate": 1,
+      "expo": 0
+    },
+    "cameraTilt": {
+      "source": "axis",
+      "axisIndex": -1,
+      "buttonIndex": -1,
+      "inverted": false,
+      "deadzone": 0,
+      "rate": 1,
+      "expo": 0
+    }
+  },
+  "buttonMapping": {
+    "arm": {
+      "source": "axis",
+      "buttonIndex": -1,
+      "axisIndex": 6,
+      "axisThreshold": 0.5,
+      "inverted": true,
+      "triggerMode": "toggle"
+    },
+    "modeSwitch": {
+      "source": "axis",
+      "buttonIndex": -1,
+      "axisIndex": 3,
+      "axisThreshold": 0.5,
+      "inverted": false,
+      "triggerMode": "level"
+    }
+  },
+  "hidCalibration": [
+    {
+      "min": null,
+      "center": null,
+      "max": null
+    },
+    {
+      "min": null,
+      "center": null,
+      "max": null
+    },
+    {
+      "min": null,
+      "center": null,
+      "max": null
+    },
+    {
+      "min": null,
+      "center": null,
+      "max": null
+    },
+    {
+      "min": null,
+      "center": null,
+      "max": null
+    },
+    {
+      "min": null,
+      "center": null,
+      "max": null
+    },
+    {
+      "min": null,
+      "center": null,
+      "max": null
+    },
+    {
+      "min": null,
+      "center": null,
+      "max": null
+    },
+    {
+      "min": null,
+      "center": null,
+      "max": null
+    },
+    {
+      "min": null,
+      "center": null,
+      "max": null
+    },
+    {
+      "min": null,
+      "center": null,
+      "max": null
+    },
+    {
+      "min": null,
+      "center": null,
+      "max": null
+    },
+    {
+      "min": null,
+      "center": null,
+      "max": null
+    },
+    {
+      "min": null,
+      "center": null,
+      "max": null
+    },
+    {
+      "min": null,
+      "center": null,
+      "max": null
+    },
+    {
+      "min": null,
+      "center": null,
+      "max": null
+    }
+  ],
+  "settings": {
+    "flight-mode-select": "drone",
+    "drone-max-speed": "83.3",
+    "drone-max-vspeed": "8",
+    "cam-hfov": "120",
+    "cam-mount-angle": "30",
+    "ctrl-pos-kp": "0.95",
+    "ctrl-pos-ki": "0",
+    "ctrl-pos-kd": "0",
+    "ctrl-vel-kp": "1.8",
+    "ctrl-vel-ki": "0.4",
+    "ctrl-vel-kd": "0.2",
+    "ctrl-alt-kp": "4",
+    "ctrl-alt-ki": "2",
+    "ctrl-alt-kd": "0",
+    "phys-mass": "980",
+    "phys-thrust": "2600",
+    "phys-drag-cd": "1.0",
+    "phys-drag-area": "0.0015",
+    "phys-drone-size": "0.3",
+    "phys-collision-radius": "0.6",
+    "clean-mode-toggle": false,
+    "osd-toggle": true,
+    "pano-level-toggle": true,
+    "yaw-lock-toggle": true
+  },
+  "modeRateExpo": {
+    "drone": {
+      "roll": {
+        "rate": 1,
+        "expo": 0
+      },
+      "pitch": {
+        "rate": 1,
+        "expo": 0
+      },
+      "throttle": {
+        "rate": 1,
+        "expo": 0
+      },
+      "yaw": {
+        "rate": 1,
+        "expo": 0
+      },
+      "cameraTilt": {
+        "rate": 1,
+        "expo": 0
+      }
+    },
+    "fpv": {
+      "roll": {
+        "rate": 1,
+        "expo": 0
+      },
+      "pitch": {
+        "rate": 1,
+        "expo": 0
+      },
+      "throttle": {
+        "rate": 1,
+        "expo": 0
+      },
+      "yaw": {
+        "rate": 1,
+        "expo": 0
+      },
+      "cameraTilt": {
+        "rate": 1,
+        "expo": 0
+      }
+    },
+    "stabilized": {
+      "roll": {
+        "rate": 1,
+        "expo": 0
+      },
+      "pitch": {
+        "rate": 1,
+        "expo": 0
+      },
+      "throttle": {
+        "rate": 1,
+        "expo": 0
+      },
+      "yaw": {
+        "rate": 1,
+        "expo": 0
+      },
+      "cameraTilt": {
+        "rate": 1,
+        "expo": 0
+      }
+    },
+    "so3": {
+      "roll": {
+        "rate": 1,
+        "expo": 0
+      },
+      "pitch": {
+        "rate": 1,
+        "expo": 0
+      },
+      "throttle": {
+        "rate": 1,
+        "expo": 0
+      },
+      "yaw": {
+        "rate": 1,
+        "expo": 0
+      },
+      "cameraTilt": {
+        "rate": 1,
+        "expo": 0
+      }
+    }
+  },
+  "modePidSettings": {
+    "drone": {
+      "ctrl-pos-kp": "0.95",
+      "ctrl-pos-ki": "0",
+      "ctrl-pos-kd": "0",
+      "ctrl-vel-kp": "1.8",
+      "ctrl-vel-ki": "0.4",
+      "ctrl-vel-kd": "0.2",
+      "ctrl-alt-kp": "4",
+      "ctrl-alt-ki": "2",
+      "ctrl-alt-kd": "0"
+    },
+    "fpv": {
+      "ctrl-pos-kp": "0.95",
+      "ctrl-pos-ki": "0",
+      "ctrl-pos-kd": "0",
+      "ctrl-vel-kp": "1.8",
+      "ctrl-vel-ki": "0.4",
+      "ctrl-vel-kd": "0.2",
+      "ctrl-alt-kp": "4",
+      "ctrl-alt-ki": "2",
+      "ctrl-alt-kd": "0"
+    },
+    "stabilized": {
+      "ctrl-pos-kp": "0.95",
+      "ctrl-pos-ki": "0",
+      "ctrl-pos-kd": "0",
+      "ctrl-vel-kp": "1.8",
+      "ctrl-vel-ki": "0.4",
+      "ctrl-vel-kd": "0.2",
+      "ctrl-alt-kp": "4",
+      "ctrl-alt-ki": "2",
+      "ctrl-alt-kd": "0"
+    },
+    "so3": {
+      "ctrl-pos-kp": "0.95",
+      "ctrl-pos-ki": "0",
+      "ctrl-pos-kd": "0",
+      "ctrl-vel-kp": "1.8",
+      "ctrl-vel-ki": "0.4",
+      "ctrl-vel-kd": "0.2",
+      "ctrl-alt-kp": "4",
+      "ctrl-alt-ki": "2",
+      "ctrl-alt-kd": "0"
+    }
+  },
+  "currentMode": "drone",
+  "gatePathSettings": {
+    "gateSize": 1.2,
+    "clearance": 0.8,
+    "path": null
+  }
+}

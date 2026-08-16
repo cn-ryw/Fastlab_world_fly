@@ -1,0 +1,37 @@
+# YOPO_55/epoch10 单尺度静态安全配置，由 YOPO_54/epoch30 微调得到。
+# 这里显式固定 SafetyLoss 参数，避免基础配置变化后意外启用双尺度研究项。
+dataset_path: "../dataset_x5_level"
+leveled_depth: true
+depth_max_m: 20.0
+depth_min_m: 0.04
+depth_mask_threshold: 127
+cruise_target_mps: 15.0
+velocity: 16.0
+vel_max_train: 16.0
+acc_max_train: 12.0
+radio_range: 9.0
+speed_mixture:
+  - [14.0, 16.0, 0.85]
+  - [10.0, 14.0, 0.10]
+  - [0.0, 10.0, 0.05]
+vz_fraction_std: 0.12
+vz_fraction_max: 0.30
+validation_map_index: 4
+mask_augment_enabled: true
+mask_augment_probability: 0.75
+mask_hole_count: [1, 4]
+mask_hole_width_fraction: [0.02, 0.12]
+mask_hole_height_fraction: [0.03, 0.20]
+mask_band_probability: 0.35
+mask_dropout_ratio: [0.05, 0.35]
+mask_min_valid_ratio: 0.60
+mask_fill_mode: "valid_mean"
+wc: 3.0
+vehicle_radius_m: 0.60
+safety_margin_m: 0.60
+d0: 1.20
+r: 0.60
+safety_far_weight: 0.0
+safety_far_r: 1.20
+safety_loss_eval_points: 30
+controller_accel_hard_cap_mps2: 25.0

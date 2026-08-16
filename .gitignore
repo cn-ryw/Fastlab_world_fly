@@ -2,3 +2,22 @@ __pycache__/
 *.pyc
 tools/
 third_party/DA360/
+
+# Runtime state must never enter commits.
+.dev-web.pid
+.dev-web.log
+.dev-firefox.log
+.dev-chrome.log
+.chrome-mindcloud-flight/
+.chrome-mindcloud-profile/
+
+# Reproducible third-party web builds are fetched from versions.lock.json.
+third_party/Cesium/
+asset/vendor/playcanvas.min.js
+
+# Model weights and raw calibration captures live outside Git.  Only compact
+# manifests, fit reports, and approved calibration parameters are versioned.
+models/
+experiment_data/raw/
+experiment_data/**/*.npz
+experiment_data/**/*.npy

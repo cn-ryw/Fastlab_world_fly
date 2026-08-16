@@ -19,9 +19,12 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+    <meta http-equiv="Pragma" content="no-cache">
+    <meta http-equiv="Expires" content="0">
 	    <title>Google 3D Tiles Flight</title>
 	    <link id="cesium-widgets-css" href="/ThirdParty/Cesium/Widgets/widgets.css" rel="stylesheet"
-	          onerror="this.onerror=null;this.href='https://cesium.com/downloads/cesiumjs/releases/1.121/Build/Cesium/Widgets/widgets.css';">
+	          onerror="this.onerror=null;this.href='https://cesium.com/downloads/cesiumjs/releases/1.117/Build/Cesium/Widgets/widgets.css';">
 	    <script>
 	        window.CESIUM_BASE_URL = '/ThirdParty/Cesium/';
             window.googleTilesCesiumReady = new Promise(function (resolve, reject) {
@@ -34,7 +37,7 @@
                 }
             };
             window.googleTilesLoadCesiumFallback = function (failedScript) {
-                var base = 'https://cesium.com/downloads/cesiumjs/releases/1.121/Build/Cesium/';
+                var base = 'https://cesium.com/downloads/cesiumjs/releases/1.117/Build/Cesium/';
                 window.CESIUM_BASE_URL = base;
                 var script = document.createElement('script');
                 script.src = base + 'Cesium.js';
@@ -50,7 +53,8 @@
 	    <script src="/ThirdParty/Cesium/Cesium.js"
                 onload="window.googleTilesCesiumLoaded && window.googleTilesCesiumLoaded();"
 	            onerror="window.googleTilesLoadCesiumFallback && window.googleTilesLoadCesiumFallback(this);"></script>
-	    <script src="https://cdn.jsdelivr.net/npm/playcanvas@2.17.2/build/playcanvas.min.js"></script>
+	    <script src="asset/vendor/playcanvas.min.js"
+            onerror="this.onerror=null;var s=document.createElement('script');s.src='https://cdn.jsdelivr.net/npm/playcanvas@2.17.2/build/playcanvas.min.js';document.head.appendChild(s);"></script>
     <!--
       Race-panel type testbed. The CSS variables defined in `:root`
       (`--race-font-family`, `--race-font-weight`, `--race-font-style`)
@@ -74,7 +78,7 @@
     -->
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@500;700;900&family=Share+Tech+Mono&family=Chakra+Petch:ital,wght@0,400;0,700;1,400;1,700&family=Rajdhani:wght@400;500;700&family=JetBrains+Mono:ital,wght@0,400;0,700;1,400;1,700&family=Teko:wght@400;500;700&family=VT323&family=Audiowide&family=Michroma&family=Wallpoet&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Chakra+Petch:ital,wght@0,400;0,700;1,400;1,700&family=Share+Tech+Mono&family=JetBrains+Mono:ital,wght@0,400;0,700;1,400;1,700&display=swap" rel="stylesheet" media="print" onload="this.media='all'">
     <style>
         /* ================================================================
          * RACE-PANEL TYPE CONTROL — edit the three variables below to
@@ -211,8 +215,7 @@
             border: 1px solid rgba(125, 211, 252, 0.42);
             border-radius: 6px;
         }
-        .panorama-pane canvas,
-        .panorama-pane img {
+        .panorama-pane canvas {
             width: 100%;
             height: 100%;
             display: block;
@@ -239,6 +242,43 @@
             font-size: 10px;
             font-weight: 600;
             letter-spacing: 0;
+        }
+        .panorama-status[data-state="offline"],
+        .panorama-status[data-state="error"] {
+            color: #fca5a5;
+        }
+        .panorama-status[data-state="planning"] {
+            color: #86efac;
+        }
+        .panorama-status[data-outcome="stale"] {
+            color: #fcd34d;
+        }
+        .panorama-readiness-badge {
+            position: absolute;
+            left: 8px;
+            bottom: 7px;
+            z-index: 2;
+            padding: 3px 6px;
+            border: 1px solid rgba(125, 211, 252, 0.5);
+            border-radius: 4px;
+            background: rgba(3, 7, 18, 0.82);
+            color: #7dd3fc;
+            font-size: 9px;
+            font-weight: 700;
+            letter-spacing: 0.2px;
+            text-shadow: 0 1px 2px #000;
+        }
+        .panorama-readiness-badge[data-state="ready"] {
+            border-color: rgba(74, 222, 128, 0.7);
+            color: #86efac;
+        }
+        .panorama-readiness-badge[data-state="partial"] {
+            border-color: rgba(250, 204, 21, 0.7);
+            color: #fde047;
+        }
+        .panorama-readiness-badge[data-state="error"] {
+            border-color: rgba(248, 113, 113, 0.8);
+            color: #fca5a5;
         }
         .depth-legend {
             padding: 7px 9px 8px;
@@ -282,6 +322,34 @@
         .depth-legend-labels {
             color: #cbd5e1;
             font-size: 10px;
+        }
+
+        /* Radar minimap */
+        #radar-panel {
+            position: fixed;
+            bottom: 10px;
+            left: 10px;
+            width: 190px;
+            height: 190px;
+            background: rgba(3,7,18,0.88);
+            border: 1px solid rgba(125,211,252,0.42);
+            border-radius: 50%;
+            overflow: hidden;
+            z-index: 200;
+            display: none;
+        }
+        #radar-panel.visible { display: block; }
+        #radar-canvas { width: 100%; height: 100%; display: block; }
+        .radar-label {
+            position: absolute; top: 38px; left: 21px;
+            color: #cbd5e1; font-size: 8px; font-weight: 700;
+            white-space: nowrap;
+            pointer-events: none;
+        }
+        .radar-range {
+            position: absolute; bottom: 38px; left: 21px;
+            color: #7dd3fc; font-size: 9px; pointer-events: none;
+            white-space: nowrap;
         }
 
         /* Race timing panel (F1 timing-tower style, left-middle). */
@@ -705,13 +773,15 @@
                 <span class="panorama-status" id="panorama-rgb-status">idle</span>
             </div>
             <canvas id="panorama-rgb-canvas"></canvas>
+            <div class="panorama-readiness-badge" id="panorama-rgb-readiness" data-state="loading"
+                 title="Waiting for the first panorama capture.">RGB LOADING 0/6</div>
         </div>
         <div class="panorama-pane">
             <div class="panorama-pane-header">
                 <span>DA360 DEPTH</span>
                 <span class="panorama-status" id="panorama-depth-status">offline</span>
             </div>
-            <img id="panorama-depth-image" alt="DA360 panoramic depth">
+            <canvas id="panorama-depth-canvas" width="384" height="192"></canvas>
         </div>
         <div class="depth-legend" aria-label="DA360 relative distance legend">
             <div class="depth-legend-row">
@@ -724,6 +794,20 @@
                 <span id="panorama-depth-far-label">far --</span>
             </div>
         </div>
+    </div>
+
+    <!-- North-up 360-depth top-down view (not a physical radar) -->
+    <div id="radar-panel" title="Left-click to set a waypoint. Relative mode maps the circle to a nominal 20 m test radius; depth remains non-metric.">
+        <canvas id="radar-canvas" width="190" height="190"></canvas>
+        <div id="depth-topdown-mode" class="radar-label">WAITING FOR DEPTH</div>
+        <div id="depth-topdown-range" class="radar-range">R --</div>
+    </div>
+
+    <!-- Waypoint input -->
+    <div id="waypoint-input" style="display:none;">
+        <input type="text" id="waypoint-x" placeholder="X (east)" style="width:70px;">
+        <input type="text" id="waypoint-z" placeholder="Z (north)" style="width:70px;">
+        <button id="waypoint-go-btn">Go</button>
     </div>
 
     <!-- Gear button -->
@@ -753,6 +837,12 @@
                 <input type="checkbox" id="panorama-toggle" checked>
             </div>
         </div>
+        <div class="setting-row">
+            <label for="flight-path-toggle">Flight Path History</label>
+            <div class="controls">
+                <input type="checkbox" id="flight-path-toggle" checked>
+            </div>
+        </div>
 
         <h3>Race Course</h3>
         <div style="font-size:12px;color:#777;margin:-4px 0 8px;">Gate rendering is disabled in Google Tiles mode for this migration step.</div>
@@ -778,8 +868,7 @@
             <label>Up Axis</label>
             <div class="controls">
                 <select id="coord-system-select" disabled style="background:#223;color:#888;border:1px solid #334;border-radius:3px;padding:4px 8px;font-size:13px;cursor:not-allowed;">
-                    <option value="zup" selected>Z-Up</option>
-                    <option value="yup">Y-Up</option>
+                    <option value="yup" selected>Y-Up (Simulation World)</option>
                 </select>
             </div>
         </div>
@@ -791,11 +880,13 @@
                 <select id="flight-mode-select" style="background:#223;color:#ddd;border:1px solid #446;border-radius:3px;padding:4px 8px;font-size:13px;">
                     <option value="drone" selected>Drone (Easy)</option>
                     <option value="fpv">FPV (Manual)</option>
+                    <option value="stabilized">Level (Self-Level)</option>
+                    <option value="so3">SO3 (YOPO Auto)</option>
                 </select>
             </div>
         </div>
         <div style="font-size:12px;color:#8aa;margin:-2px 0 8px;line-height:1.4;">
-            Drone (Easy): ↑/↓ controls forward/back speed, W/S climbs or descends, Shift boosts lower speed settings up to the 300 km/h cap. FPV (Manual): W/S is motor thrust, so forward flight needs pitch.
+            Easy: sticks command velocity and release into brake/hold. FPV: manual body rates and motor thrust. Level: self-level roll/pitch with manual thrust—there is no altitude hold. SO3: YOPO waypoint auto-flight; a connected RC transmitter continuously moves a 50 m rolling goal, while other inputs use G+scene click or the depth circle. C cancels a fixed goal. In relative-depth mode, a circle click is a nominal 20 m interaction test only and cannot authorize a YOPO trajectory.
         </div>
         <div class="setting-row">
             <label>Easy Max Speed (m/s; 83.3 = 300 km/h)</label>
@@ -830,43 +921,43 @@
         <div class="setting-row">
             <label>Pos Kp</label>
             <div class="controls">
-                <input type="range" id="ctrl-pos-kp" min="0" max="10" value="2.0" step="0.1">
-                <input type="number" id="ctrl-pos-kp-num" min="0" max="10" step="0.1" value="2.0" style="width:60px;background:#223;color:#ddd;border:1px solid #446;border-radius:3px;padding:2px 4px;font-size:12px;">
+                <input type="range" id="ctrl-pos-kp" min="0" max="10" value="0.95" step="0.05">
+                <input type="number" id="ctrl-pos-kp-num" min="0" max="10" step="0.05" value="0.95" style="width:60px;background:#223;color:#ddd;border:1px solid #446;border-radius:3px;padding:2px 4px;font-size:12px;">
             </div>
         </div>
         <div class="setting-row">
             <label>Pos Ki</label>
             <div class="controls">
-                <input type="range" id="ctrl-pos-ki" min="0" max="5" value="0.3" step="0.05">
-                <input type="number" id="ctrl-pos-ki-num" min="0" max="5" step="0.05" value="0.3" style="width:60px;background:#223;color:#ddd;border:1px solid #446;border-radius:3px;padding:2px 4px;font-size:12px;">
+                <input type="range" id="ctrl-pos-ki" min="0" max="5" value="0" step="0.05">
+                <input type="number" id="ctrl-pos-ki-num" min="0" max="5" step="0.05" value="0" style="width:60px;background:#223;color:#ddd;border:1px solid #446;border-radius:3px;padding:2px 4px;font-size:12px;">
             </div>
         </div>
         <div class="setting-row">
             <label>Pos Kd</label>
             <div class="controls">
-                <input type="range" id="ctrl-pos-kd" min="0" max="5" value="0.1" step="0.05">
-                <input type="number" id="ctrl-pos-kd-num" min="0" max="5" step="0.05" value="0.1" style="width:60px;background:#223;color:#ddd;border:1px solid #446;border-radius:3px;padding:2px 4px;font-size:12px;">
+                <input type="range" id="ctrl-pos-kd" min="0" max="5" value="0" step="0.05">
+                <input type="number" id="ctrl-pos-kd-num" min="0" max="5" step="0.05" value="0" style="width:60px;background:#223;color:#ddd;border:1px solid #446;border-radius:3px;padding:2px 4px;font-size:12px;">
             </div>
         </div>
         <div class="setting-row">
             <label>Vel Kp</label>
             <div class="controls">
-                <input type="range" id="ctrl-vel-kp" min="0" max="10" value="3.0" step="0.1">
-                <input type="number" id="ctrl-vel-kp-num" min="0" max="10" step="0.1" value="3.0" style="width:60px;background:#223;color:#ddd;border:1px solid #446;border-radius:3px;padding:2px 4px;font-size:12px;">
+                <input type="range" id="ctrl-vel-kp" min="0" max="10" value="1.8" step="0.1">
+                <input type="number" id="ctrl-vel-kp-num" min="0" max="10" step="0.1" value="1.8" style="width:60px;background:#223;color:#ddd;border:1px solid #446;border-radius:3px;padding:2px 4px;font-size:12px;">
             </div>
         </div>
         <div class="setting-row">
             <label>Vel Ki</label>
             <div class="controls">
-                <input type="range" id="ctrl-vel-ki" min="0" max="5" value="1.0" step="0.05">
-                <input type="number" id="ctrl-vel-ki-num" min="0" max="5" step="0.05" value="1.0" style="width:60px;background:#223;color:#ddd;border:1px solid #446;border-radius:3px;padding:2px 4px;font-size:12px;">
+                <input type="range" id="ctrl-vel-ki" min="0" max="5" value="0.4" step="0.05">
+                <input type="number" id="ctrl-vel-ki-num" min="0" max="5" step="0.05" value="0.4" style="width:60px;background:#223;color:#ddd;border:1px solid #446;border-radius:3px;padding:2px 4px;font-size:12px;">
             </div>
         </div>
         <div class="setting-row">
             <label>Vel Kd</label>
             <div class="controls">
-                <input type="range" id="ctrl-vel-kd" min="0" max="5" value="0.05" step="0.01">
-                <input type="number" id="ctrl-vel-kd-num" min="0" max="5" step="0.01" value="0.05" style="width:60px;background:#223;color:#ddd;border:1px solid #446;border-radius:3px;padding:2px 4px;font-size:12px;">
+                <input type="range" id="ctrl-vel-kd" min="0" max="5" value="0.2" step="0.01">
+                <input type="number" id="ctrl-vel-kd-num" min="0" max="5" step="0.01" value="0.2" style="width:60px;background:#223;color:#ddd;border:1px solid #446;border-radius:3px;padding:2px 4px;font-size:12px;">
             </div>
         </div>
         <div class="setting-row">
@@ -886,24 +977,56 @@
         <div class="setting-row">
             <label>Alt Kd</label>
             <div class="controls">
-                <input type="range" id="ctrl-alt-kd" min="0" max="5" value="0.1" step="0.01">
-                <input type="number" id="ctrl-alt-kd-num" min="0" max="5" step="0.01" value="0.1" style="width:60px;background:#223;color:#ddd;border:1px solid #446;border-radius:3px;padding:2px 4px;font-size:12px;">
+                <input type="range" id="ctrl-alt-kd" min="0" max="5" value="0" step="0.01">
+                <input type="number" id="ctrl-alt-kd-num" min="0" max="5" step="0.01" value="0" style="width:60px;background:#223;color:#ddd;border:1px solid #446;border-radius:3px;padding:2px 4px;font-size:12px;">
             </div>
         </div>
 
+        <h3>SO3 / Panorama</h3>
+        <div class="setting-row">
+            <label>Level Panorama</label>
+            <div class="controls">
+                <input type="checkbox" id="pano-level-toggle" checked>
+                <span style="font-size:12px;color:#aaa;">horizon-stabilized 360° view</span>
+            </div>
+        </div>
+        <div class="setting-row">
+            <label>Yaw Lock (SO3)</label>
+            <div class="controls">
+                <input type="checkbox" id="yaw-lock-toggle" checked>
+                <span style="font-size:12px;color:#aaa;">fix initial yaw for planning</span>
+            </div>
+        </div>
+
+        <h3>SO3 Hold Controller</h3>
+        <div style="font-size:12px;color:#8aa;margin:-2px 0 8px;line-height:1.4;">
+            Kx/Kv apply only while waiting for a trajectory or holding safely. Active YOPO trajectories use direct acceleration commands.
+        </div>
+        <div class="setting-row">
+            <label>Position Kx</label>
+            <div class="controls">
+                <span style="font-size:12px;color:#aaa;">XY 5.7 &nbsp;|&nbsp; Y-Up 6.2</span>
+            </div>
+        </div>
+        <div class="setting-row">
+            <label>Velocity Kv</label>
+            <div class="controls">
+                <span style="font-size:12px;color:#aaa;">XY 3.4 &nbsp;|&nbsp; Y-Up 4.0</span>
+            </div>
+        </div>
         <h3>Physics</h3>
         <div class="setting-row">
             <label>Mass (g)</label>
             <div class="controls">
-                <input type="range" id="phys-mass" min="50" max="5000" value="500" step="10">
-                <input type="number" id="phys-mass-num" min="50" max="5000" step="10" value="500" style="width:60px;background:#223;color:#ddd;border:1px solid #446;border-radius:3px;padding:2px 4px;font-size:12px;">
+                <input type="range" id="phys-mass" min="50" max="5000" value="980" step="10">
+                <input type="number" id="phys-mass-num" min="50" max="5000" step="10" value="980" style="width:60px;background:#223;color:#ddd;border:1px solid #446;border-radius:3px;padding:2px 4px;font-size:12px;">
             </div>
         </div>
         <div class="setting-row">
             <label>Max Thrust (gf)</label>
             <div class="controls">
-                <input type="range" id="phys-thrust" min="100" max="5000" value="1000" step="10">
-                <input type="number" id="phys-thrust-num" min="100" max="5000" step="10" value="1000" style="width:60px;background:#223;color:#ddd;border:1px solid #446;border-radius:3px;padding:2px 4px;font-size:12px;">
+                <input type="range" id="phys-thrust" min="100" max="8000" value="2600" step="10">
+                <input type="number" id="phys-thrust-num" min="100" max="8000" step="10" value="2600" style="width:60px;background:#223;color:#ddd;border:1px solid #446;border-radius:3px;padding:2px 4px;font-size:12px;">
             </div>
         </div>
         <div style="font-size:12px;color:#8aa;margin:-2px 0 8px;line-height:1.4;">
@@ -933,8 +1056,24 @@
         <div class="setting-row">
             <label>Collision Radius (m)</label>
             <div class="controls">
-                <input type="range" id="phys-collision-radius" min="0.05" max="2.0" value="0.15" step="0.05">
-                <input type="number" id="phys-collision-radius-num" min="0.05" max="2.0" step="0.05" value="0.15" style="width:60px;background:#223;color:#ddd;border:1px solid #446;border-radius:3px;padding:2px 4px;font-size:12px;">
+                <input type="range" id="phys-collision-radius" min="0.05" max="2.0" value="0.6" step="0.05">
+                <input type="number" id="phys-collision-radius-num" min="0.05" max="2.0" step="0.05" value="0.6" style="width:60px;background:#223;color:#ddd;border:1px solid #446;border-radius:3px;padding:2px 4px;font-size:12px;">
+            </div>
+        </div>
+
+        <h3>Display</h3>
+        <div class="setting-row">
+            <label>Drone Model Scale</label>
+            <div class="controls">
+                <input type="range" id="drone-model-scale" min="0.05" max="2.0" value="0.171" step="0.005">
+                <input type="number" id="drone-model-scale-num" min="0.05" max="2.0" step="0.005" value="0.171" style="width:60px;background:#223;color:#ddd;border:1px solid #446;border-radius:3px;padding:2px 4px;font-size:12px;">
+            </div>
+        </div>
+        <div class="setting-row">
+            <label>Goal Font Size</label>
+            <div class="controls">
+                <input type="range" id="goal-font-size" min="10" max="48" value="18" step="1">
+                <input type="number" id="goal-font-size-num" min="10" max="48" step="1" value="18" style="width:60px;background:#223;color:#ddd;border:1px solid #446;border-radius:3px;padding:2px 4px;font-size:12px;">
             </div>
         </div>
 
@@ -969,7 +1108,7 @@
                         window.googleTilesFlightStart();
                         return;
                     }
-                    import('./src/main.js?v=20260703-panorama-tile-idle')
+                    import('./src/main.js?v=20260814-path-collision-a3')
                         .then(function (mod) {
                             var start = window.googleTilesFlightStart || mod.startTilesMode;
                             if (typeof start === 'function') start();
@@ -980,6 +1119,6 @@
             });
         }());
     </script>
-    <script type="module" src="src/main.js?v=20260703-panorama-tile-idle"></script>
+    <script type="module" src="src/main.js?v=20260814-path-collision-a3"></script>
 </body>
 </html>

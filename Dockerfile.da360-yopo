@@ -1,0 +1,33 @@
+ARG YOPO_BASE_IMAGE=ghcr.io/cn-ryw/yopo:sim-u2004-noetic-py38
+FROM ${YOPO_BASE_IMAGE}
+
+ENV PYTHONUNBUFFERED=1 \
+    OPENCV_IO_ENABLE_OPENEXR=1 \
+    DA360_ROOT=/opt/DA360 \
+    YOPO_ROOT=/opt/YOPO_360 \
+    YOPO_CONFIG=x5_cruise15_18m_a12_mask_wc3.yaml \
+    DA360_RESAMPLE=bicubic \
+    DA360_CHANNELS_LAST=0 \
+    YOPO_CHANNELS_LAST=0 \
+    DA360_MAX_CONTENT_LENGTH=8388608
+
+ENV PATH="/opt/venv/bin:$PATH"
+
+# DA360 code
+COPY third_party/DA360 "$DA360_ROOT"
+COPY third_party/wheels /tmp/wheels
+RUN python3 -m pip install --no-cache-dir --no-deps --no-index --find-links /tmp/wheels timm \
+    && rm -rf /tmp/wheels
+
+# YOPO code (must be at /opt/YOPO_360/YOPO for config module discovery)
+COPY third_party/YOPO /opt/YOPO_360/YOPO
+
+# All server scripts in one place
+COPY scripts/da360_server.py /opt/server/da360_server.py
+COPY scripts/yopo_bridge.py /opt/server/yopo_bridge.py
+COPY scripts/combined_server.py /opt/server/combined_server.py
+
+WORKDIR /opt/server
+EXPOSE 5688
+
+CMD ["python3", "/opt/server/combined_server.py", "--host", "0.0.0.0", "--port", "5688"]

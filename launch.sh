@@ -22,7 +22,7 @@ Usage:
   ./launch.sh                 Build/run Docker, then open the browser
   ./launch.sh --no-open       Start the server only
   ./launch.sh --local         Use scripts/serve.py for local development
-  ./launch.sh --setup-input   Install Linux udev rules for RC/WebHID access
+  ./launch.sh --setup-input   Install Linux udev rules for T8L/WebHID access
 
 Options:
   --docker                    Use Docker mode (default)
@@ -32,7 +32,7 @@ Options:
   --port PORT                 Host port, same as PORT=18081 ./launch.sh
   --image IMAGE               Docker image name
   --name NAME                 Docker container name
-  --input-status              Print controller/HID status and exit
+  --input-status              Print T8L serial/controller status and exit
   -h, --help                  Show this help
 
 Environment:
@@ -264,11 +264,14 @@ print_input_status() {
     local js_devices=()
     local hid_devices=()
     local blocked_hid=()
+    local t8l_devices=()
+    local blocked_t8l=()
     local dev
 
     shopt -s nullglob
     js_devices=(/dev/input/js*)
     hid_devices=(/dev/hidraw*)
+    t8l_devices=(/dev/serial/by-id/*RADIOMASTER*)
     shopt -u nullglob
 
     echo "Input devices:"
@@ -302,9 +305,27 @@ print_input_status() {
         echo "  WebHID: no hidraw device detected yet."
     fi
 
-    if ((${#js_devices[@]} == 0 && ${#hid_devices[@]} == 0)); then
+    if ((${#t8l_devices[@]} > 0)); then
+        for dev in "${t8l_devices[@]}"; do
+            local target
+            target="$(readlink -f "$dev" 2>/dev/null || true)"
+            if [[ -r "$dev" && -w "$dev" ]]; then
+                echo "  T8L Web Serial: $dev -> ${target:-unknown} (ready)"
+            else
+                blocked_t8l+=("$dev")
+                echo "  T8L Web Serial: $dev -> ${target:-unknown} (permission required)"
+            fi
+        done
+        if ((${#blocked_t8l[@]} > 0)); then
+            echo "                  Run: ./launch.sh --setup-input"
+        fi
+    else
+        echo "  T8L Web Serial: RadioMaster serial device not detected."
+    fi
+
+    if ((${#js_devices[@]} == 0 && ${#hid_devices[@]} == 0 && ${#t8l_devices[@]} == 0)); then
         echo "  No controller is connected. Keyboard control is available."
-        echo "  You can plug in a gamepad later and refresh, or use Settings -> Connect HID."
+        echo "  Plug in T8L/gamepad, or use Settings -> Connect T8L / Connect HID."
     fi
 }
 
@@ -326,8 +347,11 @@ setup_input_rules() {
     tmp="$(mktemp)"
     cat > "$tmp" <<'EOF'
 # Google 3D Tiles Flight input access.
-# Allows Chrome Gamepad API and WebHID to read common RC transmitter devices.
+# Allows Chrome Gamepad API, WebHID, and Web Serial to read RC transmitters.
 ACTION=="add|change", SUBSYSTEM=="input", ENV{ID_INPUT_JOYSTICK}=="1", TAG+="uaccess", MODE="0660"
+
+# RadioMaster T8L processed-channel VCP (VID:PID 19f5:5740).
+ACTION=="add|change", SUBSYSTEM=="tty", ATTRS{idVendor}=="19f5", ATTRS{idProduct}=="5740", TAG+="uaccess", GROUP="dialout", MODE="0660"
 
 # RadioMaster / OpenTX / EdgeTX / common STM32 HID devices.
 ACTION=="add|change", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1209", TAG+="uaccess", MODE="0660"
@@ -345,6 +369,9 @@ EOF
     if [[ -n "$target_user" ]] && id "$target_user" >/dev/null 2>&1 && getent group plugdev >/dev/null 2>&1; then
         usermod -aG plugdev "$target_user" || true
     fi
+    if [[ -n "$target_user" ]] && id "$target_user" >/dev/null 2>&1 && getent group dialout >/dev/null 2>&1; then
+        usermod -aG dialout "$target_user" || true
+    fi
 
     if command -v udevadm >/dev/null 2>&1; then
         udevadm control --reload-rules || true
@@ -353,7 +380,7 @@ EOF
 
     echo "Installed: $RULE_FILE"
     if [[ -n "$target_user" ]]; then
-        echo "User $target_user is in plugdev if the group exists."
+        echo "User $target_user is in plugdev/dialout if those groups exist."
     fi
     echo "Reconnect the RC transmitter/gamepad. If group membership changed, log out and back in."
 }
