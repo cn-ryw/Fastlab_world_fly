@@ -28,7 +28,7 @@
 
 ### 3. DA360、YOPO 与全景感知
 
-- DA360 使用项目负责人于 2026-08-11 人工接受的 scale-only 米制标定作为 sim-to-sim 基线；
+- DA360 使用 2026-08-11 经实时效果人工检查后接受的 scale-only 米制标定作为 sim-to-sim 基线；
   自动 LOLO 精度门禁失败的事实仍完整保留，不将其描述成真实传感器精度验收通过。
 - `start-all.sh` 默认启动 `da360-metric`，YOPO 规划响应携带稳定的标定和服务身份。
 - 全景 RGB 方位恢复为 YOPO ERP 契约，修复左右镜像；深度 top-down 可视化同步修正。
@@ -53,7 +53,7 @@
 - SO3 direct-acceleration、25 m/s²、60°、轨迹替换、过期、碰撞和模式连续性；
 - Poly5 区间极值、固定时基、配置迁移、全景方位、metric anchor、后端契约和 evaluator 门禁。
 
-当前真实 Firefox 飞行已经证明：米制深度、YOPO、轨迹安装、SO3 执行和到达链路可用。
+当前 Firefox 飞行记录显示，米制深度、YOPO、轨迹安装、SO3 执行和到达链路能够完成一次闭环运行。
 但最近两次城市飞行仍未通过正式实时性验收：有效规划约 2.6/6.0 Hz，
 capture-to-apply p95 约 249/244 ms，尚未达到 15 Hz 和 150 ms 门槛。
 

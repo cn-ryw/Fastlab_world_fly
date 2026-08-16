@@ -941,7 +941,7 @@ class BackendContractTests(unittest.TestCase):
             "schema_version": 1,
             "accepted": True,
             "a": 1.25,
-            "b": 0.05,
+            "b": 0.0,
             "depth_min_m": 0.5,
             "depth_max_m": 20.0,
             "model": runner.model_name,
@@ -971,8 +971,8 @@ class BackendContractTests(unittest.TestCase):
                 "jpegQuality": 0.74,
                 "uploadScale": 0.5,
             },
-            "selected_model": "scale_shift",
-            "relation": "inverse_depth_1_per_m = a * pred_disp + b",
+            "selected_model": "scale_only",
+            "relation": "inverse_depth_1_per_m = a * pred_disp",
             "acceptance": {"passed": True},
         }
         with tempfile.TemporaryDirectory() as directory:
@@ -982,12 +982,33 @@ class BackendContractTests(unittest.TestCase):
             with patch.dict(os.environ, {"DA360_DEPTH_CALIB_PATH": str(path)}):
                 loaded = runner._load_depth_calibration()
             self.assertEqual(loaded["a"], 1.25)
+            self.assertEqual(loaded["b"], 0.0)
             self.assertEqual(loaded["id"], "depth_calibration-v1-DA360_fake-16x8")
             self.assertIs(loaded["accuracy_accepted"], True)
             self.assertIs(loaded["automatic_accuracy_gate_passed"], True)
             self.assertEqual(loaded["acceptance_method"], "automatic")
             self.assertEqual(loaded["acceptance_scope"], "accuracy-gates")
             self.assertEqual((loaded["request_width"], loaded["request_height"]), (16, 8))
+
+            legacy_zero_offset = dict(
+                calibration,
+                relation="inverse_depth_1_per_m = a * pred_disp + b",
+            )
+            path.write_text(json.dumps(legacy_zero_offset), encoding="utf-8")
+            with patch.dict(os.environ, {"DA360_DEPTH_CALIB_PATH": str(path)}):
+                self.assertEqual(runner._load_depth_calibration()["b"], 0.0)
+
+            shifted = dict(calibration, b=0.05)
+            path.write_text(json.dumps(shifted), encoding="utf-8")
+            with patch.dict(os.environ, {"DA360_DEPTH_CALIB_PATH": str(path)}):
+                with self.assertRaisesRegex(RuntimeError, "b == 0"):
+                    runner._load_depth_calibration()
+
+            wrong_model = dict(calibration, selected_model="scale_shift")
+            path.write_text(json.dumps(wrong_model), encoding="utf-8")
+            with patch.dict(os.environ, {"DA360_DEPTH_CALIB_PATH": str(path)}):
+                with self.assertRaisesRegex(RuntimeError, "selected_model must be scale_only"):
+                    runner._load_depth_calibration()
 
             runner.calibration = loaded
             infer_calls = []

@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """
-Offline inverse-depth metric fitting: 1/z = a * pred_disp + b.
+Offline DA360 scale-only metric fitting: 1/z = a * pred_disp, b = 0.
 
 Takes DA360 raw pred_disp (.npz from /depth/raw) and Cesium sparse anchors
-(.json), fits scale-only and scale+shift models via robust regression, and
-outputs metric-depth arrays together with a validation report.
+(.json), deploys a scale-only model via robust regression, and outputs
+metric-depth arrays together with a validation report.  The scale+shift fit is
+retained only as a diagnostic: DA360 removes the additive disparity shift
+internally, so an external non-zero b must never enter runtime calibration.
 
 Usage:
     python scripts/fit_da360_metric.py \\
@@ -997,19 +999,24 @@ def run_fitting(data, output_dir):
 
     scale_metrics = validation["scale_only"]
     shift_metrics = validation["scale_shift"]
-    scale_error = scale_metrics["median_abs_rel"]
-    shift_error = shift_metrics["median_abs_rel"]
-    selected_model = (
-        "scale_only"
-        if scale_error is not None and shift_error is not None and scale_error - shift_error < 0.01
-        else "scale_shift"
-    )
-    selected_a = final_a_scale if selected_model == "scale_only" else final_a_shift
-    selected_b = 0.0 if selected_model == "scale_only" else final_b_shift
+
+    # DA360's public prediction is scale-invariant disparity after the model's
+    # learned internal shift correction.  The affine fit remains useful only
+    # for diagnosing an input/data/model-contract mismatch; deployment must not
+    # reintroduce a disparity shift.
+    selected_model = "scale_only"
+    selected_a = final_a_scale
+    selected_b = 0.0
 
     report = {
         "success": True,
-        "relation": "inverse_depth_1_per_m = a * pred_disp + b",
+        "relation": "inverse_depth_1_per_m = a * pred_disp",
+        "deployment_contract": {
+            "model": "scale_only",
+            "relation": "inverse_depth_1_per_m = a * pred_disp",
+            "b": 0.0,
+            "scale_shift_role": "diagnostic_only",
+        },
         "output_units": "metres",
         "pixel_sampling": "integer-pixel-centres; resolution-scaled; horizontal-wrap bilinear",
         "robust_loss": "huber-once",
@@ -1039,6 +1046,7 @@ def run_fitting(data, output_dir):
             "near_10m": validation["scale_only_near_10m"],
         },
         "scale_shift": {
+            "diagnostic_only": True,
             "a": float(final_a_shift),
             "b": float(final_b_shift),
             **shift_metrics,
@@ -1048,7 +1056,7 @@ def run_fitting(data, output_dir):
         "calibration": {
             "a": float(selected_a),
             "b": float(selected_b),
-            "relation": "inverse_depth_1_per_m = a * pred_disp + b",
+            "relation": "inverse_depth_1_per_m = a * pred_disp",
         },
     }
 
@@ -1060,7 +1068,7 @@ def run_fitting(data, output_dir):
     inverse_shift = final_a_shift * pred_disp + final_b_shift
     depth_scale, valid_scale = inverse_depth_to_metric_depth(inverse_scale, raw_valid)
     depth_shift, valid_shift = inverse_depth_to_metric_depth(inverse_shift, raw_valid)
-    selected_valid = valid_scale if selected_model == "scale_only" else valid_shift
+    selected_valid = valid_scale
 
     np.save(os.path.join(output_dir, "metric_depth_scale.npy"), depth_scale)
     np.save(os.path.join(output_dir, "metric_depth_shift.npy"), depth_shift)
@@ -1191,7 +1199,7 @@ def run_fitting(data, output_dir):
         "input": raw_contract if inference_contract_complete else None,
         "projection": anchor_contract.get("projection") if inference_contract_complete else None,
         "selected_model": selected_model,
-        "relation": "inverse_depth_1_per_m = a * pred_disp + b",
+        "relation": "inverse_depth_1_per_m = a * pred_disp",
         "fit_report": "fit_report.json",
         "acceptance": report["acceptance"],
         "collection": report["collection"],

@@ -1,15 +1,31 @@
-# DA360 metric-scale diagnosis and simulator A/B protocol
+# DA360 米制尺度诊断与 scale-only 部署备忘
 
-## Corrected conclusion
+## 已确认的部署契约
 
-The 12 audited captures reject one fixed cross-scene mapping
+DA360 通过网络内部学习的全局 shift 修正，将底层 affine-invariant disparity 转换为 scale-invariant disparity；公开输出仍只存在尺度不确定性。因此本项目正式运行关系固定为：
 
 ```text
-inverse_depth = a * pred_disp + b
+1 / D_metric = a * pred_disp
+b = 0
+```
+
+`a * pred_disp + b` 的仿射拟合仅保留为离线诊断。如果非零 `b` 明显改善结果，应判定为输入预处理、数据、模型版本或评估契约存在偏差，而不是把 `b` 发布到运行时。标定脚本必须始终选择 `scale_only`，服务端必须拒绝任何非零 `b`。
+
+![DA360 米制标定数据](assets/figures/da360-metric-calibration.zh-CN.png)
+
+图中数据来自 4 个地点、12 次采集和 833 个 0.5–20 m 有效范围锚点。覆盖率门槛通过，但固定全局尺度的自动精度门禁未通过。[下载可编辑 SVG](assets/figures/da360-metric-calibration.zh-CN.svg)；[查看脱敏摘要数据](data/da360-metric-calibration-summary.json)。
+
+## 结论边界（英文证据记录）
+
+The 12 audited captures reject one fixed cross-scene scale-only mapping
+
+```text
+inverse_depth = a * pred_disp
 ```
 
 for the current low-resolution input pipeline. They do **not** prove that the
-captures were unusable, that DA360 cannot support an online scale cue, or that
+captures were unusable, justify adding an external disparity shift, prove that
+DA360 cannot support an online scale cue, or show that
 panoramic metric depth is impossible.
 
 DA360's documented output is *scale-invariant disparity*: the image-dependent
