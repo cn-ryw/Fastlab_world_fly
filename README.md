@@ -2,7 +2,7 @@
 
 # MindCloud World Fly
 
-**基于 CesiumJS、DA360 与 YOPO 的浏览器无人机闭环仿真平台**
+**基于 CesiumJS、DA360 与 YOPO360 的浏览器无人机闭环仿真平台**
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-1f6feb.svg)](LICENSE)
 [![Release](https://img.shields.io/badge/release-v0.1.0--demo.20260814-0b8f87.svg)](https://github.com/cn-ryw/MindCloud_World_Fly/releases/tag/v0.1.0-demo.20260814)
@@ -171,4 +171,4 @@ python3 scripts/plot_demo_flights.py \
 
 ## 致谢
 
-本项目基于 [superboySB/MindCloud_World_Fly](https://github.com/superboySB/MindCloud_World_Fly) 持续开发。遥控器与控制器算法实现参考了 [zwhhhhh9](https://github.com/zwhhhhh9/) 的相关公开工作。本项目的 YOPO_360 部分参考 [cn-ryw/YOPO_360](https://github.com/cn-ryw/YOPO_360)；该项目是在 [zwhhhhh9/YOPO_360 的 velocity_15ms 分支](https://github.com/zwhhhhh9/YOPO_360/tree/velocity_15ms) 基础上进一步优化修改。感谢 DA360、YOPO、CesiumJS 等相关开源项目和研究工作。
+本项目基于 [superboySB/MindCloud_World_Fly](https://github.com/superboySB/MindCloud_World_Fly) 持续开发。遥控器算法实现参考了 [zwhhhhh9](https://github.com/zwhhhhh9/) 的相关公开工作。本项目的 YOPO_360 部分参考 [cn-ryw/YOPO_360](https://github.com/cn-ryw/YOPO_360)；该项目是在 [zwhhhhh9/YOPO_360 的 velocity_15ms 分支](https://github.com/zwhhhhh9/YOPO_360/tree/velocity_15ms) 基础上进一步优化修改。感谢 DA360、YOPO、CesiumJS 等相关开源项目和研究工作。
