@@ -20,7 +20,7 @@ def _require_file(path, label, errors):
 
 def verify(
         manifest, da360_model=None, yopo_model=None, skip_checkpoints=False,
-        yopo_strategy="baseline"):
+        yopo_strategy="d70_h30_epoch30"):
     errors = []
     runtime = manifest["runtime_dependencies"]
 
@@ -108,7 +108,7 @@ def main(argv=None):
     parser.add_argument("--manifest", type=Path, default=MANIFEST_PATH)
     parser.add_argument("--da360-model", type=Path)
     parser.add_argument("--yopo-model", type=Path)
-    parser.add_argument("--yopo-strategy", default="baseline")
+    parser.add_argument("--yopo-strategy", default="d70_h30_epoch30")
     parser.add_argument("--skip-checkpoints", action="store_true")
     args = parser.parse_args(argv)
     with args.manifest.open(encoding="utf-8") as stream:
