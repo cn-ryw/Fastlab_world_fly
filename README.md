@@ -2,7 +2,7 @@
 
 # MindCloud World Fly
 
-**基于 CesiumJS、DA360 与 YOPO 的浏览器无人机闭环仿真平台**
+**基于 CesiumJS、DA360 与 YOPO360 的浏览器无人机闭环仿真平台**
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-1f6feb.svg)](LICENSE)
 [![Release](https://img.shields.io/badge/release-v0.1.0--demo.20260814-0b8f87.svg)](https://github.com/cn-ryw/MindCloud_World_Fly/releases/tag/v0.1.0-demo.20260814)
