@@ -21,7 +21,7 @@ from scripts.fit_da360_metric import (
 
 
 TRUE_A = 2.25
-TRUE_B = 0.12
+TRUE_B = 0.0
 UNIT_PRED_DISP = "raw disparity (inverse depth), NOT per-frame normalized"
 PANORAMA_FACES = ("front", "right", "back", "left", "up", "down")
 
@@ -519,7 +519,7 @@ def test_local_pose_deduplication_is_scoped_to_location(tmp_path):
     assert combined["location_capture_counts"] == {"site-A": 3, "site-B": 3}
 
 
-def test_known_scale_shift_all_locations_pass_and_candidate_is_bound(tmp_path):
+def test_known_scale_only_all_locations_pass_and_candidate_is_bound(tmp_path):
     data = _four_location_dataset(tmp_path / "captures")
     output_dir = tmp_path / "fit"
     report = run_fitting(data, output_dir)
@@ -530,8 +530,11 @@ def test_known_scale_shift_all_locations_pass_and_candidate_is_bound(tmp_path):
     assert len(report["validation"]["folds"]) == 4
     assert all(item["passed"] for item in report["acceptance"]["per_location"].values())
     assert np.isclose(report["scale_shift"]["a"], TRUE_A, rtol=1e-5)
-    assert np.isclose(report["scale_shift"]["b"], TRUE_B, rtol=1e-5)
-    assert report["selected_model"] == "scale_shift"
+    assert np.isclose(report["scale_shift"]["b"], TRUE_B, atol=1e-6)
+    assert report["scale_shift"]["diagnostic_only"] is True
+    assert report["selected_model"] == "scale_only"
+    assert report["relation"] == "inverse_depth_1_per_m = a * pred_disp"
+    assert report["deployment_contract"]["b"] == pytest.approx(0.0)
 
     calibration = json.loads((output_dir / "depth_calibration.json").read_text())
     assert calibration["accepted"] is True
@@ -541,6 +544,9 @@ def test_known_scale_shift_all_locations_pass_and_candidate_is_bound(tmp_path):
     assert calibration["input"]["request_width"] == 8
     assert calibration["projection"]["jpegQuality"] == 0.74
     assert calibration["projection"]["rgbWidth"] == 8
+    assert calibration["selected_model"] == "scale_only"
+    assert calibration["relation"] == "inverse_depth_1_per_m = a * pred_disp"
+    assert calibration["b"] == pytest.approx(0.0)
     assert "dataset_fingerprint_sha256" not in calibration
 
 

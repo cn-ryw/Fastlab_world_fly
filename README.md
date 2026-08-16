@@ -12,7 +12,7 @@
 
 </div>
 
-MindCloud World Fly 在浏览器中加载 Google Photorealistic 3D Tiles，以六面相机生成 360° ERP RGB，经 DA360 估计米制深度，再由 YOPO 生成 Poly5 局部轨迹，最后通过浏览器内 SO3 控制器闭环跟踪。项目同时支持键鼠、RadioMaster T8L、固定 G 航点和滚动遥控航点。
+MindCloud World Fly 在浏览器中加载 Google Photorealistic 3D Tiles，以六面相机生成 360° ERP RGB，经 DA360 估计 scale-invariant 相对视差，再通过 `b=0` 的 scale-only 仿真标定转换为近似米制深度；YOPO 随后生成 Poly5 局部轨迹，最后由浏览器内 SO3 控制器闭环跟踪。项目同时支持键鼠、RadioMaster T8L、固定 G 航点和滚动遥控航点。
 
 > 本仓库当前定位为研究与演示用仿真平台。下方日志证明了两次零碰撞成功到达，但不代表持续 15 Hz 规划门禁、真实飞行或安全认证已经通过。
 
@@ -21,7 +21,7 @@ MindCloud World Fly 在浏览器中加载 Google Photorealistic 3D Tiles，以�
 | 模块 | 当前能力 |
 |---|---|
 | 仿真世界 | CesiumJS + Google Photorealistic 3D Tiles |
-| 视觉感知 | 六面相机、384×192 ERP RGB、DA360 米制深度 |
+| 视觉感知 | 六面相机、384×192 ERP RGB、DA360 相对视差、`1/D=a·p`（`b=0`）近似米制标定 |
 | 局部规划 | YOPO 候选评估与 Poly5 轨迹 |
 | 飞行控制 | FPV、Drone (Easy)、SO3 固定航向控制 |
 | 任务输入 | G 固定航点、T8L 50 m 滚动航点 |

@@ -713,9 +713,11 @@ class DA360Runner:
     def infer_metric(self, image, projection_config=None):
         """Run DA360 inference and convert raw pred_disp to metric depth.
 
-        使用启动时验证并冻结的线性标定参数 1/z = a·pred_disp + b，
-        跳过 per-frame min-归一化步骤。没有有效标定时直接失败，避免
-        把相对深度静默冒充为米制深度。
+        DA360 已在网络内部消除 disparity 的全局平移不确定性，运行时
+        只使用启动时验证并冻结的尺度参数 1/z = a·pred_disp（b=0），
+        跳过 per-frame min-归一化步骤。外部非零偏移会重新引入平移项
+        并扭曲相对几何，因此加载器会拒绝它。没有有效标定时直接失败，
+        避免把相对深度静默冒充为米制深度。
 
         Returns
         -------
@@ -749,8 +751,8 @@ class DA360Runner:
                 )
         raw = self.infer_raw(image)
         pred_disp = raw["pred_disp"]
-        a, b = calib["a"], calib["b"]
-        inverse_depth = a * pred_disp + b
+        a = calib["a"]
+        inverse_depth = a * pred_disp
         valid = np.isfinite(inverse_depth) & (inverse_depth > 1e-6)
         metric = np.full(pred_disp.shape, np.nan, dtype=np.float32)
         metric[valid] = np.clip(
@@ -819,17 +821,30 @@ class DA360Runner:
             provenance_accepted = automatic_gate_passed or manual_accepted
             if accuracy_accepted is not provenance_accepted:
                 raise ValueError("calibration acceptance statuses disagree")
-            expected_relation = "inverse_depth_1_per_m = a * pred_disp + b"
-            if calib.get("relation") != expected_relation:
+            scale_only_relation = "inverse_depth_1_per_m = a * pred_disp"
+            legacy_zero_offset_relation = "inverse_depth_1_per_m = a * pred_disp + b"
+            if calib.get("relation") not in {
+                scale_only_relation,
+                legacy_zero_offset_relation,
+            }:
                 raise ValueError("calibration inverse-depth relation is missing or incompatible")
             a = float(calib["a"])
-            b = float(calib["b"])
+            b = float(calib.get("b", 0.0))
             min_depth = float(calib.get("depth_min_m", 0.04))
             max_depth = float(calib.get("depth_max_m", 20.0))
             if not all(math.isfinite(value) for value in (a, b, min_depth, max_depth)):
                 raise ValueError("a, b and depth limits must be finite")
             if a <= 0:
                 raise ValueError("calibration slope a must be positive")
+            if abs(b) > 1e-12:
+                raise ValueError(
+                    "DA360 scale-only calibration requires b == 0; "
+                    "a non-zero external disparity shift is not deployable"
+                )
+            if calib.get("selected_model") not in (None, "scale_only"):
+                raise ValueError(
+                    "DA360 metric calibration selected_model must be scale_only"
+                )
             if min_depth <= 0 or max_depth <= min_depth:
                 raise ValueError("calibration depth range must satisfy 0 < min < max")
 
