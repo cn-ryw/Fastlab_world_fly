@@ -67,7 +67,7 @@ MINDCLOUD_YOPO_STRATEGY=baseline ./start-all.sh
 浏览器 -> http://127.0.0.1:5688 -> DA360 + YOPO combined API
 ~~~
 
-健康检查：
+服务就绪状态与运行配置检查（不是账号认证或设备身份检查）：
 
 ~~~bash
 curl --noproxy '*' http://127.0.0.1:5688/health

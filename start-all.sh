@@ -372,7 +372,7 @@ fi
 echo "  Web 已启动 http://$WEB_HOST:$WEB_PORT (PID $WEB_PID)"
 
 echo ""
-echo "=== 4/4 验证健康状态 ==="
+echo "=== 4/4 检查服务就绪状态与运行配置 ==="
 deadline=$((SECONDS + STARTUP_TIMEOUT))
 ready=0
 while (( SECONDS < deadline )); do
@@ -383,7 +383,7 @@ while (( SECONDS < deadline )); do
     sleep 2
 done
 if (( ready == 0 )); then
-    echo "  服务在 ${STARTUP_TIMEOUT}s 内未同时通过 Web/DA360/YOPO 健康检查" >&2
+    echo "  Web、DA360 或 YOPO 在 ${STARTUP_TIMEOUT}s 内未就绪，或实际运行配置不符合预期" >&2
     tail -n 80 "$WEB_LOG" >&2 || true
     docker logs --tail 80 "$API_CONTAINER" >&2 || true
     exit 1
