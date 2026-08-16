@@ -545,6 +545,7 @@ class BackendContractTests(unittest.TestCase):
                 "px=1&py=2&pz=3&rpx=4&rpy=5&rpz=6&"
                 "gx=10&gy=2&gz=4&vx=0&vy=0&vz=0&ax=0&ay=0&az=0&yaw=0"
                 "&frame_id=f10&goal_id=g5&generation=6&include_preview=0"
+                "&prepare_preview=1"
             )
             with patch.object(
                     combined_server, "depth_to_polar_scan",
@@ -554,7 +555,10 @@ class BackendContractTests(unittest.TestCase):
                         side_effect=AssertionError("color preview must be skipped")), \
                     patch.object(
                         combined_server, "encode_image",
-                        side_effect=AssertionError("JPEG preview must be skipped")):
+                        side_effect=AssertionError("JPEG preview must be skipped")), \
+                    patch.object(
+                        combined_server, "_queue_planning_preview_render"
+                    ) as queue_preview:
                 response = clients["combined"].post(
                     f"/yopo/plan_full?{query}",
                     data=jpeg_bytes(),
@@ -576,10 +580,17 @@ class BackendContractTests(unittest.TestCase):
             self.assertEqual(payload["timings_ms"]["color_encode_ms"], 0.0)
             self.assertEqual(payload["timings_ms"]["preview_ms"], 0.0)
             self.assertEqual(combined_server.yopo_runner.infer_calls, 1)
+            queue_preview.assert_called_once()
+            queued_key, queued_entry = queue_preview.call_args.args
+            self.assertEqual(queued_key, ("f10", "g5", "6"))
+            self.assertEqual(queued_entry["frame_id"], "f10")
 
             # N+1 replaces the legacy latest slot before the UI asks for N.
-            # The identity-keyed preview LRU must still retain N exactly.
-            next_query = query.replace("frame_id=f10", "frame_id=f11")
+            # The identity-keyed raw-depth LRU must still retain N exactly,
+            # while an unrendered entry remains unavailable to the UI.
+            next_query = query.replace(
+                "frame_id=f10", "frame_id=f11"
+            ).replace("prepare_preview=1", "prepare_preview=0")
             next_response = clients["combined"].post(
                 f"/yopo/plan_full?{next_query}",
                 data=jpeg_bytes(),
@@ -591,17 +602,8 @@ class BackendContractTests(unittest.TestCase):
             preview = clients["combined"].get(
                 "/yopo/preview?frame_id=f10&goal_id=g5&generation=6"
             )
-            self.assertEqual(preview.status_code, 200)
-            preview_payload = preview.get_json()
-            self.assertIs(preview_payload["preview_included"], True)
-            self.assertEqual(preview_payload["preview_source"], "planning-cache")
-            self.assertEqual(preview_payload["frame_id"], "f10")
-            self.assertEqual(preview_payload["goal_id"], "g5")
-            self.assertEqual(preview_payload["generation"], "6")
-            self.assertTrue(
-                preview_payload["depth_image"].startswith("data:image/jpeg;base64,")
-            )
-            self.assertEqual(preview_payload["polar_scan"]["unit"], "metres")
+            self.assertEqual(preview.status_code, 409)
+            self.assertIn("not encoded yet", preview.get_json()["error"])
             self.assertEqual(combined_server.da360_runner.infer_calls, 2)
 
             stale_preview = clients["combined"].get(
@@ -660,11 +662,19 @@ class BackendContractTests(unittest.TestCase):
                 "/yopo/preview?frame_id=f-lru-0&goal_id=g-lru&generation=9"
             )
             self.assertEqual(evicted.status_code, 409)
+            self.assertNotIn(
+                ("f-lru-0", "g-lru", "9"),
+                combined_server._planning_preview_cache,
+            )
             retained = clients["combined"].get(
                 "/yopo/preview?frame_id=f-lru-1&goal_id=g-lru&generation=9"
             )
-            self.assertEqual(retained.status_code, 200)
-            self.assertEqual(retained.get_json()["frame_id"], "f-lru-1")
+            self.assertEqual(retained.status_code, 409)
+            self.assertIn("not encoded yet", retained.get_json()["error"])
+            self.assertIn(
+                ("f-lru-1", "g-lru", "9"),
+                combined_server._planning_preview_cache,
+            )
             self.assertEqual(len(combined_server._planning_preview_cache), 4)
 
     def test_plan_full_rejects_invalid_preview_flag_before_gpu_work(self):
