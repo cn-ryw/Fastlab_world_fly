@@ -163,7 +163,7 @@ python3 scripts/plot_demo_flights.py \
 
 当前运行时采用 scale-only 关系 `1/D=a·p`，固定 `b=0`。12 次采集的有效锚点覆盖率达到 74.2%，但单帧尺度差异和四地点留一验证误差均表明：一个固定全局尺度尚未通过自动精度门禁。现有配置仅作为人工检查后的 sim-to-sim 基线，不代表真实传感器或跨场景米制精度已经通过。
 
-[可编辑 SVG](docs/assets/figures/da360-metric-calibration.zh-CN.svg) · [PDF](docs/assets/figures/da360-metric-calibration.zh-CN.pdf) · [脱敏摘要数据](docs/data/da360-metric-calibration-summary.json) · [绘图脚本](scripts/plot_da360_metric_calibration.py)
+[可编辑 SVG](docs/assets/figures/da360-metric-calibration.zh-CN.svg) · [PDF](docs/assets/figures/da360-metric-calibration.zh-CN.pdf) · [脱敏摘要数据](docs/data/da360-metric-calibration-summary.json) · [绘图脚本](scripts/plot_da360_metric_calibration.py) · [详细仿真标定图与源数据](docs/research/da360-sim-calibration/README.zh-CN.md)
 
 ## 当前边界
 

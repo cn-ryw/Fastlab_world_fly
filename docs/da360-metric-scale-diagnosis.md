@@ -13,7 +13,7 @@ b = 0
 
 ![DA360 米制标定数据](assets/figures/da360-metric-calibration.zh-CN.png)
 
-图中数据来自 4 个地点、12 次采集和 833 个 0.5–20 m 有效范围锚点。覆盖率门槛通过，但固定全局尺度的自动精度门禁未通过。[下载可编辑 SVG](assets/figures/da360-metric-calibration.zh-CN.svg)；[查看脱敏摘要数据](data/da360-metric-calibration-summary.json)。
+图中数据来自 4 个地点、12 次采集和 833 个 0.5–20 m 有效范围锚点。覆盖率门槛通过，但固定全局尺度的自动精度门禁未通过。[下载可编辑 SVG](assets/figures/da360-metric-calibration.zh-CN.svg)；[查看脱敏摘要数据](data/da360-metric-calibration-summary.json)；[查看详细仿真标定图与源数据](research/da360-sim-calibration/README.zh-CN.md)。
 
 ## 结论边界（英文证据记录）
 
