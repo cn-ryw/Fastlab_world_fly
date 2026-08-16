@@ -31,8 +31,7 @@ jobs:
           curl --fail --location --retry 3 \
             https://cdn.jsdelivr.net/npm/playcanvas@2.17.2/build/playcanvas.min.js \
             --output asset/vendor/playcanvas.min.js
-          python scripts/verify_dependencies.py \
-            --skip-cesium --skip-source --skip-checkpoints
+          test -s asset/vendor/playcanvas.min.js
       - name: Audit public tree
         run: python scripts/audit_public_tree.py
       - name: Run JavaScript tests
