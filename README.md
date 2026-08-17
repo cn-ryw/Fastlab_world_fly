@@ -23,7 +23,7 @@ MindCloud World Fly 在浏览器中加载 Google Photorealistic 3D Tiles，以�
 | 仿真世界 | CesiumJS + Google Photorealistic 3D Tiles |
 | 视觉感知 | 六面相机、384×192 ERP RGB、DA360 相对视差、`1/D=a·p`（`b=0`）近似米制标定 |
 | 局部规划 | YOPO 候选评估与 Poly5 轨迹 |
-| 飞行控制 | FPV、Drone (Easy)、SO3 固定航向控制 |
+| 飞行控制 | FPV、Drone (Easy)、Level、SO3 固定航向控制 |
 | 任务输入 | G 固定航点、T8L 50 m 滚动航点 |
 | 诊断记录 | RGB/深度预览、飞行日志、规划与画面性能指标 |
 
@@ -46,7 +46,9 @@ MindCloud World Fly 在浏览器中加载 Google Photorealistic 3D Tiles，以�
 
 ![MindCloud World Fly 闭环仿真架构](docs/assets/architecture/mindcloud-system-architecture.png)
 
-系统把世界渲染、360°视觉、GPU 推理、轨迹规划和 SO3 控制组成闭环；可见预览是诊断支路，不应被当成 YOPO 实际规划频率。可检索的 Mermaid 图和模块说明见 [架构文档](docs/ARCHITECTURE.zh-CN.md)。
+[SVG 矢量图](docs/assets/architecture/mindcloud-system-architecture.svg) · [PDF](docs/assets/architecture/mindcloud-system-architecture.pdf) · [HTML 预览](docs/assets/architecture/mindcloud-system-architecture.html) · [Mermaid 与模块说明](docs/ARCHITECTURE.zh-CN.md)
+
+主图只保留 SO3 模式下活动导航任务的控制闭环：任务身份通过独立总线在请求组装阶段与不可变 `PerceptionFrame` 合入，经 DA360 sim-to-sim 零偏置尺度换算和 YOPO 局部规划后，通过时效与一致性门禁；浏览器再从应用时实测状态构造完整时域 Poly5，由 SO3 控制器和固定步长动力学执行并反馈状态。手动模式、缓存预览、日志、离线标定和评测移至 [架构文档](docs/ARCHITECTURE.zh-CN.md)，不与控制主链混画。三幅画面均裁自项目运行截图，其余元素为原生 SVG 几何和可检索文字。
 
 ## 快速开始
 
@@ -67,14 +69,9 @@ YOPO_MODEL_PATH_HOST=/path/to/epoch30.pth \
 ./start-all.sh
 ~~~
 
-Cesium Ion token 不写入仓库。首次使用某个浏览器配置时，在该浏览器开发者控制台执行一次：
+Cesium Ion token 不写入仓库。首次开始飞行时，页面会显示 token 配置框；输入一个限制到本机来源的有效 token 后，页面会将它保存在当前浏览器配置中并直接继续。`launch-firefox-gpu.sh` 使用独立、持久、非隐私的 MindCloud profile，因此后续启动无需重复输入。
 
-~~~js
-localStorage.setItem('mindcloud_cesium_ion_token', 'YOUR_CESIUM_ION_TOKEN');
-location.reload();
-~~~
-
-Firefox 和 Chrome 使用不同的浏览器存储，需要分别配置。旧版本源码中曾公开过的 token 应在 Cesium Ion 后台撤销，而不是继续复用。
+Firefox 和 Chrome 使用不同的浏览器存储，需要分别配置。该配置流程不会把 token 写入 MindCloud 页面 URL、浏览器启动命令或应用主动日志；旧版本源码中曾公开过的 token 应在 Cesium Ion 后台撤销，而不是继续复用。
 
 ### 2. 启动服务和浏览器
 
@@ -106,7 +103,7 @@ MINDCLOUD_YOPO_STRATEGY=baseline ./start-all.sh
 3. 在 SO3 模式按住 <code>G</code> 点击可通行表面设置目标；建筑物上、内部或未解析表面会被拒绝。
 4. 使用 <code>C</code> 取消导航；飞行历史路径和目标标记可在 Tab 设置中控制显示。
 
-完整的遥控器映射、三种模式、状态说明和故障排查见 [中文 User Guide](docs/USER_GUIDE.zh-CN.md)。
+完整的遥控器映射、状态说明和故障排查见 [中文 User Guide](docs/USER_GUIDE.zh-CN.md)。浏览器下拉框提供 FPV、Drone (Easy)、Level、SO3 四种模式；T8L 的 Mode 三挡默认映射 FPV、Easy、SO3。
 
 ## 成功飞行证据
 

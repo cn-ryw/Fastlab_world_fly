@@ -31,8 +31,11 @@
 import { formatError, reportUserError } from './error-report.js';
 import { erpDirectionToComponent, sampleAnchorDirections } from './erp-geometry.js';
 import { demoPerformance } from './demo-performance.js?v=20260814-adaptive-a1';
+import {
+    CESIUM_ION_TOKEN_STORAGE_KEY,
+    resolveCesiumIonToken,
+} from './cesium-token.js?v=20260817-persistent-profile-a1';
 
-const CESIUM_ION_TOKEN_STORAGE_KEY = 'mindcloud_cesium_ion_token';
 const DEFAULT_ASSET_ID = 2275207;
 const DEFAULT_VIEW = {
     longitude: 114.1690321,
@@ -69,19 +72,6 @@ function urlNumber(name, fallback) {
     if (v == null || v === '') return fallback;
     const n = Number(v);
     return Number.isFinite(n) ? n : fallback;
-}
-
-function storedCesiumIonToken() {
-    try {
-        return globalThis.localStorage?.getItem(CESIUM_ION_TOKEN_STORAGE_KEY)?.trim() || '';
-    } catch (_) {
-        return '';
-    }
-}
-
-function urlString(name, fallback) {
-    const v = new URLSearchParams(window.location.search).get(name);
-    return v == null || v === '' ? fallback : v;
 }
 
 function requireCesium() {
@@ -431,7 +421,7 @@ function rotateXZ(v, radians) {
 export class CesiumWorld {
     constructor(containerId, options = {}) {
         this.containerId = containerId;
-        this.token = options.token || storedCesiumIonToken() || urlString('ionToken', '');
+        this.token = resolveCesiumIonToken({ explicitToken: options.token });
         this.assetId = Number(options.assetId || urlNumber('assetId', DEFAULT_ASSET_ID));
         this.initialView = {
             longitude: urlNumber('lon', options.longitude ?? DEFAULT_VIEW.longitude),
@@ -537,7 +527,7 @@ export class CesiumWorld {
         this.Cesium = Cesium;
         if (!this.token) {
             throw new Error(
-                `Cesium Ion token is not configured. Set localStorage key ${CESIUM_ION_TOKEN_STORAGE_KEY} and reload.`
+                `Cesium Ion token is not configured. Use the in-app setup prompt or set localStorage key ${CESIUM_ION_TOKEN_STORAGE_KEY}.`
             );
         }
         Cesium.Ion.defaultAccessToken = this.token;

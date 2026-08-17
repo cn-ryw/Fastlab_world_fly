@@ -23,7 +23,11 @@
  * from the original simulator.
  */
 
-import { CesiumWorld } from './cesium-world.js?v=20260814-path-collision-a3';
+import { CesiumWorld } from './cesium-world.js?v=20260817-persistent-profile-a1';
+import {
+    resolveCesiumIonToken,
+    storeCesiumIonToken,
+} from './cesium-token.js?v=20260817-persistent-profile-a1';
 import { TilesCollisionProvider } from './tiles-collision.js?v=20260814-path-collision-a2';
 import { Controller } from './controller.js?v=20260812-shared-controller-config';
 import { Drone } from './drone.js?v=20260814-path-collision-a2';
@@ -66,6 +70,7 @@ let screenHandler = null;
 let flightGoalHandler = null;
 let spawnConfirmInProgress = false;
 let startTilesModeInProgress = false;
+let cesiumTokenSetupPromise = null;
 let panoramaWarmupPromise = null;
 let thirdPersonPointer = {
     active: false,
@@ -193,6 +198,7 @@ function setProgress(message, isError = false) {
     if (!el) return;
     el.textContent = message;
     el.style.color = isError ? '#f44' : '#4272F5';
+    if (!isError) document.getElementById('cesium-token-change')?.classList.remove('visible');
 }
 
 function escapeHtml(value) {
@@ -307,6 +313,56 @@ function updateViewChoiceHint() {
 
 function showError(error) {
     reportUserError('Startup failed', error, { overlay: true, intervalMs: 0 });
+    document.getElementById('cesium-token-change')?.classList.add('visible');
+}
+
+function requestCesiumIonToken(forcePrompt = false) {
+    const configured = resolveCesiumIonToken();
+    if (!forcePrompt && configured) {
+        return Promise.resolve({ token: configured, persistAfterValidation: false });
+    }
+    if (cesiumTokenSetupPromise) return cesiumTokenSetupPromise;
+
+    const overlay = document.getElementById('cesium-token-overlay');
+    const form = document.getElementById('cesium-token-form');
+    const input = document.getElementById('cesium-token-input');
+    const cancel = document.getElementById('cesium-token-cancel');
+    const error = document.getElementById('cesium-token-error');
+    if (!overlay || !form || !input || !cancel || !error) {
+        return Promise.reject(new Error('Cesium Ion token setup UI is unavailable.'));
+    }
+
+    overlay.classList.add('visible');
+    overlay.setAttribute('aria-hidden', 'false');
+    input.value = '';
+    error.textContent = '';
+    window.setTimeout(() => input.focus(), 0);
+
+    cesiumTokenSetupPromise = new Promise((resolve) => {
+        const finish = (result) => {
+            form.removeEventListener('submit', submit);
+            cancel.removeEventListener('click', dismiss);
+            overlay.classList.remove('visible');
+            overlay.setAttribute('aria-hidden', 'true');
+            input.value = '';
+            cesiumTokenSetupPromise = null;
+            resolve(result);
+        };
+        const submit = (event) => {
+            event.preventDefault();
+            const token = input.value.trim();
+            if (!token) {
+                error.textContent = 'Enter a non-empty Cesium Ion token.';
+                input.focus();
+                return;
+            }
+            finish({ token, persistAfterValidation: true });
+        };
+        const dismiss = () => finish({ token: '', persistAfterValidation: false });
+        form.addEventListener('submit', submit);
+        cancel.addEventListener('click', dismiss);
+    });
+    return cesiumTokenSetupPromise;
 }
 
 function withTimeout(promise, timeoutMs, label) {
@@ -374,10 +430,12 @@ function initSubsystems() {
     setupDisplaySettingsListeners();
 }
 
-export async function startTilesMode() {
+export async function startTilesMode(tokenSetupOverride = null) {
     if (startTilesModeInProgress) return;
     startTilesModeInProgress = true;
     try {
+        const tokenSetup = tokenSetupOverride || await requestCesiumIonToken();
+        if (!tokenSetup.token) return;
         resetFlightControlClock();
         initSubsystems();
         document.getElementById('drop-zone')?.classList.add('hidden');
@@ -395,8 +453,17 @@ export async function startTilesMode() {
         }
         if (world) world.destroy();
         panoramaWarmupPromise = null;
-        world = new CesiumWorld('cesium-container');
+        world = new CesiumWorld('cesium-container', { token: tokenSetup.token });
         await world.init(setProgress);
+        if (tokenSetup.persistAfterValidation) {
+            try {
+                storeCesiumIonToken(tokenSetup.token);
+            } catch (persistenceError) {
+                reportUserError('Cesium token is valid but could not be persisted', persistenceError, {
+                    intervalMs: 0,
+                });
+            }
+        }
         collisionProvider = new TilesCollisionProvider(world, {
             sweepProbeMode: demoPerformance.config.collisionSweepMode,
         });
@@ -1767,6 +1834,7 @@ function setupKeyboard() {
 function setupStartUI() {
     const startBtn = document.getElementById('file-picker-btn');
     const dropZone = document.getElementById('drop-zone');
+    const changeTokenBtn = document.getElementById('cesium-token-change');
     if (startBtn && !startBtn._flightStartBound) {
         startBtn._flightStartBound = true;
         startBtn.textContent = 'Start Google 3D Tiles Flight';
@@ -1782,6 +1850,14 @@ function setupStartUI() {
             e.preventDefault();
             dropZone.classList.remove('dragover');
             startTilesMode();
+        });
+    }
+    if (changeTokenBtn && !changeTokenBtn._cesiumTokenChangeBound) {
+        changeTokenBtn._cesiumTokenChangeBound = true;
+        changeTokenBtn.addEventListener('click', async () => {
+            const tokenSetup = await requestCesiumIonToken(true);
+            if (!tokenSetup.token) return;
+            startTilesMode(tokenSetup);
         });
     }
 

@@ -25,14 +25,9 @@ Google 3D Tiles 在部分网络环境下可能连接缓慢或失败。若必须�
 
 ### Cesium Ion token
 
-仓库不包含 Cesium Ion token。首次使用某个浏览器配置时，打开开发者控制台并执行：
+仓库不包含 Cesium Ion token。首次开始飞行时，页面会显示密码样式的 token 配置框；输入一个限制到本机来源的有效 token 后，页面会将它保存在当前浏览器配置中并直接继续。项目 Firefox 启动器使用独立、持久、非隐私的配置目录，正常关闭和再次启动后无需重复设置。
 
-~~~js
-localStorage.setItem('mindcloud_cesium_ion_token', 'YOUR_CESIUM_ION_TOKEN');
-location.reload();
-~~~
-
-Firefox 和 Chrome 的 <code>localStorage</code> 相互独立，因此需要分别设置。不要把真实 token 写进 README、启动脚本、URL 截图或飞行日志。旧版本中曾经公开的 token 必须在 Cesium Ion 后台撤销并重新创建受限 token。
+Firefox 和 Chrome 的 <code>localStorage</code> 相互独立，因此需要分别设置。该配置流程不会把 token 写入 MindCloud 页面 URL、浏览器启动命令或应用主动日志。不要把真实 token 写进 README、启动脚本、URL 截图或飞行日志；旧版本中曾经公开的 token 必须在 Cesium Ion 后台撤销并重新创建受限 token。
 
 ## 2. 模型与策略
 
@@ -80,7 +75,7 @@ curl --noproxy '*' http://127.0.0.1:5688/yopo/health
 ./launch-firefox-gpu.sh
 ~~~
 
-Firefox 适合主画面、G 航点和完整 Demo 测试。
+Firefox 适合主画面、G 航点和完整 Demo 测试。启动器固定使用独立、持久、非隐私的 MindCloud profile；可用 <code>FIREFOX_PROFILE_DIR</code> 覆盖默认目录。
 
 ### 启动 Chrome
 
