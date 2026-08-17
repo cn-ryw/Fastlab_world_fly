@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <meta name="description" content="MindCloud World Fly 自主导航闭环仿真：任务会话、Cesium 全景观测、DA360 sim-to-sim 近似深度、YOPO、Poly5、SO3 与动力学反馈。">
+  <title>MindCloud World Fly · 自主导航闭环仿真架构</title>
+  <style>
+    @page { size: 13.333333in 7.5in; margin: 0; }
+    * { box-sizing: border-box; }
+    html, body {
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      background: #FFFFFF;
+      overflow: hidden;
+    }
+    body {
+      display: grid;
+      place-items: center;
+    }
+    img {
+      display: block;
+      width: min(100vw, calc(100vh * 16 / 9));
+      height: min(100vh, calc(100vw * 9 / 16));
+      object-fit: contain;
+      background: #FFFFFF;
+    }
+    @media print {
+      html, body, img {
+        width: 13.333333in;
+        height: 7.5in;
+      }
+    }
+  </style>
+</head>
+<body>
+  <img src="mindcloud-system-architecture.svg"
+       alt="MindCloud World Fly 自主导航闭环仿真架构：从任务与导航会话，经 Cesium 全景采集、PerceptionFrame、DA360 sim-to-sim 近似深度、YOPO、Poly5 和 SO3，到动力学状态反馈。">
+</body>
+</html>

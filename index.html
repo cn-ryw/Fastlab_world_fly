@@ -574,6 +574,40 @@
         }
         #loading-overlay.visible { display: flex; }
 
+        #cesium-token-overlay {
+            position: fixed; inset: 0; z-index: 220; display: none;
+            align-items: center; justify-content: center;
+            background: rgba(0,0,0,0.82); padding: 24px;
+        }
+        #cesium-token-overlay.visible { display: flex; }
+        #cesium-token-form { width: min(540px, 100%); }
+        #cesium-token-dialog {
+            width: 100%; padding: 24px; border-radius: 10px;
+            border: 1px solid rgba(66,114,245,0.75); background: #101522;
+            color: #e5e7eb; box-shadow: 0 18px 50px rgba(0,0,0,0.55);
+        }
+        #cesium-token-dialog h2 { margin-bottom: 10px; color: #fff; font-size: 1.25rem; }
+        #cesium-token-dialog p { margin-bottom: 14px; color: #b8c0d4; line-height: 1.5; }
+        #cesium-token-input {
+            width: 100%; padding: 10px 12px; border-radius: 6px;
+            border: 1px solid #52617f; background: #070b13; color: #fff;
+            font: 13px/1.4 'Courier New', monospace;
+        }
+        #cesium-token-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 16px; }
+        #cesium-token-actions button {
+            padding: 9px 16px; border-radius: 6px; cursor: pointer;
+            border: 1px solid #667085; background: transparent; color: #d0d5dd;
+        }
+        #cesium-token-actions button[type="submit"] {
+            border-color: #4272F5; background: #4272F5; color: #fff;
+        }
+        #cesium-token-error { min-height: 1.4em; margin-top: 8px; color: #f87171; font-size: 12px; }
+        #cesium-token-change {
+            display: none; margin-top: 14px; padding: 9px 16px; border-radius: 6px;
+            border: 1px solid #4272F5; background: transparent; color: #8fb0ff; cursor: pointer;
+        }
+        #cesium-token-change.visible { display: inline-block; }
+
         /* Placement mode overlay */
         #placement-overlay {
             position: absolute; top: 0; left: 0; width: 100%; height: 100%;
@@ -684,8 +718,26 @@
 	            <img src="asset/display/zju-fast-lab-logo.jpg" alt="ZJU FAST Lab" style="height:15vh;margin-bottom:20px;background:transparent;">
 	            <div style="text-align:center; margin-bottom: 12px;">Loading Google 3D Tiles world...</div>
 	            <div id="loading-progress" style="color: #4272F5;"></div>
+	            <button id="cesium-token-change" type="button">Change Cesium token</button>
 	        </div>
 	    </div>
+
+    <div id="cesium-token-overlay" role="dialog" aria-modal="true"
+         aria-labelledby="cesium-token-title" aria-hidden="true">
+        <form id="cesium-token-form" autocomplete="off">
+            <div id="cesium-token-dialog">
+                <h2 id="cesium-token-title">Configure Cesium Ion</h2>
+                <p>Enter a valid, origin-restricted Cesium Ion token. This setup flow stores it only in this browser profile and does not add it to the MindCloud page URL, launcher command, or application-authored logs.</p>
+                <input id="cesium-token-input" name="cesium-ion-token" type="password"
+                       required spellcheck="false" autocomplete="off" aria-label="Cesium Ion token">
+                <div id="cesium-token-error" role="alert"></div>
+                <div id="cesium-token-actions">
+                    <button id="cesium-token-cancel" type="button">Cancel</button>
+                    <button type="submit">Save and continue</button>
+                </div>
+            </div>
+        </form>
+    </div>
 
     <!-- Key guide overlay -->
     <div id="key-guide"></div>
@@ -1108,7 +1160,7 @@
                         window.googleTilesFlightStart();
                         return;
                     }
-                    import('./src/main.js?v=20260814-path-collision-a3')
+                    import('./src/main.js?v=20260817-persistent-profile-a1')
                         .then(function (mod) {
                             var start = window.googleTilesFlightStart || mod.startTilesMode;
                             if (typeof start === 'function') start();
@@ -1119,6 +1171,6 @@
             });
         }());
     </script>
-    <script type="module" src="src/main.js?v=20260814-path-collision-a3"></script>
+    <script type="module" src="src/main.js?v=20260817-persistent-profile-a1"></script>
 </body>
 </html>
