@@ -5,7 +5,7 @@
 **ZJU FAST Lab 城市高速无人机研究项目：基于 CesiumJS、DA360 与 YOPO360 的浏览器闭环仿真平台**
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-1f6feb.svg)](LICENSE)
-[![Release](https://img.shields.io/badge/release-v0.1.0--demo.20260814-0b8f87.svg)](https://github.com/cn-ryw/Fastlab_world_fly/releases/tag/v0.1.0-demo.20260814)
+[![Release](https://img.shields.io/badge/release-v0.1.1--demo.20260818-0b8f87.svg)](https://github.com/cn-ryw/Fastlab_world_fly/releases/tag/v0.1.1-demo.20260818)
 [![Status](https://img.shields.io/badge/status-sim--to--sim-orange.svg)](#当前边界)
 
 <img src="docs/assets/demo/fastlab-world-fly-demo-overview.gif" width="960" alt="FASTLab World Fly 四种飞行模式演示">
@@ -31,6 +31,29 @@ Google 将 Photorealistic 3D Tiles 定义为以卫星与航拍影像纹理化的
 | 任务输入 | G 固定航点、T8L 50 m 滚动航点 |
 | 诊断记录 | RGB/深度预览、飞行日志、规划与画面性能指标 |
 
+## 地标城市导航演示 / Landmark Navigation Showcase
+
+以下五段均为选定的 1× 仿真片段，展示 G 固定航点与 T8L 遥控器辅助滚动航点下的导航避障效果。点击封面会下载新版 GitHub Release 中对应的 1080p MP4；原始录屏不进入 Git 仓库。
+
+All five videos are selected 1× simulation excerpts showing navigation and obstacle avoidance with G fixed waypoints or a T8L remote-assisted rolling waypoint. Click a poster to download the corresponding 1080p MP4 from the new GitHub Release; source recordings are not committed to Git.
+
+<table>
+<tr>
+<td align="center"><a href="https://github.com/cn-ryw/Fastlab_world_fly/releases/download/v0.1.1-demo.20260818/landmark-new-york-wtc-g-waypoint-01-20260818.mp4"><img src="docs/assets/demo/poster-landmark-new-york-wtc-g-waypoint-01-20260818.jpg" width="400" alt="纽约世贸中心建筑群 G 固定航点 1 演示 / World Trade Center complex G fixed waypoint 1 demo"></a><br><b>纽约世贸中心建筑群 / World Trade Center complex</b><br>G 固定航点 #1 / G fixed waypoint #1</td>
+<td align="center"><a href="https://github.com/cn-ryw/Fastlab_world_fly/releases/download/v0.1.1-demo.20260818/landmark-new-york-wtc-g-waypoint-02-20260818.mp4"><img src="docs/assets/demo/poster-landmark-new-york-wtc-g-waypoint-02-20260818.jpg" width="400" alt="纽约世贸中心建筑群 G 固定航点 2 演示 / World Trade Center complex G fixed waypoint 2 demo"></a><br><b>纽约世贸中心建筑群 / World Trade Center complex</b><br>G 固定航点 #2 / G fixed waypoint #2</td>
+</tr>
+<tr>
+<td align="center"><a href="https://github.com/cn-ryw/Fastlab_world_fly/releases/download/v0.1.1-demo.20260818/landmark-new-york-wtc-t8l-rolling-waypoint-20260818.mp4"><img src="docs/assets/demo/poster-landmark-new-york-wtc-t8l-rolling-waypoint-20260818.jpg" width="400" alt="纽约世贸中心建筑群 T8L 遥控器辅助滚动航点演示 / World Trade Center complex T8L remote-assisted rolling waypoint demo"></a><br><b>纽约世贸中心建筑群 / World Trade Center complex</b><br>T8L 遥控器辅助滚动航点 / T8L remote-assisted rolling waypoint</td>
+<td align="center"><a href="https://github.com/cn-ryw/Fastlab_world_fly/releases/download/v0.1.1-demo.20260818/landmark-paris-eiffel-tower-g-waypoint-01-20260818.mp4"><img src="docs/assets/demo/poster-landmark-paris-eiffel-tower-g-waypoint-01-20260818.jpg" width="400" alt="巴黎埃菲尔铁塔 G 固定航点 1 演示 / Paris Eiffel Tower G fixed waypoint 1 demo"></a><br><b>巴黎埃菲尔铁塔 / Paris Eiffel Tower</b><br>G 固定航点 #1 / G fixed waypoint #1</td>
+</tr>
+<tr>
+<td align="center"><a href="https://github.com/cn-ryw/Fastlab_world_fly/releases/download/v0.1.1-demo.20260818/landmark-paris-eiffel-tower-g-waypoint-02-20260818.mp4"><img src="docs/assets/demo/poster-landmark-paris-eiffel-tower-g-waypoint-02-20260818.jpg" width="400" alt="巴黎埃菲尔铁塔 G 固定航点 2 演示 / Paris Eiffel Tower G fixed waypoint 2 demo"></a><br><b>巴黎埃菲尔铁塔 / Paris Eiffel Tower</b><br>G 固定航点 #2 / G fixed waypoint #2</td>
+<td></td>
+</tr>
+</table>
+
+> **边界 / Boundary:** 这些视频是选定仿真片段，不代表真实飞行、正式零碰撞验收或安全认证。They are selected simulation excerpts, not evidence of real-world flight, formal zero-collision acceptance, or safety certification. Google/Cesium 标识和动态数据署名保留在画面中；第三方内容权利说明见 [NOTICE](NOTICE)。Google/Cesium marks and dynamic data attribution remain on screen; see [NOTICE](NOTICE) for third-party rights.
+
 ## 视频演示
 
 <table>
@@ -44,7 +67,7 @@ Google 将 Photorealistic 3D Tiles 定义为以卫星与航拍影像纹理化的
 </tr>
 </table>
 
-点击封面可打开 GitHub Release 中的 1080p MP4。仓库不提交原始录屏和完整飞行日志。
+点击封面可下载旧版 GitHub Release 中的 1080p MP4。仓库不提交原始录屏和完整飞行日志。
 
 ## 系统架构
 
@@ -154,7 +177,8 @@ python3 scripts/plot_demo_flights.py \
 | 名称 | 用途 |
 |---|---|
 | <code>main</code> | 当前默认、效果最佳的公开演示版本 |
-| <code>v0.1.0-demo.20260814</code> | 本 README 对应的演示 Release |
+| <code>v0.1.1-demo.20260818</code> | 当前 README 对应的地标导航演示 Release |
+| <code>v0.1.0-demo.20260814</code> | 原四模式演示 Release；上方旧版视频链接继续保留 |
 | <code>upstream-baseline-c6406dd</code> | 上游原始基线定位标签 |
 | <code>archive/da360-prototype-c0b82d5-20260809</code> | 早期 DA360 原型归档 |
 
