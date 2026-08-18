@@ -3,7 +3,7 @@
      xmlns:xlink="http://www.w3.org/1999/xlink"
      width="1920" height="1080" viewBox="0 0 1920 1080"
      role="img" aria-labelledby="svg-title svg-desc">
-  <title id="svg-title">MindCloud World Fly 自主导航闭环仿真架构</title>
+  <title id="svg-title">FASTLab World Fly 自主导航闭环仿真架构</title>
   <desc id="svg-desc">SO3 模式下从任务与导航会话，经 Cesium 全景采集、PerceptionFrame、DA360 sim-to-sim 近似深度、YOPO 局部规划、Poly5 与 SO3 控制，到动力学状态反馈的闭环仿真架构。</desc>
   <metadata>
     <architecture-diagram xmlns="https://mindcloud.example/schema/architecture-diagram/1">
@@ -53,7 +53,7 @@
   <rect width="1920" height="1080" fill="#FFFFFF"/>
 
   <!-- Header -->
-  <text x="70" y="91" class="sans ink title">MindCloud World Fly 自主导航闭环仿真架构</text>
+  <text x="70" y="91" class="sans ink title">FASTLab World Fly 自主导航闭环仿真架构</text>
   <text x="72" y="127" class="sans muted subtitle">SO3 模式下的全景感知、局部规划与控制反馈</text>
   <text x="1850" y="87" text-anchor="end" class="sans blue scope">图示范围 · SO3 模式下的活动导航任务</text>
   <line x1="70" y1="143" x2="1850" y2="143" class="rule"/>

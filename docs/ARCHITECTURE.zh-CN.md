@@ -1,8 +1,8 @@
-# MindCloud World Fly 系统架构
+# FASTLab World Fly 系统架构
 
-![MindCloud World Fly 闭环仿真架构](assets/architecture/mindcloud-system-architecture.svg)
+![FASTLab World Fly 闭环仿真架构](assets/architecture/fastlab-world-fly-system-architecture.svg)
 
-[SVG 矢量图](assets/architecture/mindcloud-system-architecture.svg) · [PDF](assets/architecture/mindcloud-system-architecture.pdf) · [HTML 预览](assets/architecture/mindcloud-system-architecture.html)
+[SVG 矢量图](assets/architecture/fastlab-world-fly-system-architecture.svg) · [PDF](assets/architecture/fastlab-world-fly-system-architecture.pdf) · [HTML 预览](assets/architecture/fastlab-world-fly-system-architecture.html)
 
 页首主图只呈现 SO3 模式下活动导航任务的控制闭环，以保持箭头方向、进程边界和状态反馈清晰。下方 Mermaid 再展开手动模式、预览、标定、日志和失败关闭路径：实线表示控制主链，虚线表示诊断或离线研究。诊断画面和被阻止、过期、拒绝的规划响应都不计入有效规划频率。
 

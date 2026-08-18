@@ -1,6 +1,6 @@
 # 贡献指南
 
-感谢参与 MindCloud World Fly。请从当前 <code>main</code> 创建聚焦的功能分支，并在 PR 中说明用户可见行为和验证环境。
+感谢参与 FASTLab World Fly。请从当前 <code>main</code> 创建聚焦的功能分支，并在 PR 中说明用户可见行为和验证环境。
 
 ## 提交前
 

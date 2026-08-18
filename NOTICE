@@ -1,8 +1,18 @@
-MindCloud_World_Fly
+FASTLab World Fly
 Copyright 2026 Manifold Tech Ltd.
 Author: MENG Guotao <mengguotao@manifoldtech.cn>
 
 This product is licensed under the Apache License, Version 2.0.
+
+The FASTLab World Fly project is maintained as a ZJU FAST Lab urban
+high-speed UAV research project. Use of the ZJU FAST Lab name and logo for
+this project has been authorized by ZJU FAST Lab. That authorization does
+not relicense the ZJU FAST Lab name or logo under the Apache License 2.0.
+
+Early project code originated from:
+  https://github.com/superboySB/MindCloud_World_Fly
+The current project is maintained independently while retaining the original
+copyright notice, author attribution, Git history, and baseline tag.
 
 =========================================================================
 

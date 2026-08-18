@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Launch MindCloud in a persistent, non-incognito Chrome flight profile.
+# Launch FASTLab World Fly in a persistent, non-incognito Chrome flight profile.
 # Prefer verified NVIDIA PRIME rendering and fall back to the desktop GPU.
 set -Eeuo pipefail
 
@@ -128,7 +128,7 @@ stop_profile_processes() {
         return
     fi
 
-    info "Stopping previous MindCloud Chrome profile (${#pids[@]} process(es))..."
+    info "Stopping previous FASTLab World Fly Chrome profile (${#pids[@]} process(es))..."
     kill -TERM "${pids[@]}" 2>/dev/null || true
     for _ in $(seq 1 50); do
         mapfile -t survivors < <(find_profile_pids)

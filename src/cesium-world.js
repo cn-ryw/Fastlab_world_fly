@@ -674,6 +674,7 @@ export class CesiumWorld {
                     cacheBytes: 1536 * 1024 * 1024,
                     maximumCacheOverflowBytes: 1024 * 1024 * 1024,
                     enableCollision: true,
+                    showCreditsOnScreen: true,
                 });
             } catch (e) {
                 reportUserError('Credential-safe Google Photorealistic tileset load failed', e, {
@@ -1453,54 +1454,31 @@ export class CesiumWorld {
         if (this.spawnMarker) this.spawnMarker.show = false;
     }
 
-    validateGoalPlacement(clickedLocal, goalLocal, options = {}) {
-        const x = Number(clickedLocal?.x);
-        const clickedY = Number(clickedLocal?.y);
-        const z = Number(clickedLocal?.z);
-        const goalY = Number(goalLocal?.y);
-        if (![x, clickedY, z, goalY].every(Number.isFinite)) {
+    // The picked roof/facade/terrain surface only supplies horizontal
+    // coordinates. Validity depends on the fully composed goal and clearance.
+    validateGoalPlacement(goalLocal, options = {}) {
+        const x = goalLocal?.x;
+        const goalY = goalLocal?.y;
+        const z = goalLocal?.z;
+        if (![x, goalY, z].every(Number.isFinite)) {
             return {
                 valid: false,
                 reason: 'invalid-position',
-                message: 'Goal rejected: invalid map position.'
+                message: 'Invalid map position.'
             };
         }
 
-        const collisionRadius = Math.max(0.1, Number(options.collisionRadius) || 0.6);
+        const requestedRadius = options.collisionRadius;
+        const collisionRadius = Number.isFinite(requestedRadius)
+            ? Math.max(0.1, requestedRadius)
+            : 0.6;
         const centerSurfaceY = this.sampleHeightAtLocal(x, z, Math.max(0.5, collisionRadius));
         if (!Number.isFinite(centerSurfaceY)) {
             return {
                 valid: false,
                 reason: 'surface-unresolved',
-                message: 'Goal rejected: the clicked map surface has not loaded yet.'
+                message: 'The map surface at the requested position has not loaded yet.'
             };
-        }
-
-        // Google photorealistic tiles do not expose dependable building labels.
-        // A click-only sparse height ring distinguishes elevated roofs/facades
-        // without adding any work to the flight render or planning loops.
-        const offsets = [];
-        for (const distance of [12, 30, 60]) {
-            offsets.push(
-                [distance, 0], [-distance, 0],
-                [0, distance], [0, -distance]
-            );
-        }
-        const nearbyHeights = offsets
-            .map(([dx, dz]) => this.sampleHeightAtLocal(x + dx, z + dz, 1.0))
-            .filter(Number.isFinite)
-            .sort((a, b) => a - b);
-        if (nearbyHeights.length >= 4) {
-            const lowerQuartile = nearbyHeights[Math.floor((nearbyHeights.length - 1) * 0.25)];
-            const surfaceRelief = Math.max(clickedY, centerSurfaceY) - lowerQuartile;
-            if (surfaceRelief > 4.5) {
-                return {
-                    valid: false,
-                    reason: 'building-surface',
-                    message: 'Goal rejected: click on visible ground, not on a building.',
-                    surfaceRelief
-                };
-            }
         }
 
         const requiredClearance = collisionRadius + 0.2;
@@ -1508,7 +1486,7 @@ export class CesiumWorld {
             return {
                 valid: false,
                 reason: 'goal-inside-surface',
-                message: 'Goal rejected: the requested flight height is inside a building or the ground.',
+                message: 'The requested goal intersects a building, terrain, or the required safety clearance.',
                 surfaceY: centerSurfaceY,
                 requiredClearance
             };
