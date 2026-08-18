@@ -346,7 +346,7 @@ setup_input_rules() {
     local tmp
     tmp="$(mktemp)"
     cat > "$tmp" <<'EOF'
-# Google 3D Tiles Flight input access.
+# FASTLab World Fly input access.
 # Allows Chrome Gamepad API, WebHID, and Web Serial to read RC transmitters.
 ACTION=="add|change", SUBSYSTEM=="input", ENV{ID_INPUT_JOYSTICK}=="1", TAG+="uaccess", MODE="0660"
 

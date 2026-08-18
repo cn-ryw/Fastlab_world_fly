@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# MindCloud World Fly — local-only service launcher
+# FASTLab World Fly — local-only service launcher
 set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -212,7 +212,7 @@ cleanup_failed_start() {
 trap cleanup_failed_start EXIT
 
 echo "========================================="
-echo " MindCloud World Fly — 安全启动"
+echo " FASTLab World Fly — 安全启动"
 echo "========================================="
 
 echo ""

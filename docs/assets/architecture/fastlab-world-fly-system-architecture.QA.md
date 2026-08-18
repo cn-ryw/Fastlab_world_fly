@@ -1,4 +1,4 @@
-# MindCloud World Fly 六节点架构图：准确性与发布 QA
+# FASTLab World Fly 六节点架构图：准确性与发布 QA
 
 ## 1. 适用范围
 
@@ -15,11 +15,11 @@
 
 | 文件 | 角色 |
 |---|---|
-| docs/assets/architecture/mindcloud-system-architecture.svg | 规范源；含可检索文字、六节点拓扑和三块无损 crop |
-| docs/assets/architecture/mindcloud-system-architecture.png | 2× 发布位图 |
-| docs/assets/architecture/mindcloud-system-architecture.pdf | 单页发布 PDF |
-| docs/assets/architecture/mindcloud-system-architecture.html | 只引用规范 SVG 的白底浏览器/打印壳 |
-| docs/assets/architecture/mindcloud-system-architecture.QA.md | 本事实溯源与签核记录 |
+| docs/assets/architecture/fastlab-world-fly-system-architecture.svg | 规范源；含可检索文字、六节点拓扑和三块无损 crop |
+| docs/assets/architecture/fastlab-world-fly-system-architecture.png | 2× 发布位图 |
+| docs/assets/architecture/fastlab-world-fly-system-architecture.pdf | 单页发布 PDF |
+| docs/assets/architecture/fastlab-world-fly-system-architecture.html | 只引用规范 SVG 的白底浏览器/打印壳 |
+| docs/assets/architecture/fastlab-world-fly-system-architecture.QA.md | 本事实溯源与签核记录 |
 
 ### 1.1 明确的图外范围
 
@@ -121,10 +121,10 @@
 
 | 文件 | SHA-256 |
 |---|---|
-| mindcloud-system-architecture.svg | 1f02e10a4d1b039baf7fd5efb648a5383bff4abd14814d9c684f0d5b4d634702 |
-| mindcloud-system-architecture.png | 86b57d5918c2c698c5f27bac30b0d692ccc10d1816699599f69fb5379de00d47 |
-| mindcloud-system-architecture.pdf | eeeb5ccf5dbe11a0819ce6d7aeb21ec1fb1254384b5a20859c94ffeb6aea375c |
-| mindcloud-system-architecture.html | a7eadc26748548205d3173ce990809cf6a0ffdc3898836679f306b30e22a7d47 |
+| fastlab-world-fly-system-architecture.svg | b735cbdb600a1dcf529b33035d800274afb85e2f95a837cff23fdb15686cd61e |
+| fastlab-world-fly-system-architecture.png | dbd5ec07eb4c21fd00a0ff0cd0ebfef724d7f35bd53933aa786c3992bfc2a893 |
+| fastlab-world-fly-system-architecture.pdf | 08db793b8a5d3b9805ad24b701a9c408caae93c262a27a8438437229aa7910d6 |
+| fastlab-world-fly-system-architecture.html | 76cb062143a3d64dfc9013a826443c7ffe69edb3c7a6e17fed004cac9b2ef121 |
 
 ### 5.2 结构与尺寸
 
@@ -148,8 +148,8 @@
       --hide-scrollbars \
       --window-size=3840,2160 \
       --force-device-scale-factor=1 \
-      --screenshot=/tmp/mindcloud-system-architecture.png \
-      "file://$ARCH_REPO/docs/assets/architecture/mindcloud-system-architecture.html"
+      --screenshot=/tmp/fastlab-world-fly-system-architecture.png \
+      "file://$ARCH_REPO/docs/assets/architecture/fastlab-world-fly-system-architecture.html"
 
     google-chrome \
       --headless=new \
@@ -157,8 +157,8 @@
       --disable-gpu \
       --allow-file-access-from-files \
       --no-pdf-header-footer \
-      --print-to-pdf=/tmp/mindcloud-system-architecture.pdf \
-      "file://$ARCH_REPO/docs/assets/architecture/mindcloud-system-architecture.html"
+      --print-to-pdf=/tmp/fastlab-world-fly-system-architecture.pdf \
+      "file://$ARCH_REPO/docs/assets/architecture/fastlab-world-fly-system-architecture.html"
 
 不同 Chrome 进程可能产生字形抗锯齿或 PDF 时间戳差异，因此发布哈希用于锁定本次交付，不承诺跨进程 byte-identical。重导验收以尺寸、白底、结构、文字、crop 和全图目视一致为准。
 
@@ -168,10 +168,10 @@
 
 ### 6.1 XML、画布、节点与图片数
 
-    xmllint --noout docs/assets/architecture/mindcloud-system-architecture.svg
+    xmllint --noout docs/assets/architecture/fastlab-world-fly-system-architecture.svg
     xmllint --xpath \
       'concat("root=", local-name(/*), " width=", /*/@width, " height=", /*/@height, " viewBox=", /*/@viewBox, " images=", count(//*[local-name()="image"]), " nodes=", count(//*[@aria-label]))' \
-      docs/assets/architecture/mindcloud-system-architecture.svg
+      docs/assets/architecture/fastlab-world-fly-system-architecture.svg
 
 预期：
 
@@ -184,7 +184,7 @@
     from PIL import Image
     import struct
 
-    path = Path("docs/assets/architecture/mindcloud-system-architecture.png")
+    path = Path("docs/assets/architecture/fastlab-world-fly-system-architecture.png")
     with Image.open(path) as image:
         assert image.size == (3840, 2160)
         assert image.mode == "RGB"
@@ -216,10 +216,10 @@
     assert position == len(data)
     names = [kind for kind, _ in chunks]
     assert names.count("IHDR") == 1
-    assert names.count("IDAT") == 304
+    assert names.count("IDAT") == 299
     assert names.count("IEND") == 1
     assert not {"caBX", "iTXt", "tEXt", "zTXt", "eXIf"}.intersection(names)
-    print("PNG OK:", (3840, 2160), "RGB", {"IHDR": 1, "IDAT": 304, "IEND": 1})
+    print("PNG OK:", (3840, 2160), "RGB", {"IHDR": 1, "IDAT": 299, "IEND": 1})
     PY
 
 ### 6.3 三个原生 crop 逐像素核对
@@ -233,7 +233,7 @@
     import xml.etree.ElementTree as ET
 
     repo = Path(".").resolve()
-    svg = repo / "docs/assets/architecture/mindcloud-system-architecture.svg"
+    svg = repo / "docs/assets/architecture/fastlab-world-fly-system-architecture.svg"
     ns = {
         "svg": "http://www.w3.org/2000/svg",
         "xlink": "http://www.w3.org/1999/xlink",
@@ -273,7 +273,7 @@
     import subprocess
     import xml.etree.ElementTree as ET
 
-    base = Path("docs/assets/architecture/mindcloud-system-architecture")
+    base = Path("docs/assets/architecture/fastlab-world-fly-system-architecture")
     root = ET.parse(base.with_suffix(".svg")).getroot()
     visible = []
     embedded = []
@@ -339,7 +339,7 @@
 
 ### 6.5 PDF 单页
 
-    pdfinfo docs/assets/architecture/mindcloud-system-architecture.pdf
+    pdfinfo docs/assets/architecture/fastlab-world-fly-system-architecture.pdf
 
 必须同时满足：
 
@@ -388,11 +388,11 @@
                 if key in attrs:
                     check(self.owner, attrs[key])
 
-    html = base / "mindcloud-system-architecture.html"
+    html = base / "fastlab-world-fly-system-architecture.html"
     parser = Parser(html)
     parser.feed(html.read_text(encoding="utf-8"))
 
-    svg = base / "mindcloud-system-architecture.svg"
+    svg = base / "fastlab-world-fly-system-architecture.svg"
     root = ET.parse(svg).getroot()
     for element in root.iter():
         for key in (
@@ -414,7 +414,7 @@
     import re
     import xml.etree.ElementTree as ET
 
-    path = Path("docs/assets/architecture/mindcloud-system-architecture.svg")
+    path = Path("docs/assets/architecture/fastlab-world-fly-system-architecture.svg")
     root = ET.parse(path).getroot()
     text = re.sub(
         r"\s+",
@@ -423,6 +423,7 @@
     )
 
     required = [
+        "FASTLab World Fly 自主导航闭环仿真架构",
         "图示范围 · SO3 模式下的活动导航任务",
         "目标与会话标识（在请求组装阶段合入）",
         "终端状态 + 轨迹时域 T",
@@ -495,10 +496,10 @@
 ### 6.8 发布哈希
 
     sha256sum \
-      docs/assets/architecture/mindcloud-system-architecture.svg \
-      docs/assets/architecture/mindcloud-system-architecture.png \
-      docs/assets/architecture/mindcloud-system-architecture.pdf \
-      docs/assets/architecture/mindcloud-system-architecture.html
+      docs/assets/architecture/fastlab-world-fly-system-architecture.svg \
+      docs/assets/architecture/fastlab-world-fly-system-architecture.png \
+      docs/assets/architecture/fastlab-world-fly-system-architecture.pdf \
+      docs/assets/architecture/fastlab-world-fly-system-architecture.html
 
 ### 6.9 Git whitespace
 
@@ -506,7 +507,7 @@ QA 文件当前是新增文件，因此同时运行仓库差异检查和新增�
 
     git diff --check
     git diff --no-index --check /dev/null \
-      docs/assets/architecture/mindcloud-system-architecture.QA.md \
+      docs/assets/architecture/fastlab-world-fly-system-architecture.QA.md \
       >/dev/null
 
 第二条命令因“文件不同”可返回状态 1；验收标准是 stderr/终端没有 trailing whitespace、space before tab 或 blank line at EOF 报告。
@@ -542,7 +543,7 @@ QA 文件当前是新增文件，因此同时运行仓库差异检查和新增�
 |---|---|
 | XML / SVG 结构 | 通过；1920×1080，viewBox 0 0 1920 1080，6 节点、3 images |
 | PNG 尺寸与纯白 | 通过；3840×2160 RGB，info={}，四条外边界均为 #FFFFFF |
-| PNG chunk | 通过；IHDR×1、IDAT×304、IEND×1，无 caBX/文本/EXIF chunk |
+| PNG chunk | 通过；IHDR×1、IDAT×299、IEND×1，无 caBX/文本/EXIF chunk |
 | 原生 crop | 通过；三个内嵌 PNG 与声明的原始 JPG crop 逐像素相同 |
 | SVG/HTML/PDF C2PA/JUMBF | 通过；SVG 排除 data URI 后无标记，三个内嵌 PNG chunk 无标记，HTML/PDF 无标记 |
 | PDF | 通过；1 页，960×540 pt，PDF 1.4，无 JavaScript/Custom Metadata/Metadata Stream |

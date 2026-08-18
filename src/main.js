@@ -16,14 +16,14 @@
  */
 
 /**
- * Main entry point for the Google 3D Tiles flight mode.
+ * Main entry point for FASTLab World Fly.
  *
  * Rendering is Cesium + Google Photorealistic 3D Tiles. Flight dynamics,
  * controller mapping, T8L Web Serial/WebHID/Gamepad support, HUD and OSD are retained
  * from the original simulator.
  */
 
-import { CesiumWorld } from './cesium-world.js?v=20260817-persistent-profile-a1';
+import { CesiumWorld } from './cesium-world.js?v=20260817-final-goal-clearance-a1';
 import {
     resolveCesiumIonToken,
     storeCesiumIonToken,
@@ -704,6 +704,42 @@ function setupCesiumPlacementHandler() {
 // 等价于 callback_set_goal_3d 移动整个高度平面。按 C 取消航点时复位。
 let goalAltitudeOverride = null;
 
+// Scene and minimap clicks provide horizontal coordinates only. Compose the
+// active height first, then validate the same final 3D goal for both inputs.
+function tryBeginFixedGoal(horizontal, options = {}) {
+    if (!world || !drone) return false;
+
+    const altY = goalAltitudeOverride != null ? goalAltitudeOverride : drone.y;
+    const goal = {
+        x: horizontal?.x,
+        y: altY,
+        z: horizontal?.z,
+    };
+    const placement = world.validateGoalPlacement(goal, {
+        collisionRadius: drone.collisionRadius,
+    });
+    const logLabel = options.logLabel || 'goal';
+    if (!placement.valid) {
+        console.warn(`[${logLabel}] REJECTED: ${placement.reason}`, placement);
+        reportUserError('Goal rejected', new Error(placement.message), {
+            key: 'goal-placement-rejected',
+            intervalMs: 500,
+        });
+        return false;
+    }
+
+    const detail = options.detail || (
+        goalAltitudeOverride != null ? '(高度已手动指定)' : '(沿用当前高度)'
+    );
+    console.log(
+        `[${logLabel}] SET:`,
+        goal.x.toFixed(1), goal.y.toFixed(1), goal.z.toFixed(1),
+        detail,
+    );
+    beginNavigationSession(goal);
+    return true;
+}
+
 function setupFlightGoalClickHandler() {
     if (!world || !world.viewer || flightGoalHandler) return;
     const Cesium = world.Cesium;
@@ -735,25 +771,10 @@ function setupFlightGoalClickHandler() {
                 if (Cesium.defined(p)) cartesian = p;
             } catch (_) {}
         }
-        if (!cartesian) { console.log('[goal] no ground — click on buildings/terrain, not sky'); return; }
+        if (!cartesian) { console.log('[goal] no surface — click on visible buildings/terrain, not sky'); return; }
 
         const local = world.cartesianToLocal(cartesian);
-        const altY = goalAltitudeOverride != null ? goalAltitudeOverride : drone.y;
-        const goal = { x: local.x, y: altY, z: local.z };
-        const placement = world.validateGoalPlacement(local, goal, {
-            collisionRadius: drone.collisionRadius
-        });
-        if (!placement.valid) {
-            console.warn(`[goal] REJECTED: ${placement.reason}`, placement);
-            reportUserError('Goal rejected', new Error(placement.message), {
-                key: 'goal-placement-rejected',
-                intervalMs: 500
-            });
-            return;
-        }
-        console.log('[goal] SET:', local.x.toFixed(1), altY.toFixed(1), local.z.toFixed(1),
-            goalAltitudeOverride != null ? '(高度已手动指定)' : '(沿用当前高度)');
-        beginNavigationSession(goal);
+        tryBeginFixedGoal({ x: local.x, z: local.z });
     };
 
     // Track G key state
@@ -805,13 +826,15 @@ function setupFlightGoalClickHandler() {
         }
         const goalX = drone.x + clickGoal.east;
         const goalZ = drone.z + clickGoal.north;
-        const altY = goalAltitudeOverride != null ? goalAltitudeOverride : drone.y;
-        console.log(
-            '[depth top-down goal] SET:',
-            goalX.toFixed(1), altY.toFixed(1), goalZ.toFixed(1),
-            clickGoal.mapping === 'relative-test' ? '(relative test mapping)' : '(metric)',
+        tryBeginFixedGoal(
+            { x: goalX, z: goalZ },
+            {
+                logLabel: 'depth top-down goal',
+                detail: clickGoal.mapping === 'relative-test'
+                    ? '(relative test mapping)'
+                    : '(metric)',
+            },
         );
-        beginNavigationSession({ x: goalX, y: altY, z: goalZ });
     };
     if (radarCanvas) radarCanvas.addEventListener('mousedown', onRadarMouseDown);
 
@@ -1525,6 +1548,17 @@ function setupDisplaySettingsListeners() {
         el._tilesDisplayBound = true;
         el.addEventListener('change', applyDisplaySettings);
     }
+    const clearFlightPathBtn = document.getElementById('clear-flight-path-btn');
+    if (clearFlightPathBtn && !clearFlightPathBtn._flightPathClearBound) {
+        clearFlightPathBtn._flightPathClearBound = true;
+        clearFlightPathBtn.addEventListener('click', () => {
+            const currentPosition = drone
+                && [drone.x, drone.y, drone.z].every(Number.isFinite)
+                ? { x: drone.x, y: drone.y, z: drone.z }
+                : null;
+            world?.resetFlightPath?.(currentPosition);
+        });
+    }
     // Drone model scale slider
     const modelScaleSlider = document.getElementById('drone-model-scale');
     const modelScaleNum = document.getElementById('drone-model-scale-num');
@@ -1837,7 +1871,7 @@ function setupStartUI() {
     const changeTokenBtn = document.getElementById('cesium-token-change');
     if (startBtn && !startBtn._flightStartBound) {
         startBtn._flightStartBound = true;
-        startBtn.textContent = 'Start Google 3D Tiles Flight';
+        startBtn.textContent = 'Start FASTLab World Fly';
         startBtn.addEventListener('click', () => startTilesMode());
     }
     if (dropZone) {

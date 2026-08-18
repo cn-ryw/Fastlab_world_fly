@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Launch the local MindCloud simulation in Firefox with NVIDIA PRIME offload.
+# Launch the local FASTLab World Fly simulation in Firefox with NVIDIA PRIME offload.
 #
 # Usage:
 #   ./launch-firefox-gpu.sh [URL]
@@ -7,7 +7,7 @@
 # Optional environment overrides:
 #   FIREFOX_BIN       Firefox executable (default: first `firefox` in PATH)
 #   FIREFOX_LOG_FILE  Browser stdout/stderr log
-#   FIREFOX_PROFILE_DIR  Persistent MindCloud Firefox profile directory
+#   FIREFOX_PROFILE_DIR  Persistent FASTLab World Fly Firefox profile directory
 
 set -Eeuo pipefail
 
@@ -57,7 +57,7 @@ usage() {
     cat <<EOF
 Usage: ./launch-firefox-gpu.sh [URL]
 
-Launch Firefox in a persistent, non-private MindCloud profile with NVIDIA PRIME render offload.
+Launch Firefox in a persistent, non-private FASTLab World Fly profile with NVIDIA PRIME render offload.
 
 Arguments:
   URL                 Page to open (default: ${DEFAULT_DISPLAY_URL})
@@ -65,7 +65,7 @@ Arguments:
 Environment:
   FIREFOX_BIN         Firefox executable override
   FIREFOX_LOG_FILE    Browser log override (default: ${DEFAULT_LOG_FILE})
-  FIREFOX_PROFILE_DIR Persistent MindCloud profile directory override
+  FIREFOX_PROFILE_DIR Persistent FASTLab World Fly profile directory override
 EOF
 }
 
@@ -239,7 +239,7 @@ info "Profile: ${PROFILE_DIR} (persistent, non-private)"
 
 existing_firefox_pids="$(pgrep -u "$(id -u)" -x firefox 2>/dev/null | paste -sd, - || true)"
 if [[ -n "${existing_firefox_pids}" ]]; then
-    info "Other Firefox process(es) detected (PID(s) ${existing_firefox_pids}); MindCloud will use its dedicated profile."
+    info "Other Firefox process(es) detected (PID(s) ${existing_firefox_pids}); FASTLab World Fly will use its dedicated profile."
 fi
 
 nohup "${FIREFOX_EXECUTABLE}" --profile "${PROFILE_DIR}" --new-window "${TARGET_URL}" \
