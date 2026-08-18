@@ -63,7 +63,11 @@ def test_public_assets_and_repository_links_use_new_slug():
     assert "github.com/cn-ryw/Fastlab_world_fly/security/advisories/new" in issue_config
     assert "github.com/cn-ryw/MindCloud_World_Fly" not in issue_config
 
-
+    architecture_svg = read(
+        "docs/assets/architecture/fastlab-world-fly-system-architecture.svg"
+    )
+    assert 'xmlns="urn:fastlab-world-fly:architecture-diagram:1"' in architecture_svg
+    assert "mindcloud.example" not in architecture_svg
 def test_internal_legacy_identifiers_remain_compatible():
     assert "MINDCLOUD_WEB_HOST" in read("start-all.sh")
     assert "mindcloud_cesium_ion_token" in read("src/cesium-token.js")

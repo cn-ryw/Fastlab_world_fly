@@ -6,6 +6,7 @@ COPY --chown=node:node src/ /var/www/google-tiles-flight/src/
 COPY --chown=node:node index.html /var/www/google-tiles-flight/
 COPY --chown=node:node asset/ /var/www/google-tiles-flight/asset/
 COPY --chown=node:node scripts/server.js /var/www/google-tiles-flight/scripts/server.js
+COPY --chown=node:node scripts/static-cache-policy.cjs /var/www/google-tiles-flight/scripts/static-cache-policy.cjs
 
 RUN mkdir -p /var/www/google-tiles-flight/asset/gate-paths \
     && chown -R node:node /var/www/google-tiles-flight/asset/gate-paths

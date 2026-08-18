@@ -11,6 +11,7 @@
 const express = require('express');
 const fs = require('fs');
 const path = require('path');
+const { cacheControlForPath } = require('./static-cache-policy.cjs');
 
 const app = express();
 const PORT = Number(process.env.PORT || 8000);
@@ -54,15 +55,7 @@ app.use((req, res, next) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, PUT, DELETE, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-    // Per-path caching: immutable assets get long max-age; HTML revalidates
-    const p = req.path;
-    if (p === '/' || p === '/index.html' || p.endsWith('.html')) {
-        res.setHeader('Cache-Control', 'no-cache');
-    } else if (p.startsWith('/api/')) {
-        res.setHeader('Cache-Control', 'no-store');
-    } else {
-        res.setHeader('Cache-Control', 'public, max-age=86400');
-    }
+    res.setHeader('Cache-Control', cacheControlForPath(req.path));
     next();
 });
 

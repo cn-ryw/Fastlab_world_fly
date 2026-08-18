@@ -6,7 +6,7 @@
   <title id="svg-title">FASTLab World Fly 自主导航闭环仿真架构</title>
   <desc id="svg-desc">SO3 模式下从任务与导航会话，经 Cesium 全景采集、PerceptionFrame、DA360 sim-to-sim 近似深度、YOPO 局部规划、Poly5 与 SO3 控制，到动力学状态反馈的闭环仿真架构。</desc>
   <metadata>
-    <architecture-diagram xmlns="https://mindcloud.example/schema/architecture-diagram/1">
+    <architecture-diagram xmlns="urn:fastlab-world-fly:architecture-diagram:1">
       <version>2.0</version>
       <design-language>academic schematic; white background; square modules; single blue accent</design-language>
       <canva-design-id>DAHSij1Sid8</canva-design-id>
