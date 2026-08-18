@@ -59,6 +59,23 @@ External data services
   the tile data is not distributed by this repository.
 
 -------------------------------------------------------------------------
+Landmark showcase recordings
+  Landmark showcase recordings published as GitHub Release assets contain
+  rendered Google Photorealistic 3D Tiles accessed through Cesium Ion and may
+  include Google, Cesium, and other data-provider imagery, 3D content, marks,
+  notices, and dynamic attribution. Those third-party materials and associated
+  rights remain with their respective rights holders and are not relicensed
+  under the Apache License 2.0 that applies to this project.
+
+  The recordings and their embedded third-party content must not be separately
+  resold as stock footage, imagery, map or tile content, 3D/geospatial data, or
+  another standalone asset or product. Redistribution remains subject to
+  applicable provider terms and required attribution; if correction or removal
+  is required by those terms or by a rights holder, downstream distributors
+  must promptly cease redistribution and remove or correct affected copies
+  under their control.
+
+-------------------------------------------------------------------------
 Documentation assets
   Simulator screenshots and demo recordings were produced by this project.
   The system architecture figure uses direct image crops from project
