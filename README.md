@@ -71,11 +71,11 @@ All five videos are selected 1× simulation excerpts showing navigation and obst
 
 ## 系统架构
 
-![FASTLab World Fly 闭环仿真架构](docs/assets/architecture/fastlab-world-fly-system-architecture.png)
+![FASTLab World Fly 闭环仿真架构](docs/assets/architecture/fastlab-world-fly-closed-loop-architecture-20260818.jpg)
 
-[SVG 矢量图](docs/assets/architecture/fastlab-world-fly-system-architecture.svg) · [PDF](docs/assets/architecture/fastlab-world-fly-system-architecture.pdf) · [HTML 预览](docs/assets/architecture/fastlab-world-fly-system-architecture.html) · [Mermaid 与模块说明](docs/ARCHITECTURE.zh-CN.md)
+[JPG 原图](docs/assets/architecture/fastlab-world-fly-closed-loop-architecture-20260818.jpg) · [技术细节 SVG](docs/assets/architecture/fastlab-world-fly-system-architecture.svg) · [PDF](docs/assets/architecture/fastlab-world-fly-system-architecture.pdf) · [HTML 预览](docs/assets/architecture/fastlab-world-fly-system-architecture.html) · [Mermaid 与模块说明](docs/ARCHITECTURE.zh-CN.md)
 
-主图只保留 SO3 模式下活动导航任务的控制闭环：任务身份通过独立总线在请求组装阶段与不可变 `PerceptionFrame` 合入，经 DA360 sim-to-sim 零偏置尺度换算和 YOPO 局部规划后，通过时效与一致性门禁；浏览器再从应用时实测状态构造完整时域 Poly5，由 SO3 控制器和固定步长动力学执行并反馈状态。手动模式、缓存预览、日志、离线标定和评测移至 [架构文档](docs/ARCHITECTURE.zh-CN.md)，不与控制主链混画。三幅画面均裁自项目运行截图，其余元素为原生 SVG 几何和可检索文字。
+新版主图按“仿真世界与任务输入 → 360° 视觉感知 → 局部轨迹规划 → 飞行控制与反馈”四个阶段展示闭环，标出网页/VPN 入口、G/T8L 航点、六面相机、ERP RGB、DA360 标定深度、API 与 GPU 推理服务、Poly5/SO3 控制，以及日志和性能评估输出。原 SVG/PDF/HTML 和 [架构文档](docs/ARCHITECTURE.zh-CN.md) 继续保留更细的任务身份、时效门禁和失败关闭路径。
 
 ## 快速开始
 

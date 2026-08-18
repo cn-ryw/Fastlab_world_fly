@@ -1,10 +1,10 @@
 # FASTLab World Fly 系统架构
 
-![FASTLab World Fly 闭环仿真架构](assets/architecture/fastlab-world-fly-system-architecture.svg)
+![FASTLab World Fly 闭环仿真架构](assets/architecture/fastlab-world-fly-closed-loop-architecture-20260818.jpg)
 
-[SVG 矢量图](assets/architecture/fastlab-world-fly-system-architecture.svg) · [PDF](assets/architecture/fastlab-world-fly-system-architecture.pdf) · [HTML 预览](assets/architecture/fastlab-world-fly-system-architecture.html)
+[JPG 原图](assets/architecture/fastlab-world-fly-closed-loop-architecture-20260818.jpg) · [技术细节 SVG](assets/architecture/fastlab-world-fly-system-architecture.svg) · [PDF](assets/architecture/fastlab-world-fly-system-architecture.pdf) · [HTML 预览](assets/architecture/fastlab-world-fly-system-architecture.html)
 
-页首主图只呈现 SO3 模式下活动导航任务的控制闭环，以保持箭头方向、进程边界和状态反馈清晰。下方 Mermaid 再展开手动模式、预览、标定、日志和失败关闭路径：实线表示控制主链，虚线表示诊断或离线研究。诊断画面和被阻止、过期、拒绝的规划响应都不计入有效规划频率。
+页首主图以四个阶段概览仿真世界与任务输入、360° 视觉感知、局部轨迹规划及飞行控制与反馈，并突出浏览器到 API/GPU 推理服务的边界。保留的技术细节 SVG 和下方 Mermaid 继续展开任务身份、手动模式、预览、标定、日志和失败关闭路径：实线表示控制主链，虚线表示诊断或离线研究。诊断画面和被阻止、过期、拒绝的规划响应都不计入有效规划频率。
 
 ## 可检索架构图
 

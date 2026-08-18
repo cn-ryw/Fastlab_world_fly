@@ -78,12 +78,20 @@ Landmark showcase recordings
 -------------------------------------------------------------------------
 Documentation assets
   Simulator screenshots and demo recordings were produced by this project.
-  The system architecture figure uses direct image crops from project
-  simulator screenshots (docs/assets/demo/poster-easy.jpg and
-  asset/display/20260703-005006.jpg) inside a source-code-driven native SVG.
+  The current README and architecture guide display the project-provided raster
+  overview at
+  docs/assets/architecture/fastlab-world-fly-closed-loop-architecture-20260818.jpg.
+  It combines project simulator crops with diagram icons and illustrative
+  device imagery. Any
+  third-party marks or illustrative elements remain subject to their respective
+  rights and are not relicensed under this project's Apache License 2.0.
+
+  The retained editable technical-detail architecture set uses direct image
+  crops from project simulator screenshots (docs/assets/demo/poster-easy.jpg
+  and asset/display/20260703-005006.jpg) inside a source-code-driven native SVG.
   Its remaining geometry, labels, data, formulas, and arrows are authored as
   native SVG vector elements; the HTML file is a white preview wrapper. No
-  generative image elements are used.
+  generative image elements are used in that retained SVG set.
 
 -------------------------------------------------------------------------
 JSZip
