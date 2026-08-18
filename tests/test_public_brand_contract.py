@@ -36,6 +36,7 @@ def test_public_surfaces_use_fastlab_world_fly_brand():
 def test_public_assets_and_repository_links_use_new_slug():
     new_assets = (
         "docs/assets/demo/fastlab-world-fly-demo-overview.gif",
+        "docs/assets/architecture/fastlab-world-fly-closed-loop-architecture-20260818.jpg",
         "docs/assets/architecture/fastlab-world-fly-system-architecture.svg",
         "docs/assets/architecture/fastlab-world-fly-system-architecture.png",
         "docs/assets/architecture/fastlab-world-fly-system-architecture.pdf",
@@ -56,6 +57,10 @@ def test_public_assets_and_repository_links_use_new_slug():
     readme = read("README.md")
     assert "github.com/cn-ryw/Fastlab_world_fly" in readme
     assert "docs/assets/demo/fastlab-world-fly-demo-overview.gif" in readme
+    assert (
+        "docs/assets/architecture/fastlab-world-fly-closed-loop-architecture-20260818.jpg"
+        in readme
+    )
     assert "fastlab-world-fly-system-architecture" in readme
     assert "github.com/superboySB/MindCloud_World_Fly" in readme
 
@@ -68,6 +73,14 @@ def test_public_assets_and_repository_links_use_new_slug():
     )
     assert 'xmlns="urn:fastlab-world-fly:architecture-diagram:1"' in architecture_svg
     assert "mindcloud.example" not in architecture_svg
+
+    architecture_guide = read("docs/ARCHITECTURE.zh-CN.md")
+    assert (
+        "assets/architecture/fastlab-world-fly-closed-loop-architecture-20260818.jpg"
+        in architecture_guide
+    )
+
+
 def test_internal_legacy_identifiers_remain_compatible():
     assert "MINDCLOUD_WEB_HOST" in read("start-all.sh")
     assert "mindcloud_cesium_ion_token" in read("src/cesium-token.js")
