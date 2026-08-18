@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Launch the local MindCloud simulation in Firefox with NVIDIA PRIME offload.
+# Launch the local FASTLab World Fly simulation in Firefox with NVIDIA PRIME offload.
 #
 # Usage:
 #   ./launch-firefox-gpu.sh [URL]
@@ -7,6 +7,7 @@
 # Optional environment overrides:
 #   FIREFOX_BIN       Firefox executable (default: first `firefox` in PATH)
 #   FIREFOX_LOG_FILE  Browser stdout/stderr log
+#   FIREFOX_PROFILE_DIR  Persistent FASTLab World Fly Firefox profile directory
 
 set -Eeuo pipefail
 
@@ -56,7 +57,7 @@ usage() {
     cat <<EOF
 Usage: ./launch-firefox-gpu.sh [URL]
 
-Launch Firefox in a private window with NVIDIA PRIME render offload.
+Launch Firefox in a persistent, non-private FASTLab World Fly profile with NVIDIA PRIME render offload.
 
 Arguments:
   URL                 Page to open (default: ${DEFAULT_DISPLAY_URL})
@@ -64,6 +65,7 @@ Arguments:
 Environment:
   FIREFOX_BIN         Firefox executable override
   FIREFOX_LOG_FILE    Browser log override (default: ${DEFAULT_LOG_FILE})
+  FIREFOX_PROFILE_DIR Persistent FASTLab World Fly profile directory override
 EOF
 }
 
@@ -178,6 +180,26 @@ elif [[ "${FIREFOX_EXECUTABLE}" == /snap/* ]]; then
     firefox_packaging='snap'
 fi
 
+if [[ -n "${FIREFOX_PROFILE_DIR:-}" ]]; then
+    firefox_profile_dir="${FIREFOX_PROFILE_DIR}"
+elif [[ "${firefox_packaging}" == 'snap' ]]; then
+    firefox_profile_dir="${HOME}/snap/firefox/common/.mozilla/firefox/mindcloud-world-fly"
+else
+    firefox_profile_dir="${XDG_DATA_HOME:-${HOME}/.local/share}/mindcloud-world-fly/firefox-profile"
+fi
+case "${firefox_profile_dir}" in
+    /*) ;;
+    *) die 'FIREFOX_PROFILE_DIR must be an absolute path' ;;
+esac
+[[ ! -L "${firefox_profile_dir}" ]] || die 'FIREFOX_PROFILE_DIR must not be a symbolic link'
+firefox_profile_dir="$(realpath --canonicalize-missing -- "${firefox_profile_dir}")" \
+    || die 'could not normalize FIREFOX_PROFILE_DIR'
+[[ "${firefox_profile_dir}" != '/' && "${firefox_profile_dir}" != "${HOME}" ]] \
+    || die 'FIREFOX_PROFILE_DIR must not be the filesystem root or home directory'
+[[ ! -e "${firefox_profile_dir}" || -d "${firefox_profile_dir}" ]] \
+    || die 'FIREFOX_PROFILE_DIR exists but is not a directory'
+readonly PROFILE_DIR="${firefox_profile_dir}"
+
 gpu_name='unavailable'
 if command -v nvidia-smi >/dev/null 2>&1; then
     gpu_name="$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -n 1 || true)"
@@ -195,6 +217,10 @@ if [[ "${TARGET_URL}" == http://127.0.0.1:* || "${TARGET_URL}" == http://localho
     fi
 fi
 
+if [[ ! -d "${PROFILE_DIR}" ]]; then
+    mkdir -p -- "${PROFILE_DIR}"
+    chmod 700 -- "${PROFILE_DIR}"
+fi
 mkdir -p -- "$(dirname -- "${LOG_FILE}")"
 {
     printf '\n[%s] launch\n' "$(date --iso-8601=seconds)"
@@ -209,13 +235,14 @@ info "Proxy environment: ${proxy_environment}; local loopback addresses bypass i
 info "Google Tiles transport: ${google_tiles_transport}."
 info "URL: ${DISPLAY_URL}"
 info "Log: ${LOG_FILE}"
+info "Profile: ${PROFILE_DIR} (persistent, non-private)"
 
 existing_firefox_pids="$(pgrep -u "$(id -u)" -x firefox 2>/dev/null | paste -sd, - || true)"
 if [[ -n "${existing_firefox_pids}" ]]; then
-    warn "Firefox is already running (PID(s) ${existing_firefox_pids}); the new window may reuse that process, so its original GPU environment remains authoritative."
+    info "Other Firefox process(es) detected (PID(s) ${existing_firefox_pids}); FASTLab World Fly will use its dedicated profile."
 fi
 
-nohup "${FIREFOX_EXECUTABLE}" --private-window "${TARGET_URL}" \
+nohup "${FIREFOX_EXECUTABLE}" --profile "${PROFILE_DIR}" --new-window "${TARGET_URL}" \
     </dev/null >>"${LOG_FILE}" 2>&1 &
 firefox_pid=$!
 

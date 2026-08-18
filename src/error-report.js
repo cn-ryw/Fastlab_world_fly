@@ -1,4 +1,8 @@
 const lastShownByKey = new Map();
+const ERROR_BANNER_DISPLAY_MS = 5000;
+
+let errorBannerHideTimer = null;
+let errorBannerDisplayVersion = 0;
 
 const URL_CANDIDATE_RE = /https?:\/\/[^\s<>"'`]+/giu;
 
@@ -65,6 +69,7 @@ export function reportUserError(context, error, options = {}) {
     const banner = ensureErrorBanner();
     banner.textContent = title;
     banner.style.display = 'block';
+    scheduleErrorBannerHide(banner);
 
     if (options.overlay) {
         const overlay = document.getElementById('loading-overlay');
@@ -75,6 +80,22 @@ export function reportUserError(context, error, options = {}) {
             progress.style.color = '#f44';
         }
     }
+}
+
+function scheduleErrorBannerHide(banner) {
+    const displayVersion = ++errorBannerDisplayVersion;
+    if (errorBannerHideTimer !== null) {
+        clearTimeout(errorBannerHideTimer);
+    }
+
+    errorBannerHideTimer = setTimeout(() => {
+        // clearTimeout prevents normal stale callbacks, while the version
+        // check also covers a callback that was already queued when cleared.
+        if (displayVersion !== errorBannerDisplayVersion) return;
+        banner.textContent = '';
+        banner.style.display = 'none';
+        errorBannerHideTimer = null;
+    }, ERROR_BANNER_DISPLAY_MS);
 }
 
 function ensureErrorBanner() {

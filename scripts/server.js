@@ -1,5 +1,5 @@
 /*
- * Static server for the Google 3D Tiles flight app inside the 3DCityDB/Cesium image.
+ * Static server for FASTLab World Fly inside the 3DCityDB/Cesium image.
  *
  * Serves:
  *   /                         -> this project
@@ -11,6 +11,7 @@
 const express = require('express');
 const fs = require('fs');
 const path = require('path');
+const { cacheControlForPath } = require('./static-cache-policy.cjs');
 
 const app = express();
 const PORT = Number(process.env.PORT || 8000);
@@ -54,15 +55,7 @@ app.use((req, res, next) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, PUT, DELETE, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-    // Per-path caching: immutable assets get long max-age; HTML revalidates
-    const p = req.path;
-    if (p === '/' || p === '/index.html' || p.endsWith('.html')) {
-        res.setHeader('Cache-Control', 'no-cache');
-    } else if (p.startsWith('/api/')) {
-        res.setHeader('Cache-Control', 'no-store');
-    } else {
-        res.setHeader('Cache-Control', 'public, max-age=86400');
-    }
+    res.setHeader('Cache-Control', cacheControlForPath(req.path));
     next();
 });
 
@@ -123,7 +116,7 @@ app.use(express.static(APP_ROOT, {
 app.use(express.static(WEB_ROOT));
 
 const server = app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Google 3D Tiles Flight container server listening on 0.0.0.0:${PORT}`);
+    console.log(`FASTLab World Fly container server listening on 0.0.0.0:${PORT}`);
     console.log(`Project root: ${APP_ROOT}`);
     console.log(`Cesium root: ${path.join(WEB_ROOT, 'ThirdParty', 'Cesium')}`);
 });

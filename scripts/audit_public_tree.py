@@ -29,6 +29,7 @@ TEXT_SUFFIXES = {
 TEXT_NAMES = {"Dockerfile", "LICENSE", "NOTICE"}
 ROOT = Path(__file__).resolve().parents[1]
 LEGACY_HOME_PATH_EXCEPTIONS = {"dependencies.versions.json", "fix-clash-rules.sh"}
+PUBLIC_CLIENT_TOKEN_DECLARATION = "const DEFAULT_CESIUM_ION_TOKEN = "
 
 
 def git_output(*args, binary=False):
@@ -72,6 +73,15 @@ def audit(staged=False):
         for line_number, line in enumerate(source.splitlines(), 1):
             for label, pattern in CONTENT_RULES:
                 if label == "home-path" and path in LEGACY_HOME_PATH_EXCEPTIONS:
+                    continue
+                if (
+                    path == "src/cesium-token.js"
+                    and label in {"jwt", "credential-assignment"}
+                    and PUBLIC_CLIENT_TOKEN_DECLARATION in line
+                ):
+                    # CesiumJS needs this deliberately public, browser-visible
+                    # client token. The exception is restricted to one named
+                    # declaration and never applies to server credentials.
                     continue
                 if pattern.search(line):
                     findings.append((path, line_number, label))

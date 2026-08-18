@@ -16,7 +16,7 @@
 # limitations under the License.
 #
 
-"""Local-only HTTP server for the Google 3D Tiles flight app.
+"""Local-only HTTP server for FASTLab World Fly.
 
 Only the application entry point and the explicit ``/src``, ``/asset`` and
 ``/ThirdParty/Cesium`` mounts are exposed.  The project root is deliberately
@@ -420,7 +420,7 @@ if __name__ == '__main__':
     host = sys.argv[2] if len(sys.argv) > 2 else os.environ.get('MINDCLOUD_WEB_HOST', DEFAULT_HOST)
     os.makedirs(PATHS_DIR, exist_ok=True)
     with ReusableTCPServer((host, port), Handler) as httpd:
-        print(f"Google 3D Tiles Flight running at http://{host}:{port}")
+        print(f"FASTLab World Fly running at http://{host}:{port}")
         print(f"Gate-path persistence: {PATHS_DIR}")
         print("Press Ctrl+C to stop")
         try:

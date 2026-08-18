@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# MindCloud World Fly — stop only processes owned by this project
+# FASTLab World Fly — stop only processes owned by this project
 set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

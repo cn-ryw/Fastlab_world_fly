@@ -31,8 +31,11 @@
 import { formatError, reportUserError } from './error-report.js';
 import { erpDirectionToComponent, sampleAnchorDirections } from './erp-geometry.js';
 import { demoPerformance } from './demo-performance.js?v=20260814-adaptive-a1';
+import {
+    CESIUM_ION_TOKEN_STORAGE_KEY,
+    resolveCesiumIonToken,
+} from './cesium-token.js?v=20260817-persistent-profile-a1';
 
-const CESIUM_ION_TOKEN_STORAGE_KEY = 'mindcloud_cesium_ion_token';
 const DEFAULT_ASSET_ID = 2275207;
 const DEFAULT_VIEW = {
     longitude: 114.1690321,
@@ -63,25 +66,24 @@ const PANORAMA_FACE_DEFS = [
     { name: 'up', dir: { x: 0, y: 1, z: 0 }, up: { x: 0, y: 0, z: 1 } },
     { name: 'down', dir: { x: 0, y: -1, z: 0 }, up: { x: 0, y: 0, z: -1 } },
 ];
+const GOAL_CLEARANCE_RAY_DIRECTIONS = Object.freeze([
+    { x: 1, y: 0, z: 0 },
+    { x: -1, y: 0, z: 0 },
+    { x: 0, y: 0, z: 1 },
+    { x: 0, y: 0, z: -1 },
+    { x: Math.SQRT1_2, y: 0, z: Math.SQRT1_2 },
+    { x: -Math.SQRT1_2, y: 0, z: Math.SQRT1_2 },
+    { x: Math.SQRT1_2, y: 0, z: -Math.SQRT1_2 },
+    { x: -Math.SQRT1_2, y: 0, z: -Math.SQRT1_2 },
+    { x: 0, y: 1, z: 0 },
+    { x: 0, y: -1, z: 0 },
+]);
 
 function urlNumber(name, fallback) {
     const v = new URLSearchParams(window.location.search).get(name);
     if (v == null || v === '') return fallback;
     const n = Number(v);
     return Number.isFinite(n) ? n : fallback;
-}
-
-function storedCesiumIonToken() {
-    try {
-        return globalThis.localStorage?.getItem(CESIUM_ION_TOKEN_STORAGE_KEY)?.trim() || '';
-    } catch (_) {
-        return '';
-    }
-}
-
-function urlString(name, fallback) {
-    const v = new URLSearchParams(window.location.search).get(name);
-    return v == null || v === '' ? fallback : v;
 }
 
 function requireCesium() {
@@ -431,7 +433,7 @@ function rotateXZ(v, radians) {
 export class CesiumWorld {
     constructor(containerId, options = {}) {
         this.containerId = containerId;
-        this.token = options.token || storedCesiumIonToken() || urlString('ionToken', '');
+        this.token = resolveCesiumIonToken({ explicitToken: options.token });
         this.assetId = Number(options.assetId || urlNumber('assetId', DEFAULT_ASSET_ID));
         this.initialView = {
             longitude: urlNumber('lon', options.longitude ?? DEFAULT_VIEW.longitude),
@@ -537,7 +539,7 @@ export class CesiumWorld {
         this.Cesium = Cesium;
         if (!this.token) {
             throw new Error(
-                `Cesium Ion token is not configured. Set localStorage key ${CESIUM_ION_TOKEN_STORAGE_KEY} and reload.`
+                `Cesium Ion token is not configured. Use the in-app setup prompt or set localStorage key ${CESIUM_ION_TOKEN_STORAGE_KEY}.`
             );
         }
         Cesium.Ion.defaultAccessToken = this.token;
@@ -684,6 +686,7 @@ export class CesiumWorld {
                     cacheBytes: 1536 * 1024 * 1024,
                     maximumCacheOverflowBytes: 1024 * 1024 * 1024,
                     enableCollision: true,
+                    showCreditsOnScreen: true,
                 });
             } catch (e) {
                 reportUserError('Credential-safe Google Photorealistic tileset load failed', e, {
@@ -1463,54 +1466,31 @@ export class CesiumWorld {
         if (this.spawnMarker) this.spawnMarker.show = false;
     }
 
-    validateGoalPlacement(clickedLocal, goalLocal, options = {}) {
-        const x = Number(clickedLocal?.x);
-        const clickedY = Number(clickedLocal?.y);
-        const z = Number(clickedLocal?.z);
-        const goalY = Number(goalLocal?.y);
-        if (![x, clickedY, z, goalY].every(Number.isFinite)) {
+    // The picked roof/facade/terrain surface only supplies horizontal
+    // coordinates. Validity depends on the fully composed goal and clearance.
+    validateGoalPlacement(goalLocal, options = {}) {
+        const x = goalLocal?.x;
+        const goalY = goalLocal?.y;
+        const z = goalLocal?.z;
+        if (![x, goalY, z].every(Number.isFinite)) {
             return {
                 valid: false,
                 reason: 'invalid-position',
-                message: 'Goal rejected: invalid map position.'
+                message: 'Invalid map position.'
             };
         }
 
-        const collisionRadius = Math.max(0.1, Number(options.collisionRadius) || 0.6);
+        const requestedRadius = options.collisionRadius;
+        const collisionRadius = Number.isFinite(requestedRadius)
+            ? Math.max(0.1, requestedRadius)
+            : 0.6;
         const centerSurfaceY = this.sampleHeightAtLocal(x, z, Math.max(0.5, collisionRadius));
         if (!Number.isFinite(centerSurfaceY)) {
             return {
                 valid: false,
                 reason: 'surface-unresolved',
-                message: 'Goal rejected: the clicked map surface has not loaded yet.'
+                message: 'The map surface at the requested position has not loaded yet.'
             };
-        }
-
-        // Google photorealistic tiles do not expose dependable building labels.
-        // A click-only sparse height ring distinguishes elevated roofs/facades
-        // without adding any work to the flight render or planning loops.
-        const offsets = [];
-        for (const distance of [12, 30, 60]) {
-            offsets.push(
-                [distance, 0], [-distance, 0],
-                [0, distance], [0, -distance]
-            );
-        }
-        const nearbyHeights = offsets
-            .map(([dx, dz]) => this.sampleHeightAtLocal(x + dx, z + dz, 1.0))
-            .filter(Number.isFinite)
-            .sort((a, b) => a - b);
-        if (nearbyHeights.length >= 4) {
-            const lowerQuartile = nearbyHeights[Math.floor((nearbyHeights.length - 1) * 0.25)];
-            const surfaceRelief = Math.max(clickedY, centerSurfaceY) - lowerQuartile;
-            if (surfaceRelief > 4.5) {
-                return {
-                    valid: false,
-                    reason: 'building-surface',
-                    message: 'Goal rejected: click on visible ground, not on a building.',
-                    surfaceRelief
-                };
-            }
         }
 
         const requiredClearance = collisionRadius + 0.2;
@@ -1518,13 +1498,81 @@ export class CesiumWorld {
             return {
                 valid: false,
                 reason: 'goal-inside-surface',
-                message: 'Goal rejected: the requested flight height is inside a building or the ground.',
+                message: 'The requested goal intersects a building, terrain, or the required safety clearance.',
                 surfaceY: centerSurfaceY,
                 requiredClearance
             };
         }
 
-        return { valid: true, surfaceY: centerSurfaceY };
+        const clearanceProbe = this.probeGoalClearance(
+            { x, y: goalY, z },
+            requiredClearance,
+        );
+        if (!clearanceProbe?.completed) {
+            return {
+                valid: false,
+                reason: 'clearance-query-failed',
+                message: 'The nearby scene geometry query could not be completed.',
+                surfaceY: centerSurfaceY,
+                requiredClearance,
+            };
+        }
+        if (clearanceProbe.hit) {
+            return {
+                valid: false,
+                reason: 'goal-clearance-obstructed',
+                message: 'The requested goal is too close to nearby building or terrain geometry.',
+                surfaceY: centerSurfaceY,
+                requiredClearance,
+                obstacleDistance: clearanceProbe.hit.distance,
+                obstaclePosition: clearanceProbe.hit.position,
+            };
+        }
+
+        return {
+            valid: true,
+            surfaceY: centerSurfaceY,
+            requiredClearance,
+            clearanceProbeCount: clearanceProbe.probeCount,
+        };
+    }
+
+    // Height sampling catches roofs and terrain under the goal. Ten local rays
+    // add a best-effort probe for walls, facades and overhangs in the currently
+    // queryable render geometry. This is not a complete sphere test: geometry
+    // between the rays or in unloaded tiles can still be missed. A failed GPU
+    // query rejects the goal rather than treating the probe as complete.
+    probeGoalClearance(goalLocal, maxDistance) {
+        const coordinates = [goalLocal?.x, goalLocal?.y, goalLocal?.z];
+        if (!coordinates.every(Number.isFinite)
+            || !Number.isFinite(maxDistance)
+            || maxDistance <= 0) {
+            return { completed: false, hit: null, probeCount: 0 };
+        }
+
+        let nearestHit = null;
+        let probeCount = 0;
+        for (const direction of GOAL_CLEARANCE_RAY_DIRECTIONS) {
+            const queryStatus = { completed: false };
+            const hit = this.pickLocalRay(
+                goalLocal,
+                direction,
+                maxDistance,
+                queryStatus,
+            );
+            probeCount++;
+            if (!queryStatus.completed) {
+                return { completed: false, hit: null, probeCount };
+            }
+            if (hit && (!nearestHit || hit.distance < nearestHit.distance)) {
+                nearestHit = {
+                    ...hit,
+                    direction: { ...direction },
+                };
+            }
+        }
+
+        return { completed: true, hit: nearestHit, probeCount };
     }
 
     showGoalMarker(local) {
@@ -1762,7 +1810,8 @@ export class CesiumWorld {
         if (firstKey !== undefined) this._heightSampleCache.delete(firstKey);
     }
 
-    pickLocalRay(originLocal, directionLocal, maxDistance) {
+    pickLocalRay(originLocal, directionLocal, maxDistance, queryStatus = null) {
+        if (queryStatus && typeof queryStatus === 'object') queryStatus.completed = false;
         if (!this.viewer || !this.ready) return null;
         const Cesium = this.Cesium;
         const scene = this.viewer.scene;
@@ -1789,6 +1838,7 @@ export class CesiumWorld {
         let hit;
         try {
             hit = scene.pickFromRay(ray, this._collisionExclusions());
+            if (queryStatus && typeof queryStatus === 'object') queryStatus.completed = true;
         } catch (error) {
             reportUserError('Scene pickFromRay failed during collision query', error, {
                 key: 'scene-pick-from-ray-collision',

@@ -1,8 +1,18 @@
-MindCloud_World_Fly
+FASTLab World Fly
 Copyright 2026 Manifold Tech Ltd.
 Author: MENG Guotao <mengguotao@manifoldtech.cn>
 
 This product is licensed under the Apache License, Version 2.0.
+
+The FASTLab World Fly project is maintained as a ZJU FAST Lab urban
+high-speed UAV research project. Use of the ZJU FAST Lab name and logo for
+this project has been authorized by ZJU FAST Lab. That authorization does
+not relicense the ZJU FAST Lab name or logo under the Apache License 2.0.
+
+Early project code originated from:
+  https://github.com/superboySB/MindCloud_World_Fly
+The current project is maintained independently while retaining the original
+copyright notice, author attribution, Git history, and baseline tag.
 
 =========================================================================
 
@@ -10,7 +20,7 @@ This project includes the following third-party software:
 
 -------------------------------------------------------------------------
 PlayCanvas Engine
-  Version: 2.16.2
+  Version: 2.17.2
   License: MIT
   URL: https://github.com/playcanvas/engine
   Copyright: Copyright (c) 2011-2024 PlayCanvas Ltd.
@@ -51,8 +61,12 @@ External data services
 -------------------------------------------------------------------------
 Documentation assets
   Simulator screenshots and demo recordings were produced by this project.
-  The system architecture illustration was generated with an OpenAI image
-  generation tool and reviewed for technical consistency by the project team.
+  The system architecture figure uses direct image crops from project
+  simulator screenshots (docs/assets/demo/poster-easy.jpg and
+  asset/display/20260703-005006.jpg) inside a source-code-driven native SVG.
+  Its remaining geometry, labels, data, formulas, and arrows are authored as
+  native SVG vector elements; the HTML file is a white preview wrapper. No
+  generative image elements are used.
 
 -------------------------------------------------------------------------
 JSZip
