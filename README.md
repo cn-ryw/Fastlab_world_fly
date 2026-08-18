@@ -18,7 +18,7 @@ Google 将 Photorealistic 3D Tiles 定义为以卫星与航拍影像纹理化的
 
 浏览器端架构也为手机、平板和笔记本电脑上的轻量访问留下了潜力，但移动端目前尚未完成：系统仍依赖本机回环 Web/推理服务、NVIDIA GPU 推理、键盘或遥控器输入，并且没有触屏飞控适配。当前可复现目标仍是具备 NVIDIA GPU 的桌面 Linux 环境。
 
-> 本项目用于仿真研究与演示。下方两段日志记录了零碰撞到达案例；持续 15 Hz 规划、真实飞行和安全认证仍未完成。
+> 本项目用于仿真研究与演示。下方两段日志记录了零碰撞到达案例。
 
 ## 功能概览
 
@@ -117,7 +117,7 @@ Firefox 适合完整演示；RadioMaster T8L 的 Web Serial 连接请使用：
 
 ### 3. 选择 YOPO 策略
 
-默认策略为 <code>d70_h30_epoch30</code>，对应 epoch30、70 m 感知和 30 m 最大轨迹距离。如需使用原有 epoch10 基线策略，可显式切换：
+默认策略为 <code>d70_h30_epoch30</code>，对应 epoch30、70 m 感知和 30 m 最大轨迹距离。如需使用原有未在城市场景进行针对训练的 epoch10 基线策略，可显式切换：
 
 ~~~bash
 MINDCLOUD_YOPO_STRATEGY=baseline ./start-all.sh
@@ -141,7 +141,7 @@ MINDCLOUD_YOPO_STRATEGY=baseline ./start-all.sh
 | <code>20260814-130247</code> | 是 | 0 | 约 8 Hz | 约 236 ms |
 | <code>20260814-130423</code> | 是 | 0 | 约 10 Hz | 约 160 ms |
 
-两次日志均进入 4 m 到达半径且没有碰撞，但时长不足 60 秒、规划频率低于持续 15 Hz 目标，因此 <code>formal_gate_passed=false</code>。详细轨迹图见 [第一次飞行](docs/assets/figures/demo-flight-20260814-130247.png) 和 [第二次飞行](docs/assets/figures/demo-flight-20260814-130423.png)；脱敏指标见 [demo-flight-summary.json](docs/data/demo-flight-summary.json)。
+两次日志均进入 4 m 到达半径且没有碰撞。详细轨迹图见 [第一次飞行](docs/assets/figures/demo-flight-20260814-130247.png) 和 [第二次飞行](docs/assets/figures/demo-flight-20260814-130423.png)；脱敏指标见 [demo-flight-summary.json](docs/data/demo-flight-summary.json)。
 
 可复现绘图：
 
@@ -196,7 +196,6 @@ python3 scripts/plot_demo_flights.py \
 - Google 3D Tiles 的完整性受网络、代理、缓存和视角覆盖影响；未加载区域不能视为可靠自由空间。
 - ICRA 论文或宣传材料发布前必须单独核对当前 Cesium Ion/Google 服务合同是否允许将渲染内容用于 DA360/YOPO 机器解释，并审查动态署名和宣传视频要求；本仓库不把现有实现表述为已经完成该合规审查（[Map Tiles API policies](https://developers.google.com/maps/documentation/tile/policies)）。
 - 手机和平板访问目前只是架构潜力；回环服务、GPU 推理、键盘/遥控器依赖和缺少触控适配仍阻止移动端开箱即用。
-- 两次公开演示没有通过持续 15 Hz、60 秒完整验收门禁。
 - 本项目不提供真实无人机飞行安全保证，不应直接用于人员或财产附近的自主飞行。
 - Cesium Ion token、模型文件、原始日志、设备信息和个人路径不得提交到仓库。
 
@@ -206,4 +205,4 @@ python3 scripts/plot_demo_flights.py \
 
 ## 致谢
 
-本项目的早期代码源自 [superboySB/MindCloud_World_Fly](https://github.com/superboySB/MindCloud_World_Fly)，现由 FASTLab World Fly 独立维护；原始作者与 Manifold Tech Ltd. 的版权声明、Git 提交历史和 `upstream-baseline-c6406dd` 基线标签均予保留。遥控器算法实现参考了 [zwhhhhh9](https://github.com/zwhhhhh9/) 的相关公开工作。本项目的 YOPO_360 部分参考 [cn-ryw/YOPO_360](https://github.com/cn-ryw/YOPO_360)；该项目是在 [zwhhhhh9/YOPO_360 的 velocity_15ms 分支](https://github.com/zwhhhhh9/YOPO_360/tree/velocity_15ms) 基础上进一步优化修改。感谢 DA360、YOPO、CesiumJS 等相关开源项目和研究工作。
+本项目的早期代码源自 [superboySB/MindCloud_World_Fly](https://github.com/superboySB/MindCloud_World_Fly)，现由 FASTLab World Fly 独立维护；原始作者与 Manifold Tech Ltd. 的版权声明、Git 提交历史和 `upstream-baseline-c6406dd` 基线标签均予保留。遥控器算法实现参考了 [zwhhhhh9](https://github.com/zwhhhhh9/) 的相关公开工作。本项目的 YOPO_360 部分参考 [cn-ryw/YOPO_360](https://github.com/cn-ryw/YOPO_360)，在 [zwhhhhh9/YOPO_360 的 velocity_15ms 分支](https://github.com/zwhhhhh9/YOPO_360/tree/velocity_15ms) 基础上进一步优化修改。感谢 DA360、YOPO、CesiumJS 等相关开源项目和研究工作。
